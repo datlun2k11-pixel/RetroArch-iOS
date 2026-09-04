@@ -20,11 +20,6 @@ jobs:
       with:
         submodules: recursive
 
-    - name: Fetch Cores
-      run: |
-        chmod +x pkg/apple/fetch_cores.sh
-        ./pkg/apple/fetch_cores.sh ios-arm64 || true
-
     - name: Compile RA & Archive
       run: |
         set -o pipefail
