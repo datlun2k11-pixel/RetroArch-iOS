@@ -3,6 +3,7 @@ name: CI iOS (13)
 on:
   push:
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -16,11 +17,38 @@ jobs:
 
     steps:
     - uses: actions/checkout@v6
+      with:
+        submodules: recursive
 
-    - name: Compile RA
+    - name: Fetch Cores
+      run: |
+        chmod +x pkg/apple/fetch_cores.sh
+        ./pkg/apple/fetch_cores.sh ios-arm64 || true
+
+    - name: Compile RA & Archive
       run: |
         set -o pipefail
-        xcodebuild -workspace pkg/apple/RetroArch.xcworkspace -destination generic/platform=iOS -config Release \
-        -scheme "RetroArch iOS Release" -xcconfig pkg/apple/GitHubCI.xcconfig \
-        CODE_SIGNING_ALLOWED=NO \ CODE_SIGNING_REQUIRED=NO \ CODE_SIGN_IDENTITY="" \ PROVISIONING_PROFILE_SPECIFIER="" \
-        -derivedDataPath build
+        xcodebuild -workspace pkg/apple/RetroArch.xcworkspace \
+          -scheme "RetroArch iOS Release" \
+          -destination "generic/platform=iOS" \
+          -configuration Release \
+          -xcconfig pkg/apple/GitHubCI.xcconfig \
+          -archivePath build/RetroArch.xcarchive \
+          archive \
+          CODE_SIGNING_ALLOWED=NO \
+          CODE_SIGNING_REQUIRED=NO \
+          CODE_SIGN_IDENTITY="" \
+          PROVISIONING_PROFILE_SPECIFIER=""
+
+    - name: Package to IPA
+      run: |
+        mkdir -p build/Payload
+        cp -r build/RetroArch.xcarchive/Products/Applications/*.app build/Payload/
+        cd build
+        zip -r RetroArch.ipa Payload
+
+    - name: Upload IPA Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: RetroArch-iOS-IPA
+        path: build/RetroArch.ipa
