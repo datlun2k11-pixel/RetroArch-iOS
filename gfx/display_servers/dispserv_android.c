@@ -19,16 +19,36 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <android/native_window.h>
+#include <sys/system_properties.h>
+
+#include <compat/strl.h>
 
 #include "../../verbosity.h"
 #include "../video_display_server.h"
+#include "../video_driver.h"
 #include "../../frontend/drivers/platform_unix.h"
 
 /* FORWARD DECLARATIONS */
 int system_property_get(const char *cmd, const char *args,
       char *value, size_t value_size);
 
-static void* android_display_server_init(void) { return NULL; }
+/* The display's peak luminance, as Android reports it (API 24's
+ * HdrCapabilities); 0 where it reports none. */
+static void* android_display_server_init(void)
+{
+   jfloat peak = 0.0f;
+   JNIEnv *env = jni_thread_getenv();
+   if (env && g_android && g_android->getHdrMaxLuminance)
+      CALL_FLOAT_METHOD(env, peak,
+            g_android->activity->clazz, g_android->getHdrMaxLuminance);
+   if (peak > 0.0f)
+   {
+      video_driver_set_display_peak_nits((float)peak);
+      RARCH_LOG("[Android] Display peak luminance: %.0f nits (from Android).\n",
+            (float)peak);
+   }
+   return NULL;
+}
 static void android_display_server_destroy(void *data) { }
 static bool android_display_server_set_window_opacity(void *data, unsigned opacity) { return true; }
 static bool android_display_server_set_window_progress(void *data, int progress, bool finished) { return true; }
@@ -151,8 +171,7 @@ static void *android_display_server_get_resolution_list(
       jint height   = modes[i * 4 + 2];
       jint millihz  = modes[i * 4 + 3];
 
-      conf[i].width             = (unsigned)width;
-      conf[i].height            = (unsigned)height;
+      conf[i].dims = VIDEO_SCALE_PACK((unsigned)width, (unsigned)height);
       /* Android composites 32-bit regardless of the mode. */
       conf[i].bpp               = 32;
       conf[i].refreshrate       = (unsigned)((millihz + 500) / 1000);
@@ -184,7 +203,7 @@ static void *android_display_server_get_resolution_list(
          logged_once = true;
          RARCH_LOG("[Android] Display reports %u mode(s); current is"
                " %ux%u @ %.2f Hz.\n", count,
-               conf[0].width, conf[0].height, conf[0].refreshrate_float);
+               VIDEO_SCALE_W(conf[0].dims), VIDEO_SCALE_H(conf[0].dims), conf[0].refreshrate_float);
       }
    }
 
@@ -201,7 +220,7 @@ static void *android_display_server_get_resolution_list(
  *
  * A request, not a guarantee: the system may stay where it is. */
 static bool android_display_server_set_resolution(void *data,
-      unsigned width, unsigned height, int int_hz, float hz,
+      unsigned dims, int int_hz, float hz,
       int center, int monitor_index, int xoffset, int padjust)
 {
    struct video_display_config *conf = NULL;
@@ -227,14 +246,13 @@ static bool android_display_server_set_resolution(void *data,
     * zero and only the rate filled in.  Matching those literally
     * matched nothing, so every rate-only switch failed silently.
     * Zero means "whatever size is current". */
-   if (width == 0 || height == 0)
+   if (VIDEO_SCALE_W(dims) == 0 || VIDEO_SCALE_H(dims) == 0)
    {
       for (i = 0; i < count; i++)
       {
          if (!conf[i].current)
             continue;
-         width  = conf[i].width;
-         height = conf[i].height;
+         dims = conf[i].dims;
          break;
       }
    }
@@ -243,7 +261,7 @@ static bool android_display_server_set_resolution(void *data,
    {
       float delta;
 
-      if (conf[i].width != width || conf[i].height != height)
+      if (conf[i].dims != dims)
          continue;
 
       delta = conf[i].refreshrate_float - hz;
@@ -279,7 +297,7 @@ static bool android_display_server_set_resolution(void *data,
     * between "it did not work" and knowing why. */
    RARCH_LOG("[Android] Display mode %d requested for %ux%u @ %.2f Hz"
          " (accepted: %s).\n",
-         best_id, width, height, hz, (ok == JNI_TRUE) ? "yes" : "no");
+         best_id, VIDEO_SCALE_W(dims), VIDEO_SCALE_H(dims), hz, (ok == JNI_TRUE) ? "yes" : "no");
 
    /* Tell SurfaceFlinger what this window wants, as well as asking
     * the framework for the mode.
@@ -338,7 +356,7 @@ static bool android_display_server_set_resolution(void *data,
  * offers the same resolution at several rates and the resolution
  * alone would not say which one is running. */
 static void android_display_server_get_video_output_size(void *data,
-      unsigned *width, unsigned *height, char *s, size_t len)
+      unsigned *dims, char *s, size_t len)
 {
    struct video_display_config *conf = NULL;
    unsigned count                    = 0;
@@ -353,10 +371,8 @@ static void android_display_server_get_video_output_size(void *data,
       if (!conf[i].current)
          continue;
 
-      if (width)
-         *width  = conf[i].width;
-      if (height)
-         *height = conf[i].height;
+      if (dims)
+         *dims = conf[i].dims;
       if (s && len)
          snprintf(s, len, "%.2f Hz", conf[i].refreshrate_float);
       break;
@@ -413,8 +429,7 @@ static bool android_display_server_step_video_output(void *data, int dir)
    struct video_display_config *conf = NULL;
    unsigned count                    = 0;
    unsigned current                  = 0;
-   unsigned curr_width               = 0;
-   unsigned curr_height              = 0;
+   unsigned curr_dims                = 0;
    unsigned i;
    bool found                        = false;
 
@@ -427,8 +442,7 @@ static bool android_display_server_step_video_output(void *data, int dir)
       if (conf[i].current)
       {
          current     = i;
-         curr_width  = conf[i].width;
-         curr_height = conf[i].height;
+         curr_dims = conf[i].dims;
          break;
       }
    }
@@ -441,12 +455,11 @@ static bool android_display_server_step_video_output(void *data, int dir)
          ? (current + i) % count
          : (current + count - (i % count)) % count;
 
-      if (     conf[idx].width  == curr_width
-            && conf[idx].height == curr_height)
+      if (conf[idx].dims == curr_dims)
          continue;
 
       found = android_display_server_set_resolution(data,
-            conf[idx].width, conf[idx].height,
+            conf[idx].dims,
             (int)conf[idx].refreshrate, conf[idx].refreshrate_float,
             0, 0, 0, 0);
       break;
@@ -534,16 +547,29 @@ dpi_fallback:
 
 bool android_display_has_focus(void *data)
 {
-   bool                    focused = false;
    struct android_app *android_app = (struct android_app*)g_android;
    if (!android_app)
       return true;
 
-   slock_lock(android_app->mutex);
-   focused = !retro_atomic_load_acquire_int(&android_app->unfocused);
-   slock_unlock(android_app->mutex);
+   /* The focus commands publish this with a release store
+    * (android_input_poll_main_cmd), so the acquire load carries the
+    * ordering by itself and there is no second field here to read
+    * with it. The input poll reaches this every frame. */
+   return !retro_atomic_load_acquire_int(&android_app->unfocused);
+}
 
-   return focused;
+/* The thread's looper is ident-based - prepared with
+ * ALOOPER_PREPARE_ALLOW_NON_CALLBACKS - so a poll here reports
+ * readiness and consumes nothing; the next android_input_poll
+ * dispatches the ident as it always did. Input, app commands and the
+ * sensor queue all arrive through this one object. */
+static bool android_display_server_idle_wait(void *data, unsigned ms)
+{
+   (void)data;
+   if (!ALooper_forThread())
+      return false;
+   ALooper_pollOnce((int)ms, NULL, NULL, NULL);
+   return true;
 }
 
 const video_display_server_t dispserv_android = {
@@ -565,5 +591,17 @@ const video_display_server_t dispserv_android = {
    android_display_server_get_flags,
    NULL, /* get_scanline */
    NULL, /* wait_vblank */
+   NULL, /* modeline_list_outputs */
+   NULL, /* modeline_open */
+   NULL, /* modeline_close */
+   NULL, /* modeline_caps */
+   NULL, /* modeline_enum */
+   NULL, /* modeline_add */
+   NULL, /* modeline_update */
+   NULL, /* modeline_delete */
+   NULL, /* modeline_set */
+   NULL, /* modeline_flush */
+   NULL, /* get_edid */
+   android_display_server_idle_wait,
    "android"
 };

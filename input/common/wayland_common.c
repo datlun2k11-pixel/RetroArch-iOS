@@ -688,8 +688,6 @@ static void wl_output_handle_geometry(void *data,
       int transform)
 {
    output_info_t *oi   = (output_info_t*)data;
-   oi->physical_width  = physical_width;
-   oi->physical_height = physical_height;
    oi->make            = strdup(make);
    oi->model           = strdup(model);
 }
@@ -702,8 +700,7 @@ static void wl_output_handle_mode(void *data,
       int refresh)
 {
    output_info_t *oi = (output_info_t*)data;
-   oi->width         = width;
-   oi->height        = height;
+   oi->dims          = VIDEO_SCALE_PACK(width, height);
    oi->refresh_rate  = refresh;
 }
 
@@ -847,6 +844,8 @@ static void wl_registry_handle_global(void *data, struct wl_registry *reg,
       wl->tearing_control_manager = (struct wp_tearing_control_manager_v1*)
          wl_registry_bind(
             reg, id, &wp_tearing_control_manager_v1_interface, MIN(version, 1));
+   else if (string_is_equal(interface, wl_color_interface_name()) && found++)
+      wl_color_bind(&wl->color, reg, id, version);
 
    if (found > 1)
    RARCH_LOG("[Wayland] Registered interface %s at version %u.\n",

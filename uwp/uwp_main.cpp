@@ -686,12 +686,9 @@ void App::OnPointer(CoreWindow const& sender, PointerEventArgs const& args)
       uwp_next_input.touch[i].id = id;
 
       /* convert from event coordinates to core and screen coordinates */
-      vp.x           = 0;
-      vp.y           = 0;
-      vp.width       = 0;
-      vp.height      = 0;
-      vp.full_width  = 0;
-      vp.full_height = 0;
+      vp.pos         = VIDEO_POS_PACK(0, 0);
+      vp.dims        = 0;
+      vp.full_dims   = 0;
 
       video_driver_translate_coord_viewport_wrap(
             &vp,
@@ -815,6 +812,13 @@ extern "C" {
    bool win32_has_focus(void *data)
    {
       return App::GetInstance()->IsWindowFocused();
+   }
+
+   /* DwmGetCompositionTimingInfo is not available to app containers,
+    * so the presenter paces on its own clock. */
+   retro_time_t win32_dwm_last_vblank_time(void)
+   {
+      return 0;
    }
 
    bool win32_set_video_mode(void *data, unsigned width, unsigned height, bool fullscreen)

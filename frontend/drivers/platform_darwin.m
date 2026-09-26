@@ -16,6 +16,7 @@
  */
 
 #include <stdint.h>
+#include "../../apple_runtime.h"
 #include <stddef.h>
 #include <string.h>
 #include <unistd.h>
@@ -716,9 +717,24 @@ static const char* frontend_darwin_get_cpu_model_name(void)
 static enum retro_language frontend_darwin_get_user_language(void)
 {
    char s[128];
-   CFArrayRef langs = CFLocaleCopyPreferredLanguages();
-   CFStringRef langCode = CFArrayGetValueAtIndex(langs, 0);
+   CFArrayRef langs;
+   CFStringRef langCode;
+   /* CFLocaleCopyPreferredLanguages is 10.5; looked up at run time so
+    * one binary builds against, and runs on, 10.4 as well. */
+   CFArrayRef (*copy_langs)(void) = (CFArrayRef (*)(void))
+      dlsym(RTLD_DEFAULT, "CFLocaleCopyPreferredLanguages");
+   if (!copy_langs)
+      return RETRO_LANGUAGE_ENGLISH;
+   langs = copy_langs();
+   if (!langs || CFArrayGetCount(langs) < 1)
+   {
+      if (langs)
+         CFRelease(langs);
+      return RETRO_LANGUAGE_ENGLISH;
+   }
+   langCode = CFArrayGetValueAtIndex(langs, 0);
    CFStringGetCString(langCode, s, sizeof(s), kCFStringEncodingUTF8);
+   CFRelease(langs);
    /* iOS and OS X only support the language ID syntax consisting
     * of a language designator and optional region or script designator. */
    string_replace_all_chars(s, '-', '_');
@@ -861,7 +877,7 @@ static bool accessibility_speak_macos(int speed,
 static bool frontend_darwin_is_narrator_running(void)
 {
 #if !TARGET_OS_OSX || (MAC_OS_X_VERSION_MAX_ALLOWED >= 101400)
-   if (@available(macOS 10.14, iOS 7, tvOS 9, *))
+   if (apple_runtime_available(APPLE_RUNTIME_VER(10, 14, 0), APPLE_RUNTIME_VER(7, 0, 0), APPLE_RUNTIME_VER(9, 0, 0)))
       return true;
 #endif
 #if TARGET_OS_OSX
@@ -880,7 +896,7 @@ static bool frontend_darwin_accessibility_speak(int speed,
       speed               = 10;
 
 #if !TARGET_OS_OSX || (MAC_OS_X_VERSION_MAX_ALLOWED >= 101400)
-   if (@available(macOS 10.14, iOS 7, tvOS 9, *))
+   if (apple_runtime_available(APPLE_RUNTIME_VER(10, 14, 0), APPLE_RUNTIME_VER(7, 0, 0), APPLE_RUNTIME_VER(9, 0, 0)))
    {
       static dispatch_once_t once;
       static AVSpeechSynthesizer *synth;
@@ -916,7 +932,7 @@ static bool frontend_darwin_accessibility_speak(int speed,
 static void frontend_darwin_content_loaded(void)
 {
 #ifdef HAVE_SWIFT
-   if (@available(macOS 13.0, iOS 16.0, tvOS 16.0, *)) {
+   if (apple_runtime_available(APPLE_RUNTIME_VER(13, 0, 0), APPLE_RUNTIME_VER(16, 0, 0), APPLE_RUNTIME_VER(16, 0, 0))) {
       [RetroArchAppShortcuts contentLoaded];
    }
 #endif

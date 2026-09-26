@@ -16,6 +16,18 @@ S_BOOL(audio_threaded_pipeline, AUDIO_THREADED_PIPELINE,
       "Threaded Pipeline",
       "Resample, filter and mix audio on the audio thread instead of inside each frame. Same latency as the frame-synchronous path at any Audio Latency setting, with rate control measured at the device's own pace and the resampler out of the frame budget. Audio drivers that cannot wake on the device keep the frame-synchronous path.")
 
+S_BOOL(audio_time_stretch, AUDIO_TIME_STRETCH,
+      "audio_time_stretch",
+      false, SD_FLAG_ADVANCED, 0, CMD_EVENT_AUDIO_REINIT,
+      "Pitch-Preserving Speed Changes",
+      "Preserve pitch during slow motion and fast-forward. Supports threaded and frame-synchronous playback, including negotiated multichannel audio. Adds processing cost, memory and buffering while enabled. Requires a content rate of 8000-192000 Hz. Unsupported speeds or source formats use ordinary playback. Inline layout changes reset buffered audio. Threaded playback resumes pitch preservation after queued audio drains.")
+
+S_BOOL(audio_time_stretch_lowpass, AUDIO_TIME_STRETCH_LOWPASS,
+      "audio_time_stretch_lowpass",
+      false, SD_FLAG_ADVANCED, 0, CMD_EVENT_AUDIO_REINIT,
+      "Speed-Linked Low-Pass Filter",
+      "Soften high frequencies during accelerated playback, with or without Pitch-Preserving Speed Changes. Supports the same content rates and source formats. Adds processing and prepared memory while enabled; normal-speed playback is unfiltered. This optional effect does not replace the resampler's anti-aliasing filter.")
+
 S_BOOL(audio_thread_priority, AUDIO_THREAD_PRIORITY,
       "audio_thread_priority",
       DEFAULT_AUDIO_THREAD_PRIORITY, SD_FLAG_NONE, 0, CMD_EVENT_AUDIO_REINIT,

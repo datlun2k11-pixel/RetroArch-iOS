@@ -18,18 +18,32 @@
 #include <string.h>
 
 #include <lists/string_list.h>
-#include <queues/fifo_queue.h>
+#include <retro_atomic.h>
 #include <rthreads/rthreads.h>
+#include <features/features_cpu.h>
 
 #include "audio_thread_wrapper.h"
 #include "audio_driver.h"
 #include "../verbosity.h"
+#include "../frontend/thread_elevation.h"
 
 /* How long a handshake between the main thread and the audio thread
  * may run before it is reported. Both are sub-millisecond on a device
  * that is answering, so anything near this is a device that has
  * stopped returning from a call; the wait continues either way. */
 #define AUDIO_THREAD_HANDSHAKE_WARN_US (2 * 1000 * 1000)
+/* Long past any device that is merely slow to open: a driver's init()
+ * that has not returned by now is not going to, and the frontend goes
+ * on without audio rather than never returning from drivers_init(). */
+#define AUDIO_THREAD_HANDSHAKE_GIVEUP_US (30 * 1000 * 1000)
+
+/* How long the loop parks when audio_driver_callback() had nothing to
+ * render or consume - a core paused behind the menu, or a callback
+ * that pushed no samples. There is no device write to pace on in that
+ * case, so this is the poll interval for the core coming back, and
+ * the bound on how late the first samples after it come out. A stop
+ * request signals the condition and cuts the wait short. */
+#define AUDIO_THREAD_IDLE_WAIT_US 1000
 
 typedef struct audio_thread
 {
@@ -43,18 +57,30 @@ typedef struct audio_thread
    unsigned *new_rate;
 
    int inited;
+   /* The thread's two loop conditions. Atomics, so the loop tests them
+    * without taking 'lock' on a pass that has nothing to coordinate -
+    * which is every pass while audio is playing - and so that the
+    * frontend's own reads of them are reads rather than races. A writer
+    * still holds 'lock' while it changes one and signals 'cond',
+    * because that is what makes the change and the wakeup atomic
+    * against a waiter. alive only ever goes false. */
+   retro_atomic_int_t alive;
+   retro_atomic_int_t stopped;
+   /* The frontend stopped waiting for init(): this thread owns its own
+    * state from there and frees it when init() finally returns. */
+   bool abandoned;
 
    /* Initialization options. */
    unsigned out_rate;
    unsigned latency;
-   unsigned block_frames;
 
-   bool alive;
-   bool stopped;
    bool stopped_ack;
    bool is_paused;
    bool is_shutdown;
    bool use_float;
+   /* The layout the inner driver opened with, read as use_float is:
+    * on the thread, once, right after init. */
+   uint32_t layout;
    /* Ask the OS for a higher scheduling class from inside the thread. */
    bool raise_priority;
    bool prefer_fast_cores;
@@ -69,15 +95,31 @@ static void audio_thread_loop(void *data)
    bool is_shutdown;
    audio_thread_t *thr = (audio_thread_t*)data;
 
+   if (!thr)
+      return;
+
    sthread_setname("ra-audio");
 
    /* Best effort and never fatal: a refusal leaves the default. */
    if (thr->raise_priority)
    {
-      if (sthread_raise_current_priority())
-         RARCH_LOG("[Audio] Audio thread priority raised.\n");
-      else
-         RARCH_LOG("[Audio] Audio thread priority not raised; the system refused or has no such class.\n");
+      const char *via   = NULL;
+      const char *added = NULL;
+      switch (thread_elevation_raise_current(&via, &added))
+      {
+         case THREAD_ELEVATION_GRANTED:
+            RARCH_LOG("[Audio] Audio thread priority raised.\n");
+            break;
+         case THREAD_ELEVATION_PENDING:
+            /* Finishing on a thread of its own; this one does not wait. */
+            RARCH_LOG("[Audio] Audio thread priority not raised directly; asking %s.\n", via);
+            break;
+         default:
+            RARCH_LOG("[Audio] Audio thread priority not raised; the system refused or has no such class.\n");
+            break;
+      }
+      if (added)
+         RARCH_LOG("[Audio] Audio thread runs on %s.\n", added);
    }
 
    if (thr->prefer_fast_cores)
@@ -86,18 +128,33 @@ static void audio_thread_loop(void *data)
          RARCH_LOG("[Audio] Audio thread placed on the performance cores.\n");
    }
 
-   if (!thr)
-      return;
-
    thr->driver_data   = thr->driver->init(
          thr->device, thr->out_rate, thr->latency,
-         thr->block_frames, thr->new_rate);
+         thr->new_rate);
    slock_lock(thr->lock);
    thr->inited        = thr->driver_data ? 1 : -1;
    if (thr->inited > 0 && thr->driver->use_float)
       thr->use_float  = thr->driver->use_float(thr->driver_data);
+   thr->layout        = AUDIO_LAYOUT_STEREO;
+   if (thr->inited > 0 && thr->driver->layout)
+      thr->layout     = thr->driver->layout(thr->driver_data);
    scond_signal(thr->cond);
-   slock_unlock(thr->lock);
+   {
+      bool abandoned = thr->abandoned;
+      slock_unlock(thr->lock);
+
+      /* Nobody is waiting for this any more, and nobody else will free
+       * it: init() took longer than the frontend was willing to wait. */
+      if (abandoned)
+      {
+         if (thr->driver_data && thr->driver->free)
+            thr->driver->free(thr->driver_data);
+         slock_free(thr->lock);
+         scond_free(thr->cond);
+         free(thr);
+         return;
+      }
+   }
 
    if (thr->inited < 0)
       return;
@@ -110,7 +167,7 @@ static void audio_thread_loop(void *data)
     * acknowledgement whichever loop the thread is in, so this one
     * gives it too. */
    slock_lock(thr->lock);
-   while (thr->stopped)
+   while (retro_atomic_load_relaxed_int(&thr->stopped))
    {
       thr->stopped_ack = true;
       scond_signal(thr->cond);
@@ -126,34 +183,55 @@ static void audio_thread_loop(void *data)
 
    for (;;)
    {
-      slock_lock(thr->lock);
-
-      if (!thr->alive)
+      /* Tested without the lock: a pass that is neither leaving nor
+       * parking has nothing to say to the main thread, and that is
+       * every pass while audio is playing. A request that lands just
+       * after either test is taken on the next pass, which is where it
+       * was taken before. */
+      if (!retro_atomic_load_acquire_int(&thr->alive))
       {
-         scond_signal(thr->cond);
+         slock_lock(thr->lock);
          thr->stopped_ack = true;
+         scond_signal(thr->cond);
          slock_unlock(thr->lock);
          break;
       }
 
-      if (thr->stopped)
+      if (retro_atomic_load_acquire_int(&thr->stopped))
       {
-         thr->driver->stop(thr->driver_data);
-         while (thr->stopped)
+         slock_lock(thr->lock);
+         /* Again under the lock: a start() between the test and here
+          * has already cleared it, and there is nothing to park. */
+         if (retro_atomic_load_relaxed_int(&thr->stopped))
          {
-            /* If we stop right after start,
-             * we might not be able to properly ack.
-             * Signal in the loop instead. */
-            thr->stopped_ack = true;
-            scond_signal(thr->cond);
+            thr->driver->stop(thr->driver_data);
+            while (retro_atomic_load_relaxed_int(&thr->stopped))
+            {
+               /* If we stop right after start,
+                * we might not be able to properly ack.
+                * Signal in the loop instead. */
+               thr->stopped_ack = true;
+               scond_signal(thr->cond);
 
-            scond_wait(thr->cond, thr->lock);
+               scond_wait(thr->cond, thr->lock);
+            }
+            thr->driver->start(thr->driver_data, thr->is_shutdown);
          }
-         thr->driver->start(thr->driver_data, thr->is_shutdown);
+         slock_unlock(thr->lock);
       }
 
-      slock_unlock(thr->lock);
-      audio_driver_callback();
+      if (!audio_driver_callback())
+      {
+         slock_lock(thr->lock);
+         /* The re-test belongs under the lock: a request that lands
+          * between it and the wait would otherwise go unseen until the
+          * timeout. */
+         if (     retro_atomic_load_relaxed_int(&thr->alive)
+               && !retro_atomic_load_relaxed_int(&thr->stopped))
+            scond_wait_timeout(thr->cond, thr->lock,
+                  AUDIO_THREAD_IDLE_WAIT_US);
+         slock_unlock(thr->lock);
+      }
    }
 
    audio_driver_pipeline_consumer_exit();
@@ -169,7 +247,7 @@ static void audio_thread_block(audio_thread_t *thr)
    if (!thr)
       return;
 
-   if (thr->stopped)
+   if (retro_atomic_load_acquire_int(&thr->stopped))
       return;
 
    slock_lock(thr->lock);
@@ -178,13 +256,13 @@ static void audio_thread_block(audio_thread_t *thr)
     * acknowledge anything again, and the wait below would never end.
     * There is nothing running to park, so there is nothing to wait
     * for. */
-   if (!thr->alive)
+   if (!retro_atomic_load_relaxed_int(&thr->alive))
    {
       slock_unlock(thr->lock);
       return;
    }
    thr->stopped_ack = false;
-   thr->stopped = true;
+   retro_atomic_store_release_int(&thr->stopped, 1);
    scond_signal(thr->cond);
    /* The thread may be asleep in the pipeline waiting for data; wake it
     * so it comes back to the loop and acknowledges now rather than
@@ -226,7 +304,7 @@ static void audio_thread_unblock(audio_thread_t *thr)
       return;
 
    slock_lock(thr->lock); /* Prevent the audio thread from touching this flag... */
-   thr->stopped = false; /* ...so that the main thread can do it. */
+   retro_atomic_store_release_int(&thr->stopped, 0);
    scond_signal(thr->cond); /* Then let the audio thread know that it's okay to resume. */
    slock_unlock(thr->lock); /* "As you were." */
 }
@@ -241,8 +319,8 @@ static void audio_thread_free(void *data)
    if (thr->thread)
    {
       slock_lock(thr->lock); /* Let the audio thread finish what it's doing... */
-      thr->stopped = false; /* Then stop it. "You're fired." */
-      thr->alive   = false;
+      retro_atomic_store_release_int(&thr->stopped, 0);
+      retro_atomic_store_release_int(&thr->alive,    0);
       scond_signal(thr->cond); /* Let the thread know it's okay to continue */
       slock_unlock(thr->lock); /* At this point, it will exit its loop. */
 
@@ -273,7 +351,7 @@ static bool audio_thread_alive(void *data)
    /* A thread that has ended after a failed write reports the device
     * as not alive, which is what it is; block() below is a no-op then,
     * and the answer has to come from somewhere. */
-   if (!thr->alive)
+   if (!retro_atomic_load_acquire_int(&thr->alive))
       return false;
 
    audio_thread_block(thr);
@@ -281,6 +359,20 @@ static bool audio_thread_alive(void *data)
    audio_thread_unblock(thr);
 
    return alive;
+}
+
+void audio_thread_apply_control(void *data,
+      void (*control)(void *userdata), void *userdata)
+{
+   audio_thread_t *thr = (audio_thread_t*)data;
+   bool running;
+   if (!thr || !control)
+      return;
+   running = !retro_atomic_load_acquire_int(&thr->stopped);
+   audio_thread_block(thr);
+   control(userdata);
+   if (running)
+      audio_thread_unblock(thr);
 }
 
 static bool audio_thread_stop(void *data)
@@ -374,12 +466,52 @@ static size_t audio_thread_wait_writable(void *data, size_t len)
 /* The wrapped driver's count, for the sink rate estimate: without this
  * the frontend saw the wrapper's NULL and never measured under the
  * threaded pipeline - which is where every reporter runs. */
+/* The wrapper is the driver the frontend sees, so a hook it does not
+ * forward is a hook the frontend never calls. This one it did not,
+ * and a 5.1 device under the threaded driver got the stereo mix as
+ * 8-byte frames into 24-byte ones. */
+static uint32_t audio_thread_layout(void *data)
+{
+   audio_thread_t *thr = (audio_thread_t*)data;
+   if (!thr)
+      return AUDIO_LAYOUT_STEREO;
+   return thr->layout;
+}
+
+static size_t audio_thread_underruns(void *data)
+{
+   audio_thread_t *thr = (audio_thread_t*)data;
+   if (!thr || !thr->driver->underruns || !thr->driver_data)
+      return 0;
+   return thr->driver->underruns(thr->driver_data);
+}
+
 static size_t audio_thread_frames_consumed(void *data)
 {
    audio_thread_t *thr = (audio_thread_t*)data;
    if (!thr || !thr->driver->frames_consumed || !thr->driver_data)
       return 0;
    return thr->driver->frames_consumed(thr->driver_data);
+}
+
+/* The driver's own count of frames the device took, where it keeps one
+ * beside the device clock. Not forwarded before, so the sink-rate
+ * comparison this exists for went missing on exactly the configuration
+ * it is most wanted on - the threaded one. */
+static bool audio_thread_device_clock_ppm(void *data, double *ppm)
+{
+   audio_thread_t *thr = (audio_thread_t*)data;
+   if (!thr || !thr->driver->device_clock_ppm || !thr->driver_data)
+      return false;
+   return thr->driver->device_clock_ppm(thr->driver_data, ppm);
+}
+
+static size_t audio_thread_frames_consumed_fallback(void *data)
+{
+   audio_thread_t *thr = (audio_thread_t*)data;
+   if (!thr || !thr->driver->frames_consumed_fallback || !thr->driver_data)
+      return 0;
+   return thr->driver->frames_consumed_fallback(thr->driver_data);
 }
 
 static ssize_t audio_thread_write(void *data, const void *s, size_t len)
@@ -392,7 +524,7 @@ static ssize_t audio_thread_write(void *data, const void *s, size_t len)
    if (_len < 0)
    {
       slock_lock(thr->lock);
-      thr->alive = false;
+      retro_atomic_store_release_int(&thr->alive, 0);
       scond_signal(thr->cond);
       slock_unlock(thr->lock);
    }
@@ -459,7 +591,11 @@ static const audio_driver_t audio_thread = {
    audio_thread_buffer_size,
    NULL, /* write_raw */
    audio_thread_wait_writable,
-   audio_thread_frames_consumed
+   audio_thread_frames_consumed,
+   audio_thread_underruns,
+   audio_thread_layout,
+   audio_thread_frames_consumed_fallback,
+   audio_thread_device_clock_ppm
 };
 
 /**
@@ -481,7 +617,7 @@ static const audio_driver_t audio_thread = {
 bool audio_init_thread(const audio_driver_t **out_driver,
       void **out_data, const char *device, unsigned audio_out_rate,
       unsigned *new_rate, unsigned latency,
-      unsigned block_frames, bool raise_priority,
+      bool raise_priority,
       bool prefer_fast_cores,
       const audio_driver_t *drv)
 {
@@ -496,28 +632,44 @@ bool audio_init_thread(const audio_driver_t **out_driver,
    thr->out_rate       = audio_out_rate;
    thr->new_rate       = new_rate;
    thr->latency        = latency;
-   thr->block_frames   = block_frames;
 
    if (!(thr->cond     = scond_new()))
       goto error;
    if (!(thr->lock     = slock_new()))
       goto error;
 
-   thr->alive          = true;
-   thr->stopped        = true;
+   retro_atomic_store_release_int(&thr->alive,   1);
+   retro_atomic_store_release_int(&thr->stopped, 1);
 
    if (!(thr->thread   = sthread_create(audio_thread_loop, thr)))
       goto error;
 
-   /* Wait until thread has initialized (or failed) the driver. Not
-    * abandoned either: the thread owns thr until it is joined, so
-    * returning early would free it underneath. A driver whose init()
-    * does not return is reported instead of stalling silently. */
+   /* Wait until thread has initialized (or failed) the driver, but not
+    * for ever: a driver whose init() never returns, or a thread that
+    * died inside it, would otherwise leave the frontend waiting here
+    * with no way out. Past the deadline the thread is told it owns its
+    * own state and this returns without it - freeing it here would pull
+    * it out from under a thread still using it. */
    slock_lock(thr->lock);
    {
-      bool warned = false;
+      bool warned         = false;
+      retro_time_t giveup = cpu_features_get_time_usec()
+         + AUDIO_THREAD_HANDSHAKE_GIVEUP_US;
       while (!thr->inited)
       {
+         retro_time_t now = cpu_features_get_time_usec();
+         if (now >= giveup)
+         {
+            thr->abandoned = true;
+            slock_unlock(thr->lock);
+            RARCH_ERR("[Audio] Driver \"%s\" did not return from init after %d seconds; going on without audio.\n",
+                  thr->driver->ident ? thr->driver->ident : "?",
+                  (int)(AUDIO_THREAD_HANDSHAKE_GIVEUP_US / 1000000));
+            sthread_detach(thr->thread);
+            *out_driver = NULL;
+            *out_data   = NULL;
+            return false;
+         }
          if (scond_wait_timeout(thr->cond, thr->lock,
                   AUDIO_THREAD_HANDSHAKE_WARN_US))
             continue;

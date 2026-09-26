@@ -22,6 +22,10 @@ on:
       - 'playlist.h'
       - 'tasks/task_content*'
       - 'samples/menu/playlist_nav/**'
+      - 'samples/menu/resolution_reset/**'
+      - 'samples/settings/packed_rows/**'
+      - 'setting_list.h'
+      - 'gfx/video_defines.h'
       - '.github/workflows/Linux-menu-harness.yml'
   pull_request:
     paths:
@@ -30,8 +34,16 @@ on:
       - 'playlist.h'
       - 'tasks/task_content*'
       - 'samples/menu/playlist_nav/**'
+      - 'samples/menu/resolution_reset/**'
+      - 'samples/settings/packed_rows/**'
+      - 'setting_list.h'
+      - 'gfx/video_defines.h'
       - '.github/workflows/Linux-menu-harness.yml'
   workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/master' }}
 
 jobs:
   menu-harness:
@@ -59,7 +71,25 @@ jobs:
             $pkgs
 
       - name: Checkout
-        uses: actions/checkout@v3
+        uses: actions/checkout@v5
+
+      - name: Restore ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/.ccache
+          key: ccache-${{ github.workflow }}-${{ github.job }}-${{ github.sha }}
+          restore-keys: |
+            ccache-${{ github.workflow }}-${{ github.job }}-
+
+      - name: Enable ccache
+        run: |
+          set -eu
+          command -v ccache >/dev/null 2>&1 || sudo apt-get install -y -qq ccache
+          export CCACHE_DIR="$HOME/.ccache"
+          echo "CCACHE_DIR=$CCACHE_DIR" >> "$GITHUB_ENV"
+          echo "/usr/lib/ccache" >> "$GITHUB_PATH"
+          ccache -M 500M
+          ccache -z
 
       - name: Build RetroArch headless
         shell: bash
@@ -123,3 +153,58 @@ jobs:
           samples/menu/playlist_nav/build.sh
           ./samples/menu/playlist_nav/menu_playlist_nav_test
           make -C samples/menu/playlist_nav clean
+
+      - name: Build and run resolution_reset_test
+        shell: bash
+        run: |
+          set -eu
+          # Start on the Resolution entry reinits and sets the video
+          # mode at the output size; it must keep the window state the
+          # frontend is in rather than take a windowed desktop session
+          # full screen. Shares the non-Qt build made above.
+          samples/menu/resolution_reset/build.sh
+          ./samples/menu/resolution_reset/resolution_reset_test
+          make -C samples/menu/resolution_reset clean
+
+      - name: Build and run packed_rows_test
+        shell: bash
+        run: |
+          set -eu
+          # Settings rows that each own one half of a packed settings_t
+          # word - the custom viewport's origin and size, the window
+          # size pair - driven through their display strings, a right
+          # press and the dropdown list. Each row has to show and set
+          # its own axis and leave its partner as it stands. Shares the
+          # non-Qt build made above.
+          samples/settings/packed_rows/build.sh
+          ./samples/settings/packed_rows/packed_rows_test
+          make -C samples/settings/packed_rows clean
+
+      - name: Hot function budget
+        shell: bash
+        run: |
+          set -eu
+          # Code size and stack frame of the functions that run every
+          # frame, against a checked-in reference: a change that doubles
+          # either passes every lane in the suite and shows up only as a
+          # slower frame on someone's machine. Uses the release objects
+          # this job already built.
+          .github/workflows/scripts/hot-function-budget.sh
+
+      - name: Build and run threaded_video_test
+        shell: bash
+        run: |
+          set -eu
+          # The threaded video wrapper against the real runloop, on the
+          # same non-Qt menu build: the runtime toggle, reinit under the
+          # wrapper, the command mailbox, presenter repeats, and the
+          # font init/free marshalling - the last of which is where a
+          # deferred font free unbound the video thread's GL context on
+          # X11 and left every frame after it black. This build has no
+          # allocator sanitizer, so it is also the one job where the
+          # frame-path heap lane runs: it counts heap calls over three
+          # hundred frames, threaded and not, and the frame path makes
+          # none.
+          samples/gfx/threaded_video/build.sh
+          ./samples/gfx/threaded_video/threaded_video_test 3
+          make -C samples/gfx/threaded_video clean

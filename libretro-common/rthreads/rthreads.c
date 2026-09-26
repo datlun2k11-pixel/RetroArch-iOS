@@ -28,6 +28,13 @@
 #endif
 #endif
 
+/* Affinity: cpu_set_t, CPU_SET and pthread_setaffinity_np are GNU
+ * extensions, exposed only when this is set before the first system
+ * header. */
+#if defined(__linux__) && !defined(_GNU_SOURCE)
+#define _GNU_SOURCE
+#endif
+
 #include <stdlib.h>
 #include <string.h>
 
@@ -114,6 +121,20 @@
 #include <retro_assert.h>
 #endif
 #define STACKSIZE (64 * 1024)
+#elif defined(__PS3__)
+#define USE_PS3_THREADS
+#ifdef __PSL1GHT__
+#include <sys/thread.h>
+#include <lv2/mutex.h>
+#include <lv2/cond.h>
+#else
+#include <sys/ppu_thread.h>
+#include <sys/synchronization.h>
+#endif
+#ifdef DEBUG
+#include <retro_assert.h>
+#endif
+#define STACKSIZE (128 * 1024)
 #else
 #include <pthread.h>
 #include <time.h>
@@ -222,26 +243,118 @@ static INLINE void CondVar_Broadcast(CondVar* cv)
 #endif
 
 
+#ifdef USE_PS3_THREADS
+/* Both PS3 SDKs put the same lv2 primitives behind different names, so
+ * the backend below is written against one set of its own. The names
+ * are prefixed because a unity build drops this translation unit in
+ * beside every other one, where the SDK spellings may already mean
+ * something: nothing here can be what another file sees. */
+#ifdef __PSL1GHT__
+typedef sys_lwmutex_attr_t rthreads_ps3_lwmutex_attr_t;
+typedef sys_lwcond_attr_t rthreads_ps3_lwcond_attr_t;
+
+/* Values, rather than the attribute keys some PSL1GHT vintages spell
+ * instead; the pair is what a plain non-recursive mutex asks for. */
+#ifndef SYS_LWMUTEX_PROTOCOL_PRIO
+#define SYS_LWMUTEX_PROTOCOL_PRIO 2
+#endif
+#ifndef SYS_LWMUTEX_ATTR_NOT_RECURSIVE
+#define SYS_LWMUTEX_ATTR_NOT_RECURSIVE 0x0020
+#endif
+
+#define RTHREADS_PS3_LWMUTEX_ATTR_INIT(attr) \
+   do { \
+      (attr).attr_protocol  = SYS_LWMUTEX_PROTOCOL_PRIO; \
+      (attr).attr_recursive = SYS_LWMUTEX_ATTR_NOT_RECURSIVE; \
+      (attr).name[0]        = '\0'; \
+   } while (0)
+#define RTHREADS_PS3_LWCOND_ATTR_INIT(attr) \
+   do { (attr).name[0] = '\0'; } while (0)
+
+#define RTHREADS_PS3_JOINABLE           THREAD_JOINABLE
+#define rthreads_ps3_thread_create      sysThreadCreate
+#define rthreads_ps3_thread_join        sysThreadJoin
+#define rthreads_ps3_thread_detach      sysThreadDetach
+#define rthreads_ps3_thread_exit        sysThreadExit
+#define rthreads_ps3_thread_get_id      sysThreadGetId
+#define rthreads_ps3_thread_get_prio    sysThreadGetPriority
+#define rthreads_ps3_thread_yield       sysThreadYield
+#define rthreads_ps3_thread_set_prio    sysThreadSetPriority
+#define rthreads_ps3_lwmutex_create     sysLwMutexCreate
+#define rthreads_ps3_lwmutex_destroy    sysLwMutexDestroy
+#define rthreads_ps3_lwmutex_lock       sysLwMutexLock
+#define rthreads_ps3_lwmutex_trylock    sysLwMutexTryLock
+#define rthreads_ps3_lwmutex_unlock     sysLwMutexUnlock
+#define rthreads_ps3_lwcond_create      sysLwCondCreate
+#define rthreads_ps3_lwcond_destroy     sysLwCondDestroy
+#define rthreads_ps3_lwcond_wait        sysLwCondWait
+#define rthreads_ps3_lwcond_signal      sysLwCondSignal
+#define rthreads_ps3_lwcond_signal_all  sysLwCondSignalAll
+#else
+typedef sys_lwmutex_attribute_t rthreads_ps3_lwmutex_attr_t;
+typedef sys_lwcond_attribute_t rthreads_ps3_lwcond_attr_t;
+
+#define RTHREADS_PS3_LWMUTEX_ATTR_INIT(attr) \
+   sys_lwmutex_attribute_initialize(attr)
+#define RTHREADS_PS3_LWCOND_ATTR_INIT(attr) \
+   sys_lwcond_attribute_initialize(attr)
+
+#define RTHREADS_PS3_JOINABLE           SYS_PPU_THREAD_CREATE_JOINABLE
+#define rthreads_ps3_thread_create      sys_ppu_thread_create
+#define rthreads_ps3_thread_yield       sys_ppu_thread_yield
+#define rthreads_ps3_thread_join        sys_ppu_thread_join
+#define rthreads_ps3_thread_detach      sys_ppu_thread_detach
+#define rthreads_ps3_thread_exit        sys_ppu_thread_exit
+#define rthreads_ps3_thread_get_id      sys_ppu_thread_get_id
+#define rthreads_ps3_thread_get_prio    sys_ppu_thread_get_priority
+#define rthreads_ps3_thread_set_prio    sys_ppu_thread_set_priority
+#define rthreads_ps3_lwmutex_create     sys_lwmutex_create
+#define rthreads_ps3_lwmutex_destroy    sys_lwmutex_destroy
+#define rthreads_ps3_lwmutex_lock       sys_lwmutex_lock
+#define rthreads_ps3_lwmutex_trylock    sys_lwmutex_trylock
+#define rthreads_ps3_lwmutex_unlock     sys_lwmutex_unlock
+#define rthreads_ps3_lwcond_create      sys_lwcond_create
+#define rthreads_ps3_lwcond_destroy     sys_lwcond_destroy
+#define rthreads_ps3_lwcond_wait        sys_lwcond_wait
+#define rthreads_ps3_lwcond_signal      sys_lwcond_signal
+#define rthreads_ps3_lwcond_signal_all  sys_lwcond_signal_all
+#endif
+
+/* An lv2 wait takes microseconds, with zero standing for no timeout. */
+#define RTHREADS_PS3_NO_TIMEOUT 0
+#endif
+
 #if defined(BSD) || defined(ORBIS)
 #include <sys/time.h>
 #endif
 
 /* sthread_setname */
+#if defined(__APPLE__)
+#include <dlfcn.h>
+#endif
 #if defined(__linux__) && !defined(USE_WIN32_THREADS)
 #include <sys/prctl.h>
 #endif
 
-#if defined(__ANDROID__)
+#if defined(__linux__) && !defined(USE_WIN32_THREADS)
 #include <sys/resource.h>
 #include <unistd.h>
+#if !defined(__ANDROID__) && defined(RLIMIT_RTPRIO) && defined(RLIMIT_NICE)
+#define RTHREADS_HAVE_PRIO_RLIMITS 1
+#endif
 #endif
 
-/* Android: scond goes straight to the futex. Bionic's condvar issues
- * the wake syscall on every signal whether or not anyone is waiting,
- * so a waiter count in front of it makes the common empty signal
- * free. The constants are spelled out here because they are ABI
- * facts, not header facts: the same values from 2.6-era kernels on. */
-#if defined(__ANDROID__) && !defined(USE_WIN32_THREADS)
+/* Linux: scond goes straight to the futex. The case for it on Android
+ * is that Bionic's condvar issues the wake syscall on every signal
+ * whether or not anyone is waiting, so a waiter count in front of it
+ * makes the common empty signal free. glibc already skips that syscall,
+ * but its condvar still takes its internal lock on the way to finding
+ * out: measured on one core, an empty scond_signal costs 3.6 ns through
+ * pthread_cond and 1.5 ns through the futex path, so the gate is widened
+ * to every Linux build rather than Bionic alone. The constants are
+ * spelled out here because they are ABI facts, not header facts: the
+ * same values from 2.6-era kernels on. */
+#if defined(__linux__) && !defined(USE_WIN32_THREADS)
 #include <sys/syscall.h>
 #include <errno.h>
 #define RTHREADS_FUTEX_SCOND 1
@@ -275,6 +388,8 @@ extern long syscall(long number, ...);
 #if defined(__MACH__) && defined(__APPLE__)
 #include <mach/clock.h>
 #include <mach/mach.h>
+#include <mach/mach_time.h>
+#include <mach/thread_policy.h>
 #include <TargetConditionals.h>
 #include <AvailabilityMacros.h> /* MAC_OS_X_VERSION_MIN_REQUIRED (since 10.2) */
 /* The pthread QoS override API (pthread_override_qos_class_start_np, used by
@@ -378,6 +493,8 @@ struct sthread
    s32 id;
    s32 done;               /* semaphore the exit path signals for a joiner */
    retro_atomic_int_t state;
+#elif defined(USE_PS3_THREADS)
+   sys_ppu_thread_t id;
 #else
    pthread_t id;
 #endif
@@ -401,6 +518,8 @@ struct slock
    Mutex lock;
 #elif defined(USE_PS2_THREADS)
    s32 lock;   /* binary semaphore */
+#elif defined(USE_PS3_THREADS)
+   sys_lwmutex_t lock;
 #else
    pthread_mutex_t lock;
 #endif
@@ -469,7 +588,8 @@ enum scond_spin_kind
    SCOND_SPIN_UMWAIT
 };
 
-typedef LONG (NTAPI *scond_nt_wait_alert_t)(void *hint, LARGE_INTEGER *timeout);
+typedef LONG (NTAPI *scond_nt_wait_alert_t)(volatile void *hint,
+      LARGE_INTEGER *timeout);
 typedef LONG (NTAPI *scond_nt_alert_tid_t)(HANDLE tid);
 typedef LONG (NTAPI *scond_nt_keyed_t)(HANDLE h, void *key, BOOLEAN alertable,
       LARGE_INTEGER *timeout);
@@ -551,6 +671,10 @@ struct scond
 #elif defined(RTHREADS_FUTEX_SCOND)
    retro_atomic_int_t seq;        /* bumped by every signal; futex word */
    retro_atomic_int_t waiters;    /* threads between enqueue and wake */
+#elif defined(USE_PS3_THREADS)
+   sys_lwcond_t work;
+   sys_lwmutex_t *assoc;          /* the lock this condvar is bound to */
+   retro_atomic_int_t bound;      /* nonzero once work exists */
 #else
    pthread_cond_t cond;
 #endif
@@ -745,6 +869,25 @@ static void wiiu_thread_dealloc(OSThread *thread, void *stack)
 }
 #elif defined(USE_PS2_THREADS)
 /* ps2_thread_wrap above takes the sthread itself as its argument. */
+#elif defined(USE_PS3_THREADS)
+/* The entry point takes its argument as a pointer under PSL1GHT and as
+ * the raw register value under the PS3 SDK; it arrives in the same
+ * place either way. An lv2 PPU thread leaves through the exit syscall,
+ * so returning from here is not an option. */
+#ifdef __PSL1GHT__
+static void thread_wrap(void *data_)
+#else
+static void thread_wrap(uint64_t data_)
+#endif
+{
+   struct thread_data *data = (struct thread_data*)(uintptr_t)data_;
+   if (data)
+   {
+      data->func(data->userdata);
+      free(data);
+   }
+   rthreads_ps3_thread_exit(0);
+}
 #else
 #ifdef USE_WIN32_THREADS
 static DWORD CALLBACK thread_wrap(void *data_)
@@ -761,21 +904,42 @@ static void *thread_wrap(void *data_)
 }
 #endif
 
+static sthread_t *sthread_create_ex(void (*thread_func)(void*),
+      void *userdata, int thread_priority, size_t stack_size);
+
 sthread_t *sthread_create(void (*thread_func)(void*), void *userdata)
 {
-   return sthread_create_with_priority(thread_func, userdata, 0);
+   return sthread_create_ex(thread_func, userdata, 0, 0);
+}
+
+sthread_t *sthread_create_with_priority(void (*thread_func)(void*), void *userdata, int thread_priority)
+{
+   return sthread_create_ex(thread_func, userdata, thread_priority, 0);
+}
+
+sthread_t *sthread_create_with_stack_size(void (*thread_func)(void*), void *userdata, size_t stack_size)
+{
+   return sthread_create_ex(thread_func, userdata, 0, stack_size);
 }
 
 #if !defined(USE_WIN32_THREADS) && !defined(USE_GX_THREADS) \
       && !defined(USE_CTR_THREADS) && !defined(USE_PSP_THREADS) \
       && !defined(USE_VITA_THREADS) && !defined(USE_WIIU_THREADS) \
       && !defined(USE_SWITCH_THREADS) && !defined(USE_PS2_THREADS) \
-      && !defined(__HAIKU__) && !defined(__EMSCRIPTEN__)
+      && !defined(USE_PS3_THREADS) && !defined(__HAIKU__) \
+      && !defined(__EMSCRIPTEN__)
 #define HAVE_THREAD_ATTR
 #endif
 
-sthread_t *sthread_create_with_priority(void (*thread_func)(void*), void *userdata, int thread_priority)
+static sthread_t *sthread_create_ex(void (*thread_func)(void*),
+      void *userdata, int thread_priority, size_t stack_size)
 {
+#if defined(STACKSIZE)
+   /* 0 keeps the backend's own default. This is the console case: each
+    * takes a size at create, and STACKSIZE is its default. Windows takes
+    * stack_size directly and pthread takes it through the attr. */
+   const size_t stack       = stack_size ? stack_size : (size_t)STACKSIZE;
+#endif
 #ifdef HAVE_THREAD_ATTR
    pthread_attr_t thread_attr;
    bool thread_attr_needed  = false;
@@ -802,7 +966,7 @@ sthread_t *sthread_create_with_priority(void (*thread_func)(void*), void *userda
 
 #if defined(USE_WIN32_THREADS)
    thread->id               = 0;
-   thread->thread           = CreateThread(NULL, 0, thread_wrap,
+   thread->thread           = CreateThread(NULL, stack_size, thread_wrap,
          data, 0, &thread->id);
    thread_created           = !!thread->thread;
 #elif defined(USE_GX_THREADS)
@@ -814,7 +978,7 @@ sthread_t *sthread_create_with_priority(void (*thread_func)(void*), void *userda
          prio        = (u8)(1 + ((thread_priority - 1) * 126) / 99);
       thread->id     = LWP_THREAD_NULL;
       thread_created = LWP_CreateThread(&thread->id, thread_wrap,
-            data, NULL, STACKSIZE, prio) == 0;
+            data, NULL, stack, prio) == 0;
    }
 #elif defined(USE_CTR_THREADS)
    {
@@ -843,7 +1007,7 @@ sthread_t *sthread_create_with_priority(void (*thread_func)(void*), void *userda
          prio        = 0x3F;
 
       thread->id     = threadCreate(thread_wrap, data,
-            STACKSIZE, prio, core_id, false);
+            stack, prio, core_id, false);
       thread_created = !!thread->id;
    }
 #elif defined(USE_PSP_THREADS)
@@ -877,7 +1041,7 @@ sthread_t *sthread_create_with_priority(void (*thread_func)(void*), void *userda
 
       thread->start   = start;
       thread->id      = sceKernelCreateThread("rarch_thread",
-            psp_thread_wrap, prio, STACKSIZE,
+            psp_thread_wrap, prio, stack,
             PSP_THREAD_ATTR_USER | PSP_THREAD_ATTR_VFPU, NULL);
       if (thread->id >= 0)
       {
@@ -908,7 +1072,7 @@ sthread_t *sthread_create_with_priority(void (*thread_func)(void*), void *userda
       thread->id       = -1;
       thread->done     = -1;
       retro_atomic_int_init(&thread->state, 0);
-      thread->stack    = memalign(16, STACKSIZE);
+      thread->stack    = memalign(16, stack);
       if (!thread->stack)
       {
          free(thread);
@@ -933,7 +1097,7 @@ sthread_t *sthread_create_with_priority(void (*thread_func)(void*), void *userda
       memset(&th, 0, sizeof(th));
       th.func             = (void*)ps2_thread_wrap;
       th.stack            = thread->stack;
-      th.stack_size       = STACKSIZE;
+      th.stack_size       = stack;
       th.gp_reg           = &_gp;
       th.initial_priority = prio;
       if (thread->done >= 0)
@@ -970,14 +1134,14 @@ sthread_t *sthread_create_with_priority(void (*thread_func)(void*), void *userda
       {
          s32 want = 0x3F - ((thread_priority - 1) * (0x3F - 0x1C)) / 99;
          rc       = threadCreate(&thread->t, thread_wrap, data,
-               NULL, STACKSIZE, want, -2);
+               NULL, stack, want, -2);
          if (R_FAILED(rc))
             rc    = threadCreate(&thread->t, thread_wrap, data,
-                  NULL, STACKSIZE, prio, -2);
+                  NULL, stack, prio, -2);
       }
       else
          rc       = threadCreate(&thread->t, thread_wrap, data,
-               NULL, STACKSIZE, prio, -2);
+               NULL, stack, prio, -2);
 
       if (R_SUCCEEDED(rc))
       {
@@ -997,7 +1161,7 @@ sthread_t *sthread_create_with_priority(void (*thread_func)(void*), void *userda
        * top, since PowerPC stacks grow down. */
       int32_t prio;
       uint8_t *block = (uint8_t*)memalign(16,
-            sizeof(OSThread) + STACKSIZE);
+            sizeof(OSThread) + stack);
 
       if (!block)
       {
@@ -1017,7 +1181,7 @@ sthread_t *sthread_create_with_priority(void (*thread_func)(void*), void *userda
 
       thread->id = (OSThread*)block;
       if (OSCreateThread(thread->id, thread_wrap, 0, (char*)data,
-            block + sizeof(OSThread) + STACKSIZE, STACKSIZE, prio,
+            block + sizeof(OSThread) + stack, stack, prio,
             OS_THREAD_ATTRIB_AFFINITY_ANY))
       {
          OSSetThreadDeallocator(thread->id, wiiu_thread_dealloc);
@@ -1058,7 +1222,7 @@ sthread_t *sthread_create_with_priority(void (*thread_func)(void*), void *userda
 
       thread->start   = start;
       thread->id      = sceKernelCreateThread("rarch_thread",
-            psp_thread_wrap, prio, STACKSIZE, 0, 0, NULL);
+            psp_thread_wrap, prio, stack, 0, 0, NULL);
       if (thread->id >= 0)
       {
          if (sceKernelStartThread(thread->id, sizeof(start), &start) >= 0)
@@ -1068,6 +1232,35 @@ sthread_t *sthread_create_with_priority(void (*thread_func)(void*), void *userda
       }
       if (!thread_created)
          free(start);
+   }
+#elif defined(USE_PS3_THREADS)
+   {
+      /* lv2 priorities run 0..3071 with lower numbers scheduled first;
+       * the primary thread sits at 1000. Workers inherit the creator's
+       * priority, and an explicit rthreads priority maps across
+       * 2047..512, keeping even the highest request below the band the
+       * system's own threads run in. */
+      sys_ppu_thread_t self = 0;
+      int prio              = 1000;
+
+      rthreads_ps3_thread_get_id(&self);
+      rthreads_ps3_thread_get_prio(self, &prio);
+      if (thread_priority >= 1 && thread_priority <= 100)
+         prio = 2047 - ((thread_priority - 1) * (2047 - 512)) / 99;
+      if (prio < 0)
+         prio = 0;
+      if (prio > 3071)
+         prio = 3071;
+
+      thread->id     = 0;
+      thread_created = rthreads_ps3_thread_create(&thread->id, thread_wrap,
+#ifdef __PSL1GHT__
+            data,
+#else
+            (uint64_t)(uintptr_t)data,
+#endif
+            prio, stack, RTHREADS_PS3_JOINABLE,
+            (char*)"rarch_thread") == 0;
    }
 #else
    thread->id               = 0;
@@ -1087,9 +1280,16 @@ sthread_t *sthread_create_with_priority(void (*thread_func)(void*), void *userda
 
 #if defined(__APPLE__)
    /* Default stack size on Apple is 512Kb;
-    * for PS2 disc scanning and other reasons, we'd like 2MB. */
-   pthread_attr_setstacksize(&thread_attr , 0x200000 );
+    * for PS2 disc scanning and other reasons, we'd like 2MB. A caller
+    * asking for more than that gets it below. */
+   pthread_attr_setstacksize(&thread_attr, stack_size > 0x200000 ? stack_size : 0x200000);
    thread_attr_needed = true;
+#else
+   if (stack_size)
+   {
+      pthread_attr_setstacksize(&thread_attr, stack_size);
+      thread_attr_needed = true;
+   }
 #endif
 
    if (thread_attr_needed)
@@ -1246,17 +1446,15 @@ bool sthread_prefer_fast_cores(void)
 #if defined(RTHREADS_HAVE_AFFINITY)
    if (!rthreads_fast_state)
       rthreads_find_fast_cores();
-   if (rthreads_fast_state < 0)
-      return false;
-   return syscall(__NR_sched_setaffinity, 0,
-         sizeof(rthreads_fast_mask), rthreads_fast_mask) == 0;
+   if (rthreads_fast_state >= 0)
+      return syscall(__NR_sched_setaffinity, 0,
+            sizeof(rthreads_fast_mask), rthreads_fast_mask) == 0;
 #elif defined(USE_WIN32_THREADS)
    if (!rthreads_fast_state)
       rthreads_find_fast_cores();
-   if (rthreads_fast_state < 0)
-      return false;
-   return rthreads_set_cpusets(GetCurrentThread(),
-         rthreads_fast_ids, rthreads_fast_count) != 0;
+   if (rthreads_fast_state >= 0)
+      return rthreads_set_cpusets(GetCurrentThread(),
+            rthreads_fast_ids, rthreads_fast_count) != 0;
 #elif defined(RTHREADS_HAVE_QOS_OVERRIDE)
    /* Apple silicon offers no affinity; quality of service is what
     * steers a thread onto the performance cores. */
@@ -1267,9 +1465,8 @@ bool sthread_prefer_fast_cores(void)
     * application thread there. */
    return OSSetThreadAffinity(OSGetCurrentThread(),
          OS_THREAD_ATTRIB_AFFINITY_CPU1) != FALSE;
-#else
-   return false;
 #endif
+   return false;
 }
 
 bool sthread_raise_current_priority(void)
@@ -1335,27 +1532,103 @@ bool sthread_raise_current_priority(void)
       return sceKernelChangeThreadPriority(
             sceKernelGetThreadId(), prio) == 0;
    }
+#elif defined(USE_PS3_THREADS)
+   {
+      sys_ppu_thread_t self = 0;
+      int prio              = 1000;
+      rthreads_ps3_thread_get_id(&self);
+      rthreads_ps3_thread_get_prio(self, &prio);
+      prio -= 128;
+      if (prio < 0)
+         prio = 0;
+      return rthreads_ps3_thread_set_prio(self, prio) == 0;
+   }
 #elif defined(__ANDROID__)
    /* Bionic lets an app move its own threads into the audio band
     * without privilege; -16 is ANDROID_PRIORITY_AUDIO. */
    return setpriority(PRIO_PROCESS, gettid(), -16) == 0;
+#elif defined(__MACH__) && defined(__APPLE__)
+   /* The time-constraint policy is what makes a thread real-time on
+    * Darwin: pthread_setschedparam() only moves it within the
+    * time-shared band. A period close to a small audio IO cycle with
+    * a fraction of it as the budget is what the HAL's own IO thread
+    * runs under; a thread that overruns its budget is demoted by the
+    * kernel, not killed. Needs no privilege. */
+   {
+      struct thread_time_constraint_policy policy;
+      mach_timebase_info_data_t tb;
+      double ns_per_tick;
+      if (mach_timebase_info(&tb) != KERN_SUCCESS || !tb.denom)
+         return false;
+      ns_per_tick         = (double)tb.numer / (double)tb.denom;
+      policy.period       = (uint32_t)(2900000.0 / ns_per_tick);
+      policy.computation  = (uint32_t)( 750000.0 / ns_per_tick);
+      policy.constraint   = (uint32_t)(2900000.0 / ns_per_tick);
+      policy.preemptible  = TRUE;
+      return thread_policy_set(pthread_mach_thread_np(pthread_self()),
+            THREAD_TIME_CONSTRAINT_POLICY, (thread_policy_t)&policy,
+            THREAD_TIME_CONSTRAINT_POLICY_COUNT) == KERN_SUCCESS;
+   }
 #elif defined(RTHREADS_HAVE_SCHEDPARAM)
    /* Real-time round-robin at a middling priority: above every
     * time-shared thread, below anything the system runs at the top of
     * the band. Distributions that grant the audio group an rtprio
-    * limit allow this without root; where it is refused the thread
+    * limit allow this without root. Linux then falls back to what the
+    * process's rlimits allow; where nothing is granted the thread
     * simply keeps its default, which is the caller's contract. */
-   struct sched_param sp;
-   int lo  = sched_get_priority_min(SCHED_RR);
-   int hi  = sched_get_priority_max(SCHED_RR);
-   memset(&sp, 0, sizeof(sp));
-   if (lo < 0 || hi < lo)
-      return false;
-   sp.sched_priority = lo + (hi - lo) / 2;
-   return pthread_setschedparam(pthread_self(), SCHED_RR, &sp) == 0;
-#else
-   return false;
+   {
+      struct sched_param sp;
+      int lo  = sched_get_priority_min(SCHED_RR);
+      int hi  = sched_get_priority_max(SCHED_RR);
+#if defined(RTHREADS_HAVE_PRIO_RLIMITS)
+      struct rlimit rl;
+      int nice_floor;
+      int nice_now;
 #endif
+      memset(&sp, 0, sizeof(sp));
+      if (lo >= 0 && hi >= lo)
+      {
+         sp.sched_priority = lo + (hi - lo) / 2;
+         if (pthread_setschedparam(pthread_self(), SCHED_RR, &sp) == 0)
+            return true;
+#if defined(RTHREADS_HAVE_PRIO_RLIMITS)
+         /* Without CAP_SYS_NICE a thread may take any real-time
+          * priority up to its RLIMIT_RTPRIO, so a limit below the
+          * middle of the band is asked for as it stands. */
+         if (     getrlimit(RLIMIT_RTPRIO, &rl) == 0
+               && rl.rlim_cur != RLIM_INFINITY
+               && rl.rlim_cur >= (rlim_t)lo
+               && rl.rlim_cur <  (rlim_t)sp.sched_priority)
+         {
+            sp.sched_priority = (int)rl.rlim_cur;
+            if (pthread_setschedparam(pthread_self(), SCHED_RR, &sp) == 0)
+               return true;
+         }
+#endif
+      }
+#if defined(RTHREADS_HAVE_PRIO_RLIMITS)
+      /* With real time refused, a thread may still lower its own nice
+       * value as far as 20 - RLIMIT_NICE; on Linux the nice value
+       * belongs to the thread, named by its tid. -11 is the level a
+       * sound server takes when it cannot have real time. */
+      if (getrlimit(RLIMIT_NICE, &rl) != 0 || rl.rlim_cur == 0)
+         return false;
+      nice_floor = -11;
+      if (rl.rlim_cur != RLIM_INFINITY && rl.rlim_cur < 31)
+         nice_floor = 20 - (int)rl.rlim_cur;
+      errno    = 0;
+      nice_now = getpriority(PRIO_PROCESS,
+            (id_t)syscall(__NR_gettid));
+      if (nice_now == -1 && errno)
+         return false;
+      if (nice_floor >= nice_now)
+         return false;
+      return setpriority(PRIO_PROCESS,
+            (id_t)syscall(__NR_gettid), nice_floor) == 0;
+#endif
+   }
+#endif
+   return false;
 }
 
 void sthread_setname(const char *name)
@@ -1375,9 +1648,20 @@ void sthread_setname(const char *name)
    buf[i] = '\0';
    prctl(PR_SET_NAME, buf, 0, 0, 0);
 #elif defined(__APPLE__)
+   /* pthread_setname_np is 10.6; it is looked up at run time so one
+    * binary builds against, and runs on, 10.5 as well.  The pointer is
+    * kept once found: it cannot come and go while the process runs. */
+   static int (*setname)(const char*) = NULL;
+   static int looked_up               = 0;
    if (!name)
       return;
-   pthread_setname_np(name);
+   if (!looked_up)
+   {
+      *(void**)&setname = dlsym(RTLD_DEFAULT, "pthread_setname_np");
+      looked_up         = 1;
+   }
+   if (setname)
+      setname(name);
 #elif defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__DragonFly__)
    if (!name)
       return;
@@ -1476,6 +1760,15 @@ int sthread_detach(sthread_t *thread)
    switch_reap_list = thread;
    mutexUnlock(&switch_reap_lock);
    return 0;
+#elif defined(USE_PS3_THREADS)
+   {
+      int ret;
+      if (!thread)
+         return 0;
+      ret = rthreads_ps3_thread_detach(thread->id);
+      free(thread);
+      return ret;
+   }
 #else
    int ret;
    if (!thread)
@@ -1516,10 +1809,148 @@ void sthread_join(sthread_t *thread)
    WaitSema(thread->done);
    DeleteSema(thread->done);
    free(thread->stack);
+#elif defined(USE_PS3_THREADS)
+   {
+      uint64_t exitcode = 0;
+      rthreads_ps3_thread_join(thread->id, &exitcode);
+   }
 #else
    pthread_join(thread->id, NULL);
 #endif
    free(thread);
+}
+
+/* Affinity. A mask of 0 means "any CPU", which is how a caller undoes a
+ * pin. Windows takes the mask directly; glibc takes a cpu_set built from
+ * it; Bionic has no pthread_setaffinity_np, so the thread's kernel id is
+ * used with sched_setaffinity instead. Darwin has no hard affinity, only
+ * a scheduler hint, and reports false rather than pretend; so does every
+ * console and every other backend. */
+#if defined(USE_WIN32_THREADS)
+static bool sthread_set_affinity_handle(HANDLE h, uint64_t mask)
+{
+   if (mask == 0)
+      mask = ~mask;
+   return SetThreadAffinityMask(h, (DWORD_PTR)mask) != 0;
+}
+#elif defined(__ANDROID__)
+/* bionic declares cpu_set_t and sched_setaffinity under _GNU_SOURCE
+ * only, which has to be set before the first system header - not
+ * something a unity build's include order provides. The kernel call
+ * takes a plain bit mask, so it is made directly. */
+static bool sthread_set_tid_affinity(pid_t tid, uint64_t mask)
+{
+   unsigned long bits[64 / (8 * sizeof(unsigned long))];
+   unsigned i;
+   memset(bits, 0, sizeof(bits));
+   if (!mask)
+   {
+      long n = sysconf(_SC_NPROCESSORS_CONF);
+      for (i = 0; (long)i < n && i < 64; i++)
+         mask |= (uint64_t)1 << i;
+   }
+   for (i = 0; i < 64; i++)
+      if (mask & ((uint64_t)1 << i))
+         bits[i / (8 * sizeof(unsigned long))] |=
+            1UL << (i % (8 * sizeof(unsigned long)));
+   return syscall(__NR_sched_setaffinity, tid, sizeof(bits), bits) == 0;
+}
+#elif defined(__linux__) && !defined(USE_GX_THREADS) && !defined(USE_CTR_THREADS) \
+   && !defined(USE_PSP_THREADS) && !defined(USE_PS2_THREADS) && !defined(USE_PS3_THREADS) \
+   && !defined(USE_SWITCH_THREADS) && !defined(USE_WIIU_THREADS) && !defined(USE_VITA_THREADS)
+#include <sched.h>
+static void sthread_mask_to_set(uint64_t mask, cpu_set_t *set)
+{
+   unsigned i;
+   CPU_ZERO(set);
+   if (mask)
+   {
+      for (i = 0; i < 64; i++)
+         if (mask & ((uint64_t)1 << i))
+            CPU_SET(i, set);
+   }
+   else
+   {
+      long n = sysconf(_SC_NPROCESSORS_CONF);
+      for (i = 0; (long)i < n && i < CPU_SETSIZE; i++)
+         CPU_SET(i, set);
+   }
+}
+#endif
+
+bool sthread_set_affinity(sthread_t *thread, uint64_t mask)
+{
+#if defined(USE_WIN32_THREADS)
+   return thread && sthread_set_affinity_handle(thread->thread, mask);
+#elif defined(__ANDROID__)
+#if __ANDROID_API__ >= 21
+   return thread && sthread_set_tid_affinity(pthread_gettid_np(thread->id), mask);
+#else
+   /* No pthread_gettid_np before API 21 and no other way to name
+    * another thread to sched_setaffinity; only the calling thread can
+    * pin itself there (sthread_set_current_affinity). */
+   (void)thread; (void)mask;
+   return false;
+#endif
+#elif defined(__linux__) && !defined(USE_GX_THREADS) && !defined(USE_CTR_THREADS) \
+   && !defined(USE_PSP_THREADS) && !defined(USE_PS2_THREADS) && !defined(USE_PS3_THREADS) \
+   && !defined(USE_SWITCH_THREADS) && !defined(USE_WIIU_THREADS) && !defined(USE_VITA_THREADS)
+   cpu_set_t set;
+   if (thread)
+   {
+      sthread_mask_to_set(mask, &set);
+      return pthread_setaffinity_np(thread->id, sizeof(set), &set) == 0;
+   }
+#else
+   (void)thread; (void)mask;
+#endif
+   return false;
+}
+
+bool sthread_set_current_affinity(uint64_t mask)
+{
+#if defined(USE_WIN32_THREADS)
+   return sthread_set_affinity_handle(GetCurrentThread(), mask);
+#elif defined(__ANDROID__)
+   return sthread_set_tid_affinity(0, mask);
+#elif defined(__linux__) && !defined(USE_GX_THREADS) && !defined(USE_CTR_THREADS) \
+   && !defined(USE_PSP_THREADS) && !defined(USE_PS2_THREADS) && !defined(USE_PS3_THREADS) \
+   && !defined(USE_SWITCH_THREADS) && !defined(USE_WIIU_THREADS) && !defined(USE_VITA_THREADS)
+   cpu_set_t set;
+   sthread_mask_to_set(mask, &set);
+   return sched_setaffinity(0, sizeof(set), &set) == 0;
+#else
+   (void)mask;
+   return false;
+#endif
+}
+
+/* Yield the rest of this timeslice to any runnable thread. What a
+ * bounded spin does when its bound is reached and it is not yet ready to
+ * park: the signal-safe alternative to a lock, for the one place a lock
+ * cannot go (a fault handler), and the backoff between polls of a
+ * condition that has no waiter list. Every backend has one. */
+void sthread_yield(void)
+{
+#if defined(USE_WIN32_THREADS)
+   SwitchToThread();
+#elif defined(USE_GX_THREADS)
+   LWP_YieldThread();
+#elif defined(USE_CTR_THREADS)
+   svcSleepThread(0);
+#elif defined(USE_PSP_THREADS) || defined(USE_VITA_THREADS)
+   sceKernelDelayThread(0);
+#elif defined(USE_WIIU_THREADS)
+   OSYieldThread();
+#elif defined(USE_SWITCH_THREADS)
+   svcSleepThread(0);
+#elif defined(USE_PS2_THREADS)
+   RotateThreadReadyQueue(0);
+#elif defined(USE_PS3_THREADS)
+   rthreads_ps3_thread_yield();
+#else
+   sched_yield();
+#endif
 }
 
 bool sthread_isself(sthread_t *thread)
@@ -1538,6 +1969,14 @@ bool sthread_isself(sthread_t *thread)
    return thread ? threadGetSelf() == &thread->t             : false;
 #elif defined(USE_PS2_THREADS)
    return thread ? GetThreadId() == thread->id               : false;
+#elif defined(USE_PS3_THREADS)
+   {
+      sys_ppu_thread_t self = 0;
+      if (!thread)
+         return false;
+      rthreads_ps3_thread_get_id(&self);
+      return self == thread->id;
+   }
 #else
    return thread ? pthread_equal(pthread_self(), thread->id) : false;
 #endif
@@ -1569,6 +2008,16 @@ slock_t *slock_new(void)
    {
       free(lock);
       return NULL;
+   }
+#elif defined(USE_PS3_THREADS)
+   {
+      rthreads_ps3_lwmutex_attr_t attr;
+      RTHREADS_PS3_LWMUTEX_ATTR_INIT(attr);
+      if (rthreads_ps3_lwmutex_create(&lock->lock, &attr) != 0)
+      {
+         free(lock);
+         return NULL;
+      }
    }
 #elif defined(USE_WIIU_THREADS)
    OSFastMutex_Init(&lock->lock, "rarch_lock");
@@ -1615,6 +2064,8 @@ void slock_free(slock_t *lock)
    /* nothing to destroy */
 #elif defined(USE_PS2_THREADS)
    DeleteSema(lock->lock);
+#elif defined(USE_PS3_THREADS)
+   rthreads_ps3_lwmutex_destroy(&lock->lock);
 #else
    pthread_mutex_destroy(&lock->lock);
 #endif
@@ -1641,6 +2092,8 @@ void slock_lock(slock_t *lock)
    mutexLock(&lock->lock);
 #elif defined(USE_PS2_THREADS)
    WaitSema(lock->lock);
+#elif defined(USE_PS3_THREADS)
+   rthreads_ps3_lwmutex_lock(&lock->lock, RTHREADS_PS3_NO_TIMEOUT);
 #else
    pthread_mutex_lock(&lock->lock);
 #endif
@@ -1664,6 +2117,8 @@ bool slock_try_lock(slock_t *lock)
    return lock && mutexTryLock(&lock->lock);
 #elif defined(USE_PS2_THREADS)
    return lock && (PollSema(lock->lock) >= 0);
+#elif defined(USE_PS3_THREADS)
+   return lock && (rthreads_ps3_lwmutex_trylock(&lock->lock) == 0);
 #else
    return lock && (pthread_mutex_trylock(&lock->lock) == 0);
 #endif
@@ -1689,6 +2144,8 @@ void slock_unlock(slock_t *lock)
    mutexUnlock(&lock->lock);
 #elif defined(USE_PS2_THREADS)
    SignalSema(lock->lock);
+#elif defined(USE_PS3_THREADS)
+   rthreads_ps3_lwmutex_unlock(&lock->lock);
 #else
    pthread_mutex_unlock(&lock->lock);
 #endif
@@ -1710,6 +2167,30 @@ static void scond_bind_vita(scond_t *cond, slock_t *lock)
       cond->assoc = &lock->lock;
       sceKernelCreateLwCond(&cond->work, "rarch_cond", 0,
             &lock->lock, NULL);
+      retro_atomic_store_release_int(&cond->bound, 1);
+   }
+#ifdef DEBUG
+   retro_assert(cond->assoc == &lock->lock);
+#endif
+}
+#endif
+
+#ifdef USE_PS3_THREADS
+/* An lwcond is created bound to one lwmutex, and scond only learns its
+ * lock at the first wait, so binding happens there. The caller holds
+ * the lock at that point, so concurrent first waits are serialized by
+ * the lock itself; a signal that still observes the condvar as unbound
+ * corresponds to a moment with no blocked waiter, where dropping the
+ * signal is what a condvar does anyway. Waiting on one condvar with
+ * two different locks is as undefined here as it is for pthreads. */
+static void scond_bind_ps3(scond_t *cond, slock_t *lock)
+{
+   if (!retro_atomic_load_acquire_int(&cond->bound))
+   {
+      rthreads_ps3_lwcond_attr_t attr;
+      RTHREADS_PS3_LWCOND_ATTR_INIT(attr);
+      cond->assoc = &lock->lock;
+      rthreads_ps3_lwcond_create(&cond->work, &lock->lock, &attr);
       retro_atomic_store_release_int(&cond->bound, 1);
    }
 #ifdef DEBUG
@@ -1752,6 +2233,9 @@ scond_t *scond_new(void)
 #elif defined(USE_VITA_THREADS)
    cond->assoc = NULL;
    retro_atomic_int_init(&cond->bound, 0);
+#elif defined(USE_PS3_THREADS)
+   cond->assoc = NULL;
+   retro_atomic_int_init(&cond->bound, 0);
 #elif defined(USE_WIIU_THREADS)
    OSFastMutex_Init(&cond->gate, "rarch_cond");
 #elif defined(USE_SWITCH_THREADS)
@@ -1789,6 +2273,9 @@ void scond_free(scond_t *cond)
 #elif defined(USE_VITA_THREADS)
    if (retro_atomic_load_acquire_int(&cond->bound))
       sceKernelDeleteLwCond(&cond->work);
+#elif defined(USE_PS3_THREADS)
+   if (retro_atomic_load_acquire_int(&cond->bound))
+      rthreads_ps3_lwcond_destroy(&cond->work);
 #elif defined(USE_WIIU_THREADS)
    /* nothing to destroy: waiter nodes live on their threads' stacks */
 #elif defined(USE_SWITCH_THREADS) || defined(USE_PS2_THREADS) \
@@ -1862,7 +2349,7 @@ static INLINE void scond_pause(void)
 #if defined(SCOND_HAVE_MWAITX)
 /* AMD: park on the line holding *addr until it is written or ticks
  * TSC cycles pass (ECX bit 1 enables the timer) */
-static INLINE void scond_monitorx(const void *addr)
+static INLINE void scond_monitorx(const volatile void *addr)
 {
 #if defined(SCOND_HAVE_X86_INTRIN)
    _mm_monitorx((void*)addr, 0, 0);
@@ -1886,7 +2373,7 @@ static INLINE void scond_mwaitx(unsigned ticks)
 #if defined(SCOND_HAVE_UMWAIT)
 /* Intel WAITPKG: park on the line until written or the absolute TSC
  * deadline; control 1 asks for the lighter C0.1 state */
-static INLINE void scond_umonitor(const void *addr)
+static INLINE void scond_umonitor(const volatile void *addr)
 {
 #if defined(SCOND_HAVE_X86_INTRIN)
    _umonitor((void*)addr);
@@ -2299,6 +2786,9 @@ void scond_wait(scond_t *cond, slock_t *lock)
 #elif defined(USE_VITA_THREADS)
    scond_bind_vita(cond, lock);
    sceKernelWaitLwCond(&cond->work, NULL);
+#elif defined(USE_PS3_THREADS)
+   scond_bind_ps3(cond, lock);
+   rthreads_ps3_lwcond_wait(&cond->work, RTHREADS_PS3_NO_TIMEOUT);
 #elif defined(USE_WIIU_THREADS)
    struct wiiu_cond_waiter w;
    w.next = NULL;
@@ -2375,6 +2865,10 @@ int scond_broadcast(scond_t *cond)
 #elif defined(USE_VITA_THREADS)
    if (retro_atomic_load_acquire_int(&cond->bound))
       sceKernelSignalLwCondAll(&cond->work);
+   return 0;
+#elif defined(USE_PS3_THREADS)
+   if (retro_atomic_load_acquire_int(&cond->bound))
+      rthreads_ps3_lwcond_signal_all(&cond->work);
    return 0;
 #elif defined(USE_WIIU_THREADS)
    struct wiiu_cond_waiter *w, *next;
@@ -2473,6 +2967,9 @@ void scond_signal(scond_t *cond)
 #elif defined(USE_VITA_THREADS)
    if (retro_atomic_load_acquire_int(&cond->bound))
       sceKernelSignalLwCond(&cond->work);
+#elif defined(USE_PS3_THREADS)
+   if (retro_atomic_load_acquire_int(&cond->bound))
+      rthreads_ps3_lwcond_signal(&cond->work);
 #elif defined(USE_WIIU_THREADS)
    struct wiiu_cond_waiter *w;
    OSFastMutex_Lock(&cond->gate);
@@ -2603,6 +3100,12 @@ bool scond_wait_timeout(scond_t *cond, slock_t *lock, int64_t timeout_us)
    }
    slock_lock(lock);
    return woken;
+#elif defined(USE_PS3_THREADS)
+   if (timeout_us <= 0)
+      return false;
+   scond_bind_ps3(cond, lock);
+   return rthreads_ps3_lwcond_wait(&cond->work,
+         (uint64_t)timeout_us) == 0;
 #elif defined(USE_VITA_THREADS)
    unsigned int to;
    if (timeout_us <= 0)
@@ -2755,14 +3258,16 @@ bool scond_wait_timeout(scond_t *cond, slock_t *lock, int64_t timeout_us)
    now.tv_sec  = mts.tv_sec;
    now.tv_nsec = mts.tv_nsec;
 #endif
-#elif !defined(__PSL1GHT__) && defined(__PS3__)
-   sys_time_sec_t s;
-   sys_time_nsec_t n;
-   sys_time_get_current_time(&s, &n);
-   now.tv_sec            = s;
-   now.tv_nsec           = n;
 #elif defined(RETRO_WIN32_USE_PTHREADS)
-   _ftime64_s(&now);
+   {
+      /* _ftime64_s fills a __timeb64, not a timespec: seconds and
+       * milliseconds, which pthread_cond_timedwait wants as seconds
+       * and nanoseconds since the epoch. */
+      struct __timeb64 tb;
+      _ftime64_s(&tb);
+      now.tv_sec  = (time_t)tb.time;
+      now.tv_nsec = (long)tb.millitm * 1000000L;
+   }
 #else
    clock_gettime(CLOCK_REALTIME, &now);
 #endif
@@ -2860,6 +3365,12 @@ uintptr_t sthread_get_current_thread_id(void)
    return (uintptr_t)threadGetSelf();
 #elif defined(USE_PS2_THREADS)
    return (uintptr_t)GetThreadId();
+#elif defined(USE_PS3_THREADS)
+   {
+      sys_ppu_thread_t self = 0;
+      rthreads_ps3_thread_get_id(&self);
+      return (uintptr_t)self;
+   }
 #else
    return (uintptr_t)pthread_self();
 #endif
@@ -2885,7 +3396,7 @@ bool sthread_is_main_thread(void)
       && !defined(USE_CTR_THREADS) && !defined(USE_PSP_THREADS) \
       && !defined(USE_VITA_THREADS) && !defined(USE_WIIU_THREADS) \
       && !defined(USE_SWITCH_THREADS) && !defined(USE_PS2_THREADS) \
-      && !defined(__ANDROID__)
+      && !defined(USE_PS3_THREADS) && !defined(__ANDROID__)
 #define RTHREADS_HAVE_CANCEL 1
 #endif
 

@@ -732,8 +732,7 @@ static void gl3_static_texture_init(struct gl3_static_texture *tex,
    texture->filter            = GLSLANG_FILTER_CHAIN_NEAREST;
    texture->mip_filter        = GLSLANG_FILTER_CHAIN_NEAREST;
    texture->address           = address;
-   texture->texture.width     = width;
-   texture->texture.height    = height;
+   texture->texture.dims      = VIDEO_SCALE_PACK(width, height);
    texture->texture.format    = 0;
    texture->texture.image     = image_;
 
@@ -798,8 +797,7 @@ struct gl3_common_resources
    gl3_buffer_locations quad_loc;
 };
 
-/* Every default was zero, so a memset covers the initializers the
- * in-class ones used to supply. */
+/* Every field starts at zero, so a memset covers the whole struct. */
 static void gl3_common_resources_init(gl3_common_resources *common)
 {
    static float quad_data[] = {
@@ -824,8 +822,8 @@ static void gl3_common_resources_init(gl3_common_resources *common)
 static void gl3_common_resources_free(gl3_common_resources *common)
 {
    size_t i;
-   /* The unique_ptr vector used to free these on destruction; the plain
-    * array does not, so every LUT has to be released by hand. */
+   /* The LUT array owns its textures, so each one is released by
+    * hand before the array itself goes. */
    for (i = 0; i < common->num_luts; i++)
       gl3_static_texture_free(&common->luts[i]);
    free(common->luts);
@@ -855,8 +853,8 @@ static void gl3_common_resources_free(gl3_common_resources *common)
 struct gl3_framebuffer
 {
    GLuint image;
-   unsigned size_width;
-      unsigned size_height;
+   /* The target's size, in VIDEO_SCALE_PACK's layout. */
+   unsigned size_dims;
    GLenum format;
    unsigned max_levels;
    unsigned levels;
@@ -877,8 +875,7 @@ static struct gl3_framebuffer *gl3_framebuffer_new(GLenum format_,
    if (!fb)
       return NULL;
 
-   fb->size_width  = 1;
-   fb->size_height = 1;
+   fb->size_dims   = VIDEO_SCALE_PACK(1, 1);
    fb->format      = format_;
    fb->max_levels  = max_levels_;
 
@@ -895,10 +892,9 @@ static struct gl3_framebuffer *gl3_framebuffer_new(GLenum format_,
 }
 
 static void gl3_framebuffer_set_size(struct gl3_framebuffer *fb,
-      unsigned width_, unsigned height_, GLenum format_)
+      unsigned dims, GLenum format_)
 {
-   fb->size_width  = width_;
-   fb->size_height = height_;
+   fb->size_dims   = dims;
    if (format_ != 0)
       fb->format = format_;
 
@@ -920,12 +916,13 @@ static void gl3_framebuffer_build(struct gl3_framebuffer *fb)
    glGenTextures(1, &fb->image);
    glBindTexture(GL_TEXTURE_2D, fb->image);
 
-   if (fb->size_width == 0)
-      fb->size_width = 1;
-   if (fb->size_height == 0)
-      fb->size_height = 1;
+   if (VIDEO_SCALE_W(fb->size_dims) == 0)
+      VIDEO_SCALE_PUT_W(fb->size_dims, 1);
+   if (VIDEO_SCALE_H(fb->size_dims) == 0)
+      VIDEO_SCALE_PUT_H(fb->size_dims, 1);
 
-   fb->levels = glslang_num_miplevels(fb->size_width, fb->size_height);
+   fb->levels = glslang_num_miplevels(
+         VIDEO_SCALE_W(fb->size_dims), VIDEO_SCALE_H(fb->size_dims));
    if (fb->max_levels < fb->levels)
       fb->levels = fb->max_levels;
    if (fb->levels == 0)
@@ -933,7 +930,7 @@ static void gl3_framebuffer_build(struct gl3_framebuffer *fb)
 
    glTexStorage2D(GL_TEXTURE_2D, fb->levels,
                   fb->format,
-                  fb->size_width, fb->size_height);
+                  VIDEO_SCALE_W(fb->size_dims), VIDEO_SCALE_H(fb->size_dims));
 
    glFramebufferTexture2D(GL_FRAMEBUFFER,
          GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, fb->image, 0);
@@ -966,12 +963,15 @@ static void gl3_framebuffer_build(struct gl3_framebuffer *fb)
                glGenTextures(1, &fb->image);
                glBindTexture(GL_TEXTURE_2D, fb->image);
 
-               levels = glslang_num_miplevels(fb->size_width, fb->size_height);
+               levels = glslang_num_miplevels(
+                     VIDEO_SCALE_W(fb->size_dims),
+                     VIDEO_SCALE_H(fb->size_dims));
                if (fb->max_levels < levels)
                   levels = fb->max_levels;
                glTexStorage2D(GL_TEXTURE_2D, levels,
                      GL_RGBA8,
-                     fb->size_width, fb->size_height);
+                     VIDEO_SCALE_W(fb->size_dims),
+                     VIDEO_SCALE_H(fb->size_dims));
                glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, fb->image, 0);
                fb->complete = glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE;
             }
@@ -1042,17 +1042,14 @@ static void gl3_ubo_ring_free(struct gl3_ubo_ring *ring)
 struct gl3_pass
 {
 
-#ifdef GL3_ROLLING_SCANLINE_SIMULATION
-
-#endif /* GL3_ROLLING_SCANLINE_SIMULATION */
-
    bool final_pass;
 
    GLuint pipeline;
    gl3_common_resources *common;
 
-   unsigned current_framebuffer_size_width;
-      unsigned current_framebuffer_size_height;
+   /* The size this pass last rendered at, in VIDEO_SCALE_PACK's
+    * layout. */
+   unsigned current_framebuffer_size_dims;
    gl3_viewport curr_vp;
    gl3_filter_chain_pass_info pass_info;
 
@@ -1073,6 +1070,7 @@ struct gl3_pass
    size_t uniforms_size;
 
    uint64_t frame_count;
+   uint64_t swap_count;
    unsigned frame_count_period;
    int32_t frame_direction;
    uint32_t frame_time_delta;
@@ -1135,13 +1133,11 @@ static void gl3_pass_reflect_texture_parameter(struct gl3_pass *pass, const char
 static void gl3_pass_reflect_parameter_array(struct gl3_pass *pass, const char *name, slang_texture_semantic_array *meta);
 static bool gl3_pass_init_pipeline(struct gl3_pass *pass);
 static void gl3_pass_set_pass_info(struct gl3_pass *pass, const gl3_filter_chain_pass_info info);
-static void gl3_pass_get_output_size(struct gl3_pass *pass,
-      unsigned original_width, unsigned original_height,
-      unsigned source_width, unsigned source_height,
-      unsigned *out_width, unsigned *out_height);
+static unsigned gl3_pass_get_output_size(struct gl3_pass *pass,
+      unsigned original_dims, unsigned source_dims);
 static void gl3_pass_end_frame(struct gl3_pass *pass);
 static void gl3_pass_build_semantic_vec4(struct gl3_pass *pass, uint8_t *data, enum slang_semantic semantic,
-      unsigned width, unsigned height);
+      unsigned dims);
 static void gl3_pass_build_semantic_parameter(struct gl3_pass *pass, uint8_t *data, unsigned index, float value);
 static void gl3_pass_build_semantic_uint(struct gl3_pass *pass, uint8_t *data, enum slang_semantic semantic,
                                uint32_t value);
@@ -1154,9 +1150,9 @@ static void gl3_pass_build_semantic_vec3(struct gl3_pass *pass, uint8_t *data, e
 static void gl3_pass_build_semantic_texture(struct gl3_pass *pass, uint8_t *buffer,
       enum slang_texture_semantic semantic, const gl3_texture_t *texture);
 static void gl3_pass_build_semantic_texture_array_vec4(struct gl3_pass *pass, uint8_t *data, enum slang_texture_semantic semantic,
-      unsigned index, unsigned width, unsigned height);
+      unsigned index, unsigned dims);
 static void gl3_pass_build_semantic_texture_vec4(struct gl3_pass *pass, uint8_t *data, enum slang_texture_semantic semantic,
-      unsigned width, unsigned height);
+      unsigned dims);
 static bool gl3_pass_init_feedback(struct gl3_pass *pass);
 static void gl3_pass_set_shader(struct gl3_pass *pass, GLenum stage,
       const uint32_t *spirv,
@@ -1175,8 +1171,8 @@ static void gl3_pass_build_commands(struct gl3_pass *pass,
       const float *mvp);
 static void gl3_pass_free(struct gl3_pass *pass);
 
-/* Every default was zero except these four, which the in-class
- * initializers used to supply. */
+/* Every field starts at zero except the four set below, so the
+ * allocation is zeroed and only those are written. */
 static struct gl3_pass *gl3_pass_new(bool final_pass)
 {
    struct gl3_pass *pass = (struct gl3_pass*)calloc(1, sizeof(*pass));
@@ -1626,6 +1622,7 @@ static bool gl3_pass_init_pipeline(struct gl3_pass *pass)
    gl3_pass_reflect_parameter(pass, "Gyroscope", &pass->reflection.semantics[SLANG_SEMANTIC_GYROSCOPE]);
    gl3_pass_reflect_parameter(pass, "Accelerometer", &pass->reflection.semantics[SLANG_SEMANTIC_ACCELEROMETER]);
    gl3_pass_reflect_parameter(pass, "AccelerometerRest", &pass->reflection.semantics[SLANG_SEMANTIC_ACCELEROMETER_REST]);
+   gl3_pass_reflect_parameter(pass, "SwapCount", &pass->reflection.semantics[SLANG_SEMANTIC_SWAP_COUNT]);
 
    {
       const slang_semantic_meta *g =
@@ -1637,7 +1634,7 @@ static bool gl3_pass_init_pipeline(struct gl3_pass *pass)
       if (g->uniform || g->push_constant ||
           a->uniform || a->push_constant ||
           r->uniform || r->push_constant)
-         input_state_get_ptr()->shader_uses_sensors = true;
+         input_driver_set_shader_uses_sensors(true);
    }
 
    gl3_pass_reflect_texture_parameter(pass, "OriginalSize",
@@ -1678,25 +1675,26 @@ static void gl3_pass_set_pass_info(struct gl3_pass *pass, const gl3_filter_chain
    pass->pass_info = info;
 }
 
-static void gl3_pass_get_output_size(struct gl3_pass *pass,
-      unsigned original_width, unsigned original_height,
-      unsigned source_width, unsigned source_height,
-      unsigned *out_width, unsigned *out_height)
+/* Returns the size this pass renders at, in VIDEO_SCALE_PACK's
+ * layout. The two axes scale independently of each other, so they are
+ * worked out separately and joined only on the way out. */
+static unsigned gl3_pass_get_output_size(struct gl3_pass *pass,
+      unsigned original_dims, unsigned source_dims)
 {
    float width  = 0.0f;
    float height = 0.0f;
    switch (pass->pass_info.scale_type_x)
    {
       case GLSLANG_FILTER_CHAIN_SCALE_ORIGINAL:
-         width = (float)(original_width) * pass->pass_info.scale_x;
+         width = (float)VIDEO_SCALE_W(original_dims) * pass->pass_info.scale_x;
          break;
 
       case GLSLANG_FILTER_CHAIN_SCALE_SOURCE:
-         width = (float)(source_width) * pass->pass_info.scale_x;
+         width = (float)VIDEO_SCALE_W(source_dims) * pass->pass_info.scale_x;
          break;
 
       case GLSLANG_FILTER_CHAIN_SCALE_VIEWPORT:
-         width = (retroarch_get_rotation() % 2 ? pass->curr_vp.height : pass->curr_vp.width) * pass->pass_info.scale_x;
+         width = (pass->rotation % 2 ? VIDEO_SCALE_H(pass->curr_vp.dims) : VIDEO_SCALE_W(pass->curr_vp.dims)) * pass->pass_info.scale_x;
          break;
 
       case GLSLANG_FILTER_CHAIN_SCALE_ABSOLUTE:
@@ -1710,15 +1708,15 @@ static void gl3_pass_get_output_size(struct gl3_pass *pass,
    switch (pass->pass_info.scale_type_y)
    {
       case GLSLANG_FILTER_CHAIN_SCALE_ORIGINAL:
-         height = (float)(original_height) * pass->pass_info.scale_y;
+         height = (float)VIDEO_SCALE_H(original_dims) * pass->pass_info.scale_y;
          break;
 
       case GLSLANG_FILTER_CHAIN_SCALE_SOURCE:
-         height = (float)(source_height) * pass->pass_info.scale_y;
+         height = (float)VIDEO_SCALE_H(source_dims) * pass->pass_info.scale_y;
          break;
 
       case GLSLANG_FILTER_CHAIN_SCALE_VIEWPORT:
-         height = (retroarch_get_rotation() % 2 ? pass->curr_vp.width : pass->curr_vp.height) * pass->pass_info.scale_y;
+         height = (pass->rotation % 2 ? VIDEO_SCALE_W(pass->curr_vp.dims) : VIDEO_SCALE_H(pass->curr_vp.dims)) * pass->pass_info.scale_y;
          break;
 
       case GLSLANG_FILTER_CHAIN_SCALE_ABSOLUTE:
@@ -1729,8 +1727,10 @@ static void gl3_pass_get_output_size(struct gl3_pass *pass,
          break;
    }
 
-   *out_width  = (unsigned)(roundf(width));
-   *out_height = (unsigned)(roundf(height));
+   /* VIDEO_PX rounds rather than truncates and bounds the conversion:
+    * a scale factor that puts either axis outside int range would make
+    * a plain cast undefined. */
+   return VIDEO_SCALE_PACK(VIDEO_PX(width), VIDEO_PX(height));
 }
 
 static void gl3_pass_end_frame(struct gl3_pass *pass)
@@ -1741,8 +1741,10 @@ static void gl3_pass_end_frame(struct gl3_pass *pass)
 }
 
 static void gl3_pass_build_semantic_vec4(struct gl3_pass *pass, uint8_t *data, enum slang_semantic semantic,
-      unsigned width, unsigned height)
+      unsigned dims)
 {
+   unsigned width  = VIDEO_SCALE_W(dims);
+   unsigned height = VIDEO_SCALE_H(dims);
    slang_semantic_meta *refl = (slang_semantic_meta*)
       &pass->reflection.semantics[semantic];
 
@@ -1962,13 +1964,15 @@ static void gl3_pass_build_semantic_texture(struct gl3_pass *pass, uint8_t *buff
       enum slang_texture_semantic semantic, const gl3_texture_t *texture)
 {
    gl3_pass_build_semantic_texture_vec4(pass, buffer, semantic,
-         texture->texture.width, texture->texture.height);
+         texture->texture.dims);
    gl3_pass_set_semantic_texture(pass, semantic, texture);
 }
 
 static void gl3_pass_build_semantic_texture_array_vec4(struct gl3_pass *pass, uint8_t *data, enum slang_texture_semantic semantic,
-      unsigned index, unsigned width, unsigned height)
+      unsigned index, unsigned dims)
 {
+   unsigned width  = VIDEO_SCALE_W(dims);
+   unsigned height = VIDEO_SCALE_H(dims);
    const slang_texture_semantic_array *arr =
       &pass->reflection.semantic_textures[semantic];
    const slang_texture_semantic_meta *refl;
@@ -2026,9 +2030,9 @@ static void gl3_pass_build_semantic_texture_array_vec4(struct gl3_pass *pass, ui
 }
 
 static void gl3_pass_build_semantic_texture_vec4(struct gl3_pass *pass, uint8_t *data, enum slang_texture_semantic semantic,
-      unsigned width, unsigned height)
+      unsigned dims)
 {
-   gl3_pass_build_semantic_texture_array_vec4(pass, data, semantic, 0, width, height);
+   gl3_pass_build_semantic_texture_array_vec4(pass, data, semantic, 0, dims);
 }
 
 static bool gl3_pass_init_feedback(struct gl3_pass *pass)
@@ -2143,7 +2147,7 @@ static void gl3_pass_build_semantic_texture_array(struct gl3_pass *pass, uint8_t
       enum slang_texture_semantic semantic, unsigned index, const gl3_texture_t *texture)
 {
    gl3_pass_build_semantic_texture_array_vec4(pass, buffer, semantic, index,
-         texture->texture.width, texture->texture.height);
+         texture->texture.dims);
 
    if (index < pass->reflection.semantic_textures[semantic].size &&
          pass->reflection.semantic_textures[semantic].data[index].texture)
@@ -2191,11 +2195,9 @@ static void gl3_pass_build_semantics(struct gl3_pass *pass, uint8_t *buffer,
 
    /* Output information */
    gl3_pass_build_semantic_vec4(pass, buffer, SLANG_SEMANTIC_OUTPUT,
-                       pass->current_framebuffer_size_width,
-                       pass->current_framebuffer_size_height);
+                       pass->current_framebuffer_size_dims);
    gl3_pass_build_semantic_vec4(pass, buffer, SLANG_SEMANTIC_FINAL_VIEWPORT,
-                       (unsigned)(pass->curr_vp.width),
-                       (unsigned)(pass->curr_vp.height));
+                       pass->curr_vp.dims);
 
    gl3_pass_build_semantic_uint(pass, buffer, SLANG_SEMANTIC_FRAME_COUNT,
                        pass->frame_count_period
@@ -2224,17 +2226,23 @@ static void gl3_pass_build_semantics(struct gl3_pass *pass, uint8_t *buffer,
                       pass->total_subframes);
    gl3_pass_build_semantic_uint(pass, buffer, SLANG_SEMANTIC_CURRENT_SUBFRAME,
                       pass->current_subframe);
+   /* Each sub-frame is its own present; CurrentSubFrame is 1-based. */
+   gl3_pass_build_semantic_uint(pass, buffer, SLANG_SEMANTIC_SWAP_COUNT,
+                      (uint32_t)(pass->swap_count
+                         + (pass->current_subframe
+                            ? pass->current_subframe - 1 : 0)));
 
-   /* Sensor pass->uniforms — per-frame snapshot cached
-    * by input_driver_poll() on the main thread */
+   /* Sensor pass->uniforms — one coherent seqlock'd snapshot of the
+    * values input_driver_poll() published on the main thread. */
    {
-      input_driver_state_t *input_st = input_state_get_ptr();
+      float gyro[3], accel[3], rest[3];
+      input_driver_read_sensor_snapshot(gyro, accel, rest);
       gl3_pass_build_semantic_vec3(pass, buffer, SLANG_SEMANTIC_GYROSCOPE,
-                        input_st->sensor_gyroscope_cache);
+                        gyro);
       gl3_pass_build_semantic_vec3(pass, buffer, SLANG_SEMANTIC_ACCELEROMETER,
-                        input_st->sensor_accelerometer_cache);
+                        accel);
       gl3_pass_build_semantic_vec3(pass, buffer, SLANG_SEMANTIC_ACCELEROMETER_REST,
-                        input_st->sensor_accelerometer_rest);
+                        rest);
    }
 
    /* Standard inputs */
@@ -2284,28 +2292,25 @@ static void gl3_pass_build_commands(struct gl3_pass *pass,
       const gl3_viewport *vp,
       const float *mvp)
 {
-   unsigned size_width;
-      unsigned size_height;
-   unsigned size_orig_width;
-      unsigned size_orig_height;
-   unsigned size_src_width;
-      unsigned size_src_height;
+   unsigned size_dims;
 
    pass->curr_vp    = *vp;
-   size_orig_width  = original->texture.width;
-   size_orig_height = original->texture.height;
-   size_src_width   = source->texture.width;
-   size_src_height  = source->texture.height;
-   gl3_pass_get_output_size(pass, size_orig_width, size_orig_height,
-         size_src_width, size_src_height, &size_width, &size_height);
+   size_dims        = gl3_pass_get_output_size(pass,
+         original->texture.dims, source->texture.dims);
 
-   if (pass->framebuffer &&
-       (size_width  != pass->framebuffer->size_width ||
-        size_height != pass->framebuffer->size_height))
-      gl3_framebuffer_set_size(pass->framebuffer, size_width, size_height, 0);
+   /* gl3_framebuffer_new() only reserves the name; nothing is attached
+    * until a set_size. Build an unbuilt one even at the 1x1 seed size. */
+   if (     pass->framebuffer
+         && (  !pass->framebuffer->complete
+            || size_dims != pass->framebuffer->size_dims))
+      gl3_framebuffer_set_size(pass->framebuffer, size_dims, 0);
 
-   pass->current_framebuffer_size_width  = size_width;
-   pass->current_framebuffer_size_height = size_height;
+   pass->current_framebuffer_size_dims = size_dims;
+
+   /* With no target of its own the draw below would land on the
+    * backbuffer, which every pass leaves bound when it finishes. */
+   if (!pass->final_pass && !(pass->framebuffer && pass->framebuffer->complete))
+      return;
 
    glUseProgram(pass->pipeline);
 
@@ -2401,42 +2406,44 @@ static void gl3_pass_build_commands(struct gl3_pass *pass,
 
    if (pass->final_pass)
    {
-      glViewport(pass->curr_vp.x, pass->curr_vp.y,
-                 pass->curr_vp.width, pass->curr_vp.height);
+      glViewport(VIDEO_POS_X(pass->curr_vp.pos), VIDEO_POS_Y(pass->curr_vp.pos),
+                 VIDEO_SCALE_W(pass->curr_vp.dims), VIDEO_SCALE_H(pass->curr_vp.dims));
 #ifdef GL3_ROLLING_SCANLINE_SIMULATION
       if (pass->simulate_scanline)
       {
-         glScissor(  pass->curr_vp.x,
-                     (int32_t)(((float)(pass->curr_vp.height) / (float)(pass->total_subframes))
+         glScissor(  VIDEO_POS_X(pass->curr_vp.pos),
+                     (int32_t)(((float)(VIDEO_SCALE_H(pass->curr_vp.dims)) / (float)(pass->total_subframes))
                               * (float)(pass->current_subframe - 1)),
-                     pass->curr_vp.width,
-                     (uint32_t)((float)(pass->curr_vp.height) / (float)(pass->total_subframes))
+                     VIDEO_SCALE_W(pass->curr_vp.dims),
+                     (uint32_t)((float)(VIDEO_SCALE_H(pass->curr_vp.dims)) / (float)(pass->total_subframes))
          );
       }
       else
       {
-         glScissor(  pass->curr_vp.x,     pass->curr_vp.y,
-                     pass->curr_vp.width, pass->curr_vp.height);
+         glScissor(  VIDEO_POS_X(pass->curr_vp.pos),     VIDEO_POS_Y(pass->curr_vp.pos),
+                     VIDEO_SCALE_W(pass->curr_vp.dims), VIDEO_SCALE_H(pass->curr_vp.dims));
       }
 #endif /* GL3_ROLLING_SCANLINE_SIMULATION */
    }
    else
    {
-      glViewport(0, 0, size_width, size_height);
+      glViewport(0, 0, VIDEO_SCALE_W(size_dims), VIDEO_SCALE_H(size_dims));
 
 #ifdef GL3_ROLLING_SCANLINE_SIMULATION
       if (pass->simulate_scanline)
       {
          glScissor(  0,
-                     (int32_t)(((float)(size_height) / (float)(pass->total_subframes))
+                     (int32_t)(((float)(VIDEO_SCALE_H(size_dims))
+                              / (float)(pass->total_subframes))
                               * (float)(pass->current_subframe - 1)),
-                     size_width,
-                     (uint32_t)((float)(size_height) / (float)(pass->total_subframes))
+                     VIDEO_SCALE_W(size_dims),
+                     (uint32_t)((float)(VIDEO_SCALE_H(size_dims))
+                              / (float)(pass->total_subframes))
          );
       }
       else
       {
-         glScissor(0, 0, size_width, size_height);
+         glScissor(0, 0, VIDEO_SCALE_W(size_dims), VIDEO_SCALE_H(size_dims));
       }
 #endif /* GL3_ROLLING_SCANLINE_SIMULATION */
    }
@@ -2605,8 +2612,7 @@ static void gl3_chain_update_history_info(struct gl3_filter_chain *chain)
          continue;
 
       source->texture.image  = chain->original_history[i]->image;
-      source->texture.width  = chain->original_history[i]->size_width;
-      source->texture.height = chain->original_history[i]->size_height;
+      source->texture.dims   = chain->original_history[i]->size_dims;
       source->filter         = gl3_pass_get_source_filter(chain->passes[0]);
       source->mip_filter     = gl3_pass_get_mip_filter(chain->passes[0]);
       source->address        = gl3_pass_get_address_mode(chain->passes[0]);
@@ -2630,8 +2636,7 @@ static void gl3_chain_update_feedback_info(struct gl3_filter_chain *chain)
          continue;
 
       source->texture.image  = fb->image;
-      source->texture.width  = fb->size_width;
-      source->texture.height = fb->size_height;
+      source->texture.dims   = fb->size_dims;
       source->filter         = gl3_pass_get_source_filter(chain->passes[i]);
       source->mip_filter     = gl3_pass_get_mip_filter(chain->passes[i]);
       source->address        = gl3_pass_get_address_mode(chain->passes[i]);
@@ -2671,8 +2676,7 @@ static void gl3_chain_build_offscreen_passes(struct gl3_filter_chain *chain, con
       fb = gl3_pass_get_framebuffer(chain->passes[i]);
 
       source.texture.image             = fb->image;
-      source.texture.width             = fb->size_width;
-      source.texture.height            = fb->size_height;
+      source.texture.dims              = fb->size_dims;
       source.filter                    = gl3_pass_get_source_filter(chain->passes[i + 1]);
       source.mip_filter                = gl3_pass_get_mip_filter(chain->passes[i + 1]);
       source.address                   = gl3_pass_get_address_mode(chain->passes[i + 1]);
@@ -2695,18 +2699,11 @@ static void gl3_chain_end_frame(struct gl3_filter_chain *chain)
          chain->original_history[chain->num_original_history - 1];
       chain->original_history[chain->num_original_history - 1] = NULL;
 
-      if (chain->input_texture.width      != tmp->size_width  ||
-            chain->input_texture.height     != tmp->size_height ||
-            (chain->input_texture.format    != 0
-             && chain->input_texture.format != tmp->format))
-      {
-         unsigned new_size_width;
-      unsigned new_size_height;
-         new_size_width  = chain->input_texture.width;
-         new_size_height = chain->input_texture.height;
-         gl3_framebuffer_set_size(tmp, new_size_width, new_size_height,
+      if (     chain->input_texture.dims != tmp->size_dims
+            || (   chain->input_texture.format != 0
+                && chain->input_texture.format != tmp->format))
+         gl3_framebuffer_set_size(tmp, chain->input_texture.dims,
                chain->input_texture.format);
-      }
 
       if (tmp->complete)
          gl3_framebuffer_copy(
@@ -2714,7 +2711,7 @@ static void gl3_chain_end_frame(struct gl3_filter_chain *chain)
                chain->common.quad_program,
                chain->common.quad_vbo,
                chain->common.quad_loc.flat_ubo_vertex,
-               tmp->size_width, tmp->size_height,
+               VIDEO_SCALE_W(tmp->size_dims), VIDEO_SCALE_H(tmp->size_dims),
                chain->input_texture.image);
 
       /* Should ring buffer, but we don't have *that* many chain->passes. */
@@ -2756,8 +2753,7 @@ static void gl3_chain_build_viewport_pass(struct gl3_filter_chain *chain, const 
       const struct gl3_framebuffer *fb =
          gl3_pass_get_framebuffer(chain->passes[chain->num_passes - 2]);
       source.texture.image           = fb->image;
-      source.texture.width           = fb->size_width;
-      source.texture.height          = fb->size_height;
+      source.texture.dims            = fb->size_dims;
       source.filter                  = gl3_pass_get_source_filter(chain->passes[chain->num_passes - 1]);
       source.mip_filter              = gl3_pass_get_mip_filter(chain->passes[chain->num_passes - 1]);
       source.address                 = gl3_pass_get_address_mode(chain->passes[chain->num_passes - 1]);
@@ -3358,40 +3354,33 @@ static void gl3_chain_set_input_texture(struct gl3_filter_chain *chain, const gl
 
    /* Need a copy to remove padding.
     * GL HW render interface in libretro is kinda garbage now ... */
-   if (chain->input_texture.padded_width  != chain->input_texture.width ||
-       chain->input_texture.padded_height != chain->input_texture.height)
+   if (chain->input_texture.padded_dims != chain->input_texture.dims)
    {
       if (!chain->copy_framebuffer)
          chain->copy_framebuffer = gl3_framebuffer_new(texture.format, 1);
       if (!chain->copy_framebuffer)
          return;
 
-      if (chain->input_texture.width   != chain->copy_framebuffer->size_width  ||
-          chain->input_texture.height  != chain->copy_framebuffer->size_height ||
-          (chain->input_texture.format != 0                                   &&
-           chain->input_texture.format != chain->copy_framebuffer->format))
-      {
-         unsigned copy_size_width;
-      unsigned copy_size_height;
-         copy_size_width  = chain->input_texture.width;
-         copy_size_height = chain->input_texture.height;
+      if (     chain->input_texture.dims
+                     != chain->copy_framebuffer->size_dims
+            || (   chain->input_texture.format != 0
+                && chain->input_texture.format
+                     != chain->copy_framebuffer->format))
          gl3_framebuffer_set_size(chain->copy_framebuffer,
-               copy_size_width, copy_size_height,
-               chain->input_texture.format);
-      }
+               chain->input_texture.dims, chain->input_texture.format);
 
       if (chain->copy_framebuffer->complete)
          gl3_framebuffer_copy_partial(
                chain->copy_framebuffer->framebuffer,
                chain->common.quad_program,
                chain->common.quad_loc.flat_ubo_vertex,
-               chain->copy_framebuffer->size_width,
-               chain->copy_framebuffer->size_height,
+               VIDEO_SCALE_W(chain->copy_framebuffer->size_dims),
+               VIDEO_SCALE_H(chain->copy_framebuffer->size_dims),
                chain->input_texture.image,
-               (float)(chain->input_texture.width)
-               / chain->input_texture.padded_width,
-               (float)(chain->input_texture.height)
-               / chain->input_texture.padded_height);
+               (float)VIDEO_SCALE_W(chain->input_texture.dims)
+               / VIDEO_SCALE_W(chain->input_texture.padded_dims),
+               (float)VIDEO_SCALE_H(chain->input_texture.dims)
+               / VIDEO_SCALE_H(chain->input_texture.padded_dims));
       chain->input_texture.image = chain->copy_framebuffer->image;
    }
 }
@@ -3414,6 +3403,13 @@ static void gl3_chain_set_frame_count(struct gl3_filter_chain *chain, uint64_t c
    unsigned i;
    for (i = 0; i < chain->num_passes; i++)
       gl3_pass_set_frame_count(chain->passes[i], count);
+}
+
+static void gl3_chain_set_swap_count(struct gl3_filter_chain *chain, uint64_t count)
+{
+   unsigned i;
+   for (i = 0; i < chain->num_passes; i++)
+      chain->passes[i]->swap_count = count;
 }
 
 static void gl3_chain_set_frame_count_period(struct gl3_filter_chain *chain, unsigned pass, unsigned period)
@@ -4057,7 +4053,7 @@ struct video_shader *gl3_filter_chain_get_preset(
 void gl3_filter_chain_free(gl3_filter_chain_t *chain)
 {
    gl3_chain_free(chain);
-   input_state_get_ptr()->shader_uses_sensors = false;
+   input_driver_set_shader_uses_sensors(false);
 }
 
 void gl3_filter_chain_set_shader(
@@ -4095,6 +4091,13 @@ void gl3_filter_chain_set_frame_count(
       uint64_t count)
 {
    gl3_chain_set_frame_count(chain, count);
+}
+
+void gl3_filter_chain_set_swap_count(
+      gl3_filter_chain_t *chain,
+      uint64_t count)
+{
+   gl3_chain_set_swap_count(chain, count);
 }
 
 void gl3_filter_chain_set_frame_direction(

@@ -82,7 +82,7 @@ extern "C" {
  * thread owns the window, while winraw_poll() is called from
  * input_driver_poll() in the runloop, always on the main thread. Every
  * field the two share crosses a thread boundary. dlt_x/dlt_y,
- * whl_u/whl_d, pos_pending, abs_pending and abs_x/abs_y are
+ * whl_u/whl_d, pos_pending, abs_pending and abs_pos are
  * retro_atomic_int_t for that reason.
  *
  * x and y are plain LONG because they have exactly one writer:
@@ -156,10 +156,11 @@ typedef struct
     * the system cursor, drained once per frame by winraw_poll(). */
    retro_atomic_int_t pos_pending;
    /* Set by the wndproc for a MOUSE_MOVE_ABSOLUTE report, with the
-    * scaled position alongside. Takes precedence over the accumulated
-    * delta, and yields to pos_pending. */
+    * scaled position alongside as one VIDEO_POS_PACK word, so poll
+    * never pairs one report's x with another's y. Takes precedence
+    * over the accumulated delta, and yields to pos_pending. */
    retro_atomic_int_t abs_pending;
-   retro_atomic_int_t abs_x, abs_y;
+   retro_atomic_int_t abs_pos;
    int device;
    uint8_t flags;
 } winraw_mouse_t;
@@ -535,8 +536,8 @@ static void winraw_init_mouse_xy_mapping(winraw_input_t *wr)
       return;
 
    /* Default fallback: center of the viewport */
-   mouse_x = viewport.x + viewport.width  / 2;
-   mouse_y = viewport.y + viewport.height / 2;
+   mouse_x = VIDEO_POS_X(viewport.pos) + VIDEO_SCALE_W(viewport.dims)  / 2;
+   mouse_y = VIDEO_POS_Y(viewport.pos) + VIDEO_SCALE_H(viewport.dims) / 2;
 
    /* Sync to OS cursor position; fall back to center if it fails */
    if (!winraw_sync_mouse_to_cursor(wr))
@@ -548,8 +549,8 @@ static void winraw_init_mouse_xy_mapping(winraw_input_t *wr)
       }
    }
 
-   wr->view_abs_ratio_x   = (double)viewport.full_width  / 65535.0;
-   wr->view_abs_ratio_y   = (double)viewport.full_height / 65535.0;
+   wr->view_abs_ratio_x   = (double)VIDEO_SCALE_W(viewport.full_dims)  / 65535.0;
+   wr->view_abs_ratio_y   = (double)VIDEO_SCALE_H(viewport.full_dims) / 65535.0;
 
    wr->flags             |= WRAW_INP_FLG_MOUSE_XY_MAPPING_READY;
 }
@@ -574,8 +575,8 @@ static void winraw_update_mouse_state(winraw_input_t *wr,
                state->lLastY - mouse->abs_ref_y);
          mouse->abs_ref_x = state->lLastX;
          mouse->abs_ref_y = state->lLastY;
-         retro_atomic_store_release_int(&mouse->abs_x, state->lLastX);
-         retro_atomic_store_release_int(&mouse->abs_y, state->lLastY);
+         retro_atomic_store_release_int(&mouse->abs_pos,
+               (int)VIDEO_POS_PACK(state->lLastX, state->lLastY));
          retro_atomic_store_release_int(&mouse->abs_pending, 1);
       }
       else
@@ -967,8 +968,10 @@ static void winraw_poll(void *data)
       }
       else if (retro_atomic_exchange_int(&g_mice[i].abs_pending, 0))
       {
-         g_mice[i].x = (LONG)retro_atomic_load_acquire_int(&g_mice[i].abs_x);
-         g_mice[i].y = (LONG)retro_atomic_load_acquire_int(&g_mice[i].abs_y);
+         unsigned pos = (unsigned)retro_atomic_load_acquire_int(
+               &g_mice[i].abs_pos);
+         g_mice[i].x  = (LONG)VIDEO_POS_X(pos);
+         g_mice[i].y  = (LONG)VIDEO_POS_Y(pos);
       }
       else if (dx || dy)
       {
@@ -1052,7 +1055,7 @@ static int16_t winraw_input_state(
                {
                   for (i = 0; i < RARCH_FIRST_CUSTOM_BIND; i++)
                   {
-                     if (binds[port][i].valid)
+                     if (RETRO_KEYBIND_VALID(&binds[port][i]))
                      {
                         if (winraw_mouse_button_pressed(wr, mouse, port, binds[port][i].mbutton))
                            ret |= (1 << i);
@@ -1064,10 +1067,10 @@ static int16_t winraw_input_state(
                {
                   for (i = 0; i < RARCH_FIRST_CUSTOM_BIND; i++)
                   {
-                     if (binds[port][i].valid)
+                     if (RETRO_KEYBIND_VALID(&binds[port][i]))
                      {
-                        if (     (binds[port][i].key && binds[port][i].key < RETROK_LAST)
-                              && WINRAW_KEYBOARD_PRESSED(wr, binds[port][i].key))
+                        if (     (RETRO_KEYBIND_KEY(&binds[port][i]) && RETRO_KEYBIND_KEY(&binds[port][i]) < RETROK_LAST)
+                              && WINRAW_KEYBOARD_PRESSED(wr, RETRO_KEYBIND_KEY(&binds[port][i])))
                            ret |= (1 << i);
                      }
                   }
@@ -1078,10 +1081,10 @@ static int16_t winraw_input_state(
 
             if (id < RARCH_BIND_LIST_END)
             {
-               if (binds[port][id].valid)
+               if (RETRO_KEYBIND_VALID(&binds[port][id]))
                {
-                  if (     (binds[port][id].key && binds[port][id].key < RETROK_LAST)
-                        && WINRAW_KEYBOARD_PRESSED(wr, binds[port][id].key)
+                  if (     (RETRO_KEYBIND_KEY(&binds[port][id]) && RETRO_KEYBIND_KEY(&binds[port][id]) < RETROK_LAST)
+                        && WINRAW_KEYBOARD_PRESSED(wr, RETRO_KEYBIND_KEY(&binds[port][id]))
                         && (id == RARCH_GAME_FOCUS_TOGGLE || !keyboard_mapping_blocked)
                      )
                      return 1;
@@ -1101,10 +1104,10 @@ static int16_t winraw_input_state(
 
                input_conv_analog_id_to_bind_id(idx, id, id_minus, id_plus);
 
-               id_minus_valid        = binds[port][id_minus].valid;
-               id_plus_valid         = binds[port][id_plus].valid;
-               id_minus_key          = binds[port][id_minus].key;
-               id_plus_key           = binds[port][id_plus].key;
+               id_minus_valid        = RETRO_KEYBIND_VALID(&binds[port][id_minus]);
+               id_plus_valid         = RETRO_KEYBIND_VALID(&binds[port][id_plus]);
+               id_minus_key          = RETRO_KEYBIND_KEY(&binds[port][id_minus]);
+               id_plus_key           = RETRO_KEYBIND_KEY(&binds[port][id_plus]);
 
                if (id_plus_valid && id_plus_key && id_plus_key < RETROK_LAST)
                {
@@ -1258,7 +1261,7 @@ static int16_t winraw_input_state(
                      const uint32_t joyaxis         = (bind_joyaxis != AXIS_NONE)
                         ? bind_joyaxis : autobind_joyaxis;
 
-                     if (binds[port][new_id].valid)
+                     if (RETRO_KEYBIND_VALID(&binds[port][new_id]))
                      {
                         if ((uint16_t)joykey != NO_BTN && joypad->button(
                                  joyport, (uint16_t)joykey))
@@ -1267,9 +1270,9 @@ static int16_t winraw_input_state(
                               ((float)abs(joypad->axis(joyport, joyaxis))
                                / 0x8000) > axis_threshold)
                            return 1;
-                        else if ((binds[port][new_id].key && binds[port][new_id].key < RETROK_LAST)
+                        else if ((RETRO_KEYBIND_KEY(&binds[port][new_id]) && RETRO_KEYBIND_KEY(&binds[port][new_id]) < RETROK_LAST)
                               && !keyboard_mapping_blocked
-                              && WINRAW_KEYBOARD_PRESSED(wr, binds[port][new_id].key)
+                              && WINRAW_KEYBOARD_PRESSED(wr, RETRO_KEYBIND_KEY(&binds[port][new_id]))
                            )
                            return 1;
                         else if (mouse)
@@ -1317,22 +1320,28 @@ bool winraw_handle_message(UINT msg,
          {
             PDEV_BROADCAST_HDR pHdr = (PDEV_BROADCAST_HDR)lpar;
             if (pHdr->dbch_devicetype == DBT_DEVTYP_DEVICEINTERFACE)
-            {
-               settings_t *settings = config_get_ptr();
-               /* Name the joypad driver to reinitialise. Passing NULL
-                * here makes input_joypad_init_driver() skip the branch
-                * that honours the configured driver - it is guarded by
-                * 'if (ident && *ident)' - and fall through to
-                * input_joypad_init_first(), which takes whichever entry
-                * of joypad_drivers[] initialises first. The configured
-                * driver is never tried, so a device change silently
-                * swaps it for one earlier in that list. */
-               joypad_driver_reinit(NULL,
-                     settings ? settings->arrays.input_joypad_driver : NULL);
-            }
+               win32_hotplug_arm();
          }
 #endif
          break;
+      case WM_TIMER:
+         if (wpar != WIN32_HOTPLUG_TIMER_ID)
+            break;
+         if (win32_hotplug_due())
+         {
+            settings_t *settings = config_get_ptr();
+            /* Name the joypad driver to reinitialise. Passing NULL
+             * here makes input_joypad_init_driver() skip the branch
+             * that honours the configured driver - it is guarded by
+             * 'if (ident && *ident)' - and fall through to
+             * input_joypad_init_first(), which takes whichever entry
+             * of joypad_drivers[] initialises first. The configured
+             * driver is never tried, so a device change silently
+             * swaps it for one earlier in that list. */
+            joypad_driver_reinit(NULL,
+                  settings ? settings->arrays.input_joypad_driver : NULL);
+         }
+         return true;
    }
    return false;
 }

@@ -43,6 +43,10 @@
 #include <SDL3/SDL.h>
 #include "../common/sdl3_common.h"
 
+#ifdef WEBOS
+#include "../common/sdl3_common_webos.h"
+#endif
+
 #include "../font_driver.h"
 #include "../gfx_display.h"
 #include "../video_thread_wrapper.h"
@@ -103,10 +107,10 @@ static void sdl3_refresh_renderer(sdl3_video_t *vid)
 
    /* We avoid clearing the screen here, since that's owned by
     * sdl3_gfx_frame(). Instead, we just update the viewport. */
-   r.x = vid->vp.x;
-   r.y = vid->vp.y;
-   r.w = (int)vid->vp.width;
-   r.h = (int)vid->vp.height;
+   r.x = VIDEO_POS_X(vid->vp.pos);
+   r.y = VIDEO_POS_Y(vid->vp.pos);
+   r.w = (int)VIDEO_SCALE_W(vid->vp.dims);
+   r.h = (int)VIDEO_SCALE_H(vid->vp.dims);
 
    SDL_SetRenderViewport(vid->renderer, &r);
 }
@@ -120,13 +124,12 @@ static void sdl3_refresh_viewport(sdl3_video_t *vid)
     * SDL_GetWindowSize - size the viewport in pixels to match. */
    SDL_GetWindowSizeInPixels(vid->window, &win_w, &win_h);
 
-   vid->vp.full_width  = win_w;
-   vid->vp.full_height = win_h;
+   vid->vp.full_dims   = VIDEO_SCALE_PACK(win_w, win_h);
    video_driver_update_viewport(&vid->vp, false, vid->video.force_aspect, true);
 
    /* Tell the rest of the engine about our actual window dimensions
     * (mirrors sdl2_gfx / vga / gx2). */
-   video_driver_set_output_size(win_w, win_h);
+   video_driver_set_output_dims(VIDEO_SCALE_PACK(win_w, win_h));
 
    vid->flags &= ~SDL3_FLAG_SHOULD_RESIZE;
 
@@ -227,6 +230,12 @@ static void *sdl3_gfx_init(const video_info_t *video,
 
    sdl3_set_app_metadata();
 
+#ifdef WEBOS
+   SDL_SetHint(SDL_HINT_WEBOS_ACCESS_POLICY_KEYS_BACK, "true");
+   SDL_SetHint(SDL_HINT_WEBOS_ACCESS_POLICY_KEYS_EXIT, "true");
+   SDL_SetHint(SDL_HINT_WEBOS_CURSOR_SLEEP_TIME, "5000");
+#endif
+
    /* Initialize the video system. */
    if (!SDL_InitSubSystem(SDL_INIT_VIDEO))
       return NULL;
@@ -246,11 +255,12 @@ static void *sdl3_gfx_init(const video_info_t *video,
       RARCH_LOG("[SDL3] \t%s\n", SDL_GetRenderDriver(i));
 
    if (!video->fullscreen)
-      RARCH_LOG("[SDL3] Creating window @ %ux%u.\n", video->width, video->height);
+      RARCH_LOG("[SDL3] Creating window @ %ux%u.\n", VIDEO_SCALE_W(video->dims), VIDEO_SCALE_H(video->dims));
 
    /* No backend flag: SDL_CreateRenderer picks the render driver. */
    if (!sdl3_window_set_video_mode(&vid->window,
-            video->width, video->height, video->fullscreen, 0))
+            video->dims,
+            video->fullscreen, 0))
    {
       RARCH_ERR("[SDL3] Failed to init SDL window: %s.\n", SDL_GetError());
       goto error;
@@ -298,8 +308,8 @@ static void sdl3_viewport_push_full(sdl3_video_t *vid, SDL_Rect *saved)
 
    full.x = 0;
    full.y = 0;
-   full.w = (int)vid->vp.full_width;
-   full.h = (int)vid->vp.full_height;
+   full.w = (int)VIDEO_SCALE_W(vid->vp.full_dims);
+   full.h = (int)VIDEO_SCALE_H(vid->vp.full_dims);
    SDL_SetRenderViewport(vid->renderer, &full);
 }
 
@@ -324,17 +334,17 @@ static void sdl3_blit_frame(sdl3_video_t *vid)
    {
       SDL_FRect dst;
       SDL_Rect  game_vp;
-      dst.w = (float)vid->vp.height;
-      dst.h = (float)vid->vp.width;
-      dst.x = (float)(vid->vp.x + ((int)vid->vp.width  - (int)vid->vp.height) / 2);
-      dst.y = (float)(vid->vp.y + ((int)vid->vp.height - (int)vid->vp.width)  / 2);
+      dst.w = (float)VIDEO_SCALE_H(vid->vp.dims);
+      dst.h = (float)VIDEO_SCALE_W(vid->vp.dims);
+      dst.x = (float)(VIDEO_POS_X(vid->vp.pos) + ((int)VIDEO_SCALE_W(vid->vp.dims)  - (int)VIDEO_SCALE_H(vid->vp.dims)) / 2);
+      dst.y = (float)(VIDEO_POS_Y(vid->vp.pos) + ((int)VIDEO_SCALE_H(vid->vp.dims) - (int)VIDEO_SCALE_W(vid->vp.dims))  / 2);
       SDL_SetRenderViewport(vid->renderer, NULL);
       SDL_RenderTextureRotated(vid->renderer, vid->frame.tex, NULL, &dst,
             vid->rotation, NULL, SDL_FLIP_NONE);
-      game_vp.x = vid->vp.x;
-      game_vp.y = vid->vp.y;
-      game_vp.w = (int)vid->vp.width;
-      game_vp.h = (int)vid->vp.height;
+      game_vp.x = VIDEO_POS_X(vid->vp.pos);
+      game_vp.y = VIDEO_POS_Y(vid->vp.pos);
+      game_vp.w = (int)VIDEO_SCALE_W(vid->vp.dims);
+      game_vp.h = (int)VIDEO_SCALE_H(vid->vp.dims);
       SDL_SetRenderViewport(vid->renderer, &game_vp);
    }
    else
@@ -364,11 +374,11 @@ static bool sdl3_capture_viewport(sdl3_video_t *vid, uint8_t *buffer)
 
    /* Clamp against the viewport dimensions the caller sized its
     * buffer from, so a mismatch can never overrun it. */
-   w = (surf->w < (int)vid->vp.width)  ? surf->w : (int)vid->vp.width;
-   h = (surf->h < (int)vid->vp.height) ? surf->h : (int)vid->vp.height;
+   w = (surf->w < (int)VIDEO_SCALE_W(vid->vp.dims))  ? surf->w : (int)VIDEO_SCALE_W(vid->vp.dims);
+   h = (surf->h < (int)VIDEO_SCALE_H(vid->vp.dims)) ? surf->h : (int)VIDEO_SCALE_H(vid->vp.dims);
 
-   if (w < (int)vid->vp.width || h < (int)vid->vp.height)
-      memset(buffer, 0, (size_t)vid->vp.width * vid->vp.height * 3);
+   if (w < (int)VIDEO_SCALE_W(vid->vp.dims) || h < (int)VIDEO_SCALE_H(vid->vp.dims))
+      memset(buffer, 0, VIDEO_SCALE_AREA(vid->vp.dims) * 3);
 
    for (y = 0; y < h; y++)
    {
@@ -376,8 +386,8 @@ static bool sdl3_capture_viewport(sdl3_video_t *vid, uint8_t *buffer)
             (const uint8_t*)surf->pixels + (size_t)y * surf->pitch,
             surf->pitch,
             SDL_PIXELFORMAT_BGR24,
-            buffer + (size_t)(h - 1 - y) * vid->vp.width * 3,
-            (int)vid->vp.width * 3))
+            buffer + (size_t)(h - 1 - y) * VIDEO_SCALE_W(vid->vp.dims) * 3,
+            (int)VIDEO_SCALE_W(vid->vp.dims) * 3))
       {
          RARCH_WARN("[SDL3] Failed to convert viewport data to BGR24: %s.\n",
                SDL_GetError());
@@ -391,7 +401,7 @@ static bool sdl3_capture_viewport(sdl3_video_t *vid, uint8_t *buffer)
 }
 
 /* Menu, statistics, widgets and OSD text all compute their
- * coordinates against video_info->width/height - the full window
+ * coordinates against VIDEO_SCALE_W(video_info->dims)/height - the full window
  * dimensions - and every viewport change flushes SDL's render batch.
  * Run all of these passes under a single full-window viewport switch,
  * restoring the game viewport at the end (readback and the next
@@ -441,10 +451,10 @@ static void sdl3_render_ui(sdl3_video_t *vid, const char *msg,
    if (menu_visible)
    {
       SDL_FRect menu_dst;
-      menu_dst.x = (float)vid->vp.x;
-      menu_dst.y = (float)vid->vp.y;
-      menu_dst.w = (float)vid->vp.width;
-      menu_dst.h = (float)vid->vp.height;
+      menu_dst.x = (float)VIDEO_POS_X(vid->vp.pos);
+      menu_dst.y = (float)VIDEO_POS_Y(vid->vp.pos);
+      menu_dst.w = (float)VIDEO_SCALE_W(vid->vp.dims);
+      menu_dst.h = (float)VIDEO_SCALE_H(vid->vp.dims);
       SDL_RenderTexture(vid->renderer, vid->menu.tex, NULL, &menu_dst);
    }
 
@@ -468,10 +478,12 @@ static void sdl3_render_ui(sdl3_video_t *vid, const char *msg,
    SDL_SetRenderViewport(vid->renderer, &saved_vp);
 }
 
-static bool sdl3_gfx_frame(void *data, const void *frame, unsigned width,
-      unsigned height, uint64_t frame_count,
+static bool sdl3_gfx_frame(void *data, const void *frame,
+      unsigned dims, uint64_t frame_count,
       unsigned pitch, const char *msg, video_frame_info_t *video_info)
 {
+   unsigned width = VIDEO_SCALE_W(dims);
+   unsigned height = VIDEO_SCALE_H(dims);
    sdl3_video_t *vid = (sdl3_video_t*)data;
 
    if (vid->flags & SDL3_FLAG_SHOULD_RESIZE)
@@ -598,25 +610,23 @@ static bool sdl3_gfx_read_viewport(void *data, uint8_t *buffer, bool is_idle)
 
 /* Applies a new window size / fullscreen in place, without tearing
  * down the entire driver. */
-static void sdl3_poke_set_video_mode(void *data, unsigned width,
-      unsigned height, bool fullscreen)
+static void sdl3_poke_set_video_mode(void *data, unsigned dims, bool fullscreen)
 {
    sdl3_video_t *vid = (sdl3_video_t*)data;
 
    if (!vid || !vid->window)
       return;
 
-   if (!sdl3_window_set_video_mode(&vid->window, width, height, fullscreen, 0))
+   if (!sdl3_window_set_video_mode(&vid->window, dims, fullscreen, 0))
    {
       RARCH_WARN("[SDL3] Failed to set video mode: %s.\n", SDL_GetError());
       return;
    }
 
    /* On the next frame, recompute the viewport pixel size. */
-   vid->flags |= SDL3_FLAG_SHOULD_RESIZE;
-   vid->video.width = width;
-   vid->video.height = height;
-   vid->video.fullscreen = fullscreen;
+   vid->flags            |= SDL3_FLAG_SHOULD_RESIZE;
+   vid->video.dims        = dims;
+   vid->video.fullscreen  = fullscreen;
 }
 
 static void sdl3_poke_set_filtering(void *data, unsigned index, bool smooth, bool ctx_scaling)
@@ -646,7 +656,7 @@ static const SDL_DisplayMode *sdl3_current_video_mode(sdl3_video_t *vid)
 }
 
 static void sdl3_get_video_output_size(void *data,
-      unsigned *width, unsigned *height, char *desc, size_t desc_len)
+      unsigned *dims, char *desc, size_t desc_len)
 {
    sdl3_video_t *vid = (sdl3_video_t*)data;
    const SDL_DisplayMode *mode;
@@ -658,13 +668,11 @@ static void sdl3_get_video_output_size(void *data,
    {
       int w = 0, h = 0;
       SDL_GetWindowSizeInPixels(vid->window, &w, &h);
-      *width  = (unsigned)w;
-      *height = (unsigned)h;
+      *dims = VIDEO_SCALE_PACK((unsigned)w, (unsigned)h);
       return;
    }
 
-   *width  = (unsigned)mode->w;
-   *height = (unsigned)mode->h;
+   *dims = VIDEO_SCALE_PACK((unsigned)mode->w, (unsigned)mode->h);
    SDL_snprintf(desc, desc_len, "%.2f Hz", mode->refresh_rate);
 }
 
@@ -741,13 +749,13 @@ static void sdl3_poke_apply_state_changes(void *data)
 
 static void sdl3_poke_set_texture_frame(void *data,
       const void *frame, bool rgb32,
-      unsigned width, unsigned height, float alpha)
+      unsigned dims, float alpha)
 {
    sdl3_video_t *vid = (sdl3_video_t*)data;
    if (!vid || !frame)
       return;
-   sdl3_refresh_input_size(vid, true, rgb32, width, height);
-   sdl3_stream_upload(&vid->menu, frame, width * (rgb32 ? 4 : 2));
+   sdl3_refresh_input_size(vid, true, rgb32, VIDEO_SCALE_W(dims), VIDEO_SCALE_H(dims));
+   sdl3_stream_upload(&vid->menu, frame, VIDEO_SCALE_W(dims) * (rgb32 ? 4 : 2));
 }
 
 static void sdl3_poke_texture_enable(void *data, bool enable, bool full_screen)
@@ -932,10 +940,11 @@ static void gfx_display_sdl3_blend_end(void *data)
    SDL_SetRenderDrawBlendMode(vid->renderer, SDL_BLENDMODE_NONE);
 }
 
-static void gfx_display_sdl3_scissor_begin(void *data,
-      unsigned video_width, unsigned video_height,
-      int x, int y, unsigned width, unsigned height)
+static void gfx_display_sdl3_scissor_begin(void *data, unsigned video_dims,
+      int x, int y, unsigned dims)
 {
+   unsigned width        = VIDEO_SCALE_W(dims);
+   unsigned height       = VIDEO_SCALE_H(dims);
    SDL_Rect rect;
    sdl3_video_t *vid = (sdl3_video_t*)data;
    if (!vid)
@@ -958,8 +967,7 @@ static void gfx_display_sdl3_scissor_begin(void *data,
    SDL_SetRenderClipRect(vid->renderer, &rect);
 }
 
-static void gfx_display_sdl3_scissor_end(void *data,
-      unsigned video_width, unsigned video_height)
+static void gfx_display_sdl3_scissor_end(void *data, unsigned video_dims)
 {
    sdl3_video_t *vid = (sdl3_video_t*)data;
    if (!vid)
@@ -976,7 +984,7 @@ static void gfx_display_sdl3_scissor_end(void *data,
  *
  * 1. gfx_display_draw_quad - used by widgets and most menu chrome.
  *    Sets coords->vertex = NULL and encodes the quad rectangle in
- *    draw->x / draw->y / draw->width / draw->height (pixel coords,
+ *    the origin in draw->pos and the size in draw->dims (pixel coords,
  *    y bottom-up). We synthesize the four corners in pixel space.
  *
  * 2. The general path - menu drivers that build their own vertex
@@ -999,9 +1007,10 @@ static INLINE void sdl3_vertex_color(SDL_Vertex *v, const float *col, unsigned i
 }
 
 static void gfx_display_sdl3_draw(gfx_display_ctx_draw_t *draw,
-      void *data, unsigned video_width, unsigned video_height)
+      void *data, unsigned video_dims)
 {
-#define SDL3_DRAW_COORD_LIMIT 65536
+   unsigned video_width  = VIDEO_SCALE_W(video_dims);
+   unsigned video_height = VIDEO_SCALE_H(video_dims);
 #define SDL3_DISPLAY_STACK_VERTS 64
    static const int quad_idx[6] = { 0, 1, 2, 2, 1, 3 };
    SDL_Vertex verts_stack[SDL3_DISPLAY_STACK_VERTS];
@@ -1033,13 +1042,14 @@ static void gfx_display_sdl3_draw(gfx_display_ctx_draw_t *draw,
    tex = (SDL_Texture*)(uintptr_t)draw->texture;
 
    /* Path 1: gfx_display_draw_quad - vtx is NULL, geometry comes
-    * from draw->x/y/width/height with y bottom-up.  n is always 4.
+    * from draw->pos and draw->dims with y bottom-up.  n is always 4.
     *
-    * - draw->x / y / width / height: pixel coords, y bottom-up
-    *   (gfx_display_draw_quad pre-flips: draw.y = height - y - h).
+    * - draw->pos / draw->dims: pixel coords, y bottom-up
+    *   (gfx_display_draw_quad pre-flips y before packing).
     *   To put the rect at the right spot in SDL's top-down pixel
     *   space, re-flip:
-    *      dst_y = video_height - draw->height - draw->y
+    *      dst_y = video_height - VIDEO_SCALE_H(draw->dims)
+    *              - VIDEO_POS_Y(draw->pos)
     *
     * - coords->tex_coord (when non-NULL): 0..1 normalised, TOP-DOWN
     *   (opposite to the bottom-up vertex convention; documented in
@@ -1049,22 +1059,19 @@ static void gfx_display_sdl3_draw(gfx_display_ctx_draw_t *draw,
    {
       float x0, x1, y0, y1;
 
-      /* Defensive clamp: gfx_widgets_draw_icon's coordinate math
-       * can underflow during the first few frames after icon load,
-       * producing draw->y == INT_MIN. Float-converting that produces
-       * NaN vertex positions and a spurious SDL error that pollutes
-       * the renderer state for subsequent draws. */
-      if (   draw->x < -SDL3_DRAW_COORD_LIMIT || draw->x > SDL3_DRAW_COORD_LIMIT
-          || draw->y < -SDL3_DRAW_COORD_LIMIT || draw->y > SDL3_DRAW_COORD_LIMIT
-          || draw->width  > SDL3_DRAW_COORD_LIMIT
-          || draw->height > SDL3_DRAW_COORD_LIMIT)
-         return;
-
-      x0 = (float)draw->x;
-      x1 = (float)draw->x + (float)draw->width;
+      /* The rect needed a range test here once: gfx_widgets_draw_icon's
+       * coordinate math underflows in the first few frames after an icon
+       * loads, and the float the descriptor carried took that value as
+       * far as SDL_RenderGeometry, where it became NaN vertex positions
+       * and an SDL error that pollutes the renderer state for every draw
+       * after it. The descriptor's origin is a signed 16-bit pair now
+       * and its size an unsigned 16-bit one, so neither can hold a value
+       * this has to defend against. */
+      x0 = (float)VIDEO_POS_X(draw->pos);
+      x1 = (float)VIDEO_POS_X(draw->pos) + (float)VIDEO_SCALE_W(draw->dims);
       /* Re-flip Y from bottom-up to SDL top-down. */
-      y0 = (float)video_height - (float)draw->height - (float)draw->y;
-      y1 = y0 + (float)draw->height;
+      y0 = (float)video_height - (float)VIDEO_SCALE_H(draw->dims) - (float)VIDEO_POS_Y(draw->pos);
+      y1 = y0 + (float)VIDEO_SCALE_H(draw->dims);
 
       /* Apply draw->scale_factor (centred scaling around the quad's
        * midpoint). XMB sets this on icon draws (node->zoom) to grow
@@ -1226,7 +1233,6 @@ static void gfx_display_sdl3_draw(gfx_display_ctx_draw_t *draw,
       free(indices);
    }
 #undef SDL3_DISPLAY_STACK_VERTS
-#undef SDL3_DRAW_COORD_LIMIT
 }
 
 
@@ -1583,8 +1589,8 @@ static void sdl3_raster_font_render_msg(
    if (!font || !msg || !*msg || !vid)
       return;
 
-   width  = vid->vp.full_width  ? vid->vp.full_width  : vid->video.width;
-   height = vid->vp.full_height ? vid->vp.full_height : vid->video.height;
+   width  = VIDEO_SCALE_W(vid->vp.full_dims)  ? VIDEO_SCALE_W(vid->vp.full_dims)  : VIDEO_SCALE_W(vid->video.dims);
+   height = VIDEO_SCALE_H(vid->vp.full_dims) ? VIDEO_SCALE_H(vid->vp.full_dims) : VIDEO_SCALE_H(vid->video.dims);
    if (!width || !height)
    {
       /* viewport not set up yet (very early frames) - skip rather
@@ -1728,7 +1734,6 @@ video_driver_t video_sdl3 = {
    sdl3_gfx_set_rotation,
    sdl3_gfx_viewport_info,
    sdl3_gfx_read_viewport,
-   NULL,                        /* read_frame_raw */
 #ifdef HAVE_OVERLAY
    NULL,                        /* overlay_interface */
 #endif
@@ -1759,6 +1764,7 @@ gfx_display_ctx_driver_t gfx_display_ctx_sdl3 = {
    GFX_VIDEO_DRIVER_SDL3,
    "sdl3",
    false,
+   true,
    gfx_display_sdl3_scissor_begin,
    gfx_display_sdl3_scissor_end
 };

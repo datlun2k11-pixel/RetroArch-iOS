@@ -33,6 +33,9 @@
 #include <jni.h>
 #include <poll.h>
 #include <sched.h>
+/* struct android_app below is sized by DEFAULT_MAX_PADS; include its
+ * home rather than rely on whoever included this header first. */
+#include "../../input/input_driver.h"
 
 #include <android/looper.h>
 #include <android/configuration.h>
@@ -217,6 +220,7 @@ struct android_app
    jmethodID getPendingIntentScreenshotsLocation;
    jmethodID isAndroidTV;
    jmethodID getRefreshRate;
+   jmethodID getHdrMaxLuminance;
    jmethodID getDisplayModes;
    jmethodID getCurrentDisplayModeId;
    jmethodID setDisplayModeId;
@@ -249,15 +253,16 @@ struct android_app
 
    /* Written by the Android UI thread in onContentRectChanged(), read by
     * the video thread in the context drivers, with no lock on either
-    * side. Publication is ordered: the dimensions are stored first, then
-    * @changed with a release store, and the reader acquires @changed
-    * before consuming them.
+    * side. @dims is the size as one VIDEO_SCALE_PACK word, so a reader
+    * never pairs one report's width with another's height. It is stored
+    * before @changed is raised, and the reader takes @changed with an
+    * exchange, so a change raised while it reads is not cleared unseen.
     *
     * The atomic type makes this struct C-only; see the __cplusplus
     * guard at the top of the ANDROID block. */
    struct
    {
-      retro_atomic_int_t width, height;
+      retro_atomic_int_t dims;
       retro_atomic_int_t changed;
    } content_rect;
    uint16_t rumble_last_strength_strong[MAX_USERS];
@@ -514,6 +519,11 @@ void android_display_server_reapply_mode(void);
  * by the input driver's poll, and a core reaches that poll from inside
  * retro_run(). No-op when nothing is pending. */
 void android_input_flush_pending_state(void);
+
+/* Dispatches an outstanding keypress haptic. Called from the runloop for
+ * the same reason as the flush above, and only from there: entering Java
+ * is only safe on the OS stack. No-op when nothing is pending. */
+void android_input_flush_pending_haptics(void);
 
 bool android_app_write_cmd(struct android_app *android_app, int8_t cmd);
 

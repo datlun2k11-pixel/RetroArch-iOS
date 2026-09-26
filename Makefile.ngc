@@ -136,6 +136,7 @@ HAVE_RTGA                := 1
 HAVE_RMODTRACKER                := 1
 HAVE_OVERLAY             := 1
 HAVE_7ZIP                := 1
+HAVE_RZSTD               := 1
 HAVE_CONFIGFILE          := 1
 HAVE_PATCH               := 1
 HAVE_XDELTA              := 0 # disabled because <lzma.h> isn't available (or we haven't figured out how to install it)
@@ -160,7 +161,7 @@ INCLUDE += -I./libretro-common/include \
            -Ideps
 CFLAGS += -Wall -std=gnu99 $(MACHDEP) $(PLATCFLAGS) $(INCLUDE)
 
-OBJ =  $(PLATOBJS) audio/drivers/gx_audio.o gfx/drivers/gx_gfx.o input/drivers/gx_input.o frontend/drivers/platform_gx.o input/drivers_joypad/gx_joypad.o
+OBJ =  $(PLATOBJS) audio/drivers/gx_audio.o gfx/drivers/gx_gfx.o gfx/display_servers/dispserv_gx.o gfx/display_servers/dispserv_gx_modes.o input/drivers/gx_input.o frontend/drivers/platform_gx.o input/drivers_joypad/gx_joypad.o
 
 ifeq ($(EXTERNAL_LIBOGC), 0)
    OBJ += wii/libogc/libfat/libfat.o wii/libogc/libfat/fatfile.o wii/libogc/libfat/file_allocation_table.o wii/libogc/libfat/cache.o wii/libogc/libfat/fatdir.o wii/libogc/libfat/partition.o wii/libogc/libfat/directory.o wii/libogc/libfat/filetime.o wii/libogc/libfat/disc.o
@@ -179,8 +180,8 @@ ifeq ($(HAVE_LOGGER), 1)
    CFLAGS      += -DPC_DEVELOPMENT_IP_ADDRESS=\"$(PC_DEVELOPMENT_IP_ADDRESS)\" -DPC_DEVELOPMENT_UDP_PORT=$(PC_DEVELOPMENT_UDP_PORT)
 endif
 
-ifeq ($(HAVE_KERNEL_PRX), 1)
-   CFLAGS      += -DHAVE_KERNEL_PRX
+ifeq ($(HAVE_THREADS), 1)
+   CFLAGS      += -DHAVE_THREADS
 endif
 
 ifeq ($(HAVE_WIIUSB_HID), 1)

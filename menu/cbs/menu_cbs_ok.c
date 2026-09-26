@@ -45,6 +45,7 @@
 #endif
 
 #include "../../config.def.h"
+#include "../../gfx/gfx_surface.h"
 #include "../../driver.h"
 #include "../../file_path_special.h"
 
@@ -183,7 +184,7 @@ static int (funcname)(const char *path, const char *label, unsigned type, size_t
    return generic_action_ok(path, label, type, idx, entry_idx, _id, _flush); \
 }
 
-#define DEFAULT_ACTION_DIALOG_START(funcname, _label, _idx, _cb) \
+#define DEFAULT_ACTION_DIALOG_START_TYPE(funcname, _label, _idx, _cb, _text_type) \
 static int (funcname)(const char *path, const char *label_setting, unsigned type, size_t idx, size_t entry_idx) \
 { \
    menu_input_ctx_line_t line; \
@@ -191,11 +192,15 @@ static int (funcname)(const char *path, const char *label_setting, unsigned type
    line.label_setting = label_setting; \
    line.type          = type; \
    line.idx           = (_idx); \
+   line.text_type     = (_text_type); \
    line.cb            = _cb; \
    if (!menu_input_dialog_start(&line)) \
       return -1; \
    return 0; \
 }
+
+#define DEFAULT_ACTION_DIALOG_START(funcname, _label, _idx, _cb) \
+   DEFAULT_ACTION_DIALOG_START_TYPE(funcname, _label, _idx, _cb, MENU_INPUT_DIALOG_KB_TYPE_TEXT)
 
 
 #define DEFAULT_ACTION_OK_START_BUILTIN_CORE(funcname, _id) \
@@ -280,6 +285,8 @@ static enum msg_hash_enums action_ok_dl_to_enum(unsigned lbl)
          return MENU_ENUM_LABEL_DEFERRED_DROPDOWN_BOX_LIST_SPECIAL;
       case ACTION_OK_DL_DROPDOWN_BOX_LIST_RESOLUTION:
          return MENU_ENUM_LABEL_DEFERRED_DROPDOWN_BOX_LIST_RESOLUTION;
+      case ACTION_OK_DL_DROPDOWN_BOX_LIST_CRT_SUPER_RESOLUTION:
+         return MENU_ENUM_LABEL_DEFERRED_DROPDOWN_BOX_LIST_CRT_SUPER_RESOLUTION;
       case ACTION_OK_DL_DROPDOWN_BOX_LIST_AUDIO_DEVICE:
          return MENU_ENUM_LABEL_DEFERRED_DROPDOWN_BOX_LIST_AUDIO_DEVICE;
       case ACTION_OK_DL_DROPDOWN_BOX_LIST_MIDI_DEVICE:
@@ -332,8 +339,8 @@ static enum msg_hash_enums action_ok_dl_to_enum(unsigned lbl)
          return MENU_ENUM_LABEL_DEFERRED_MIXER_STREAM_SETTINGS_LIST;
       case ACTION_OK_DL_ACCOUNTS_LIST:
          return MENU_ENUM_LABEL_DEFERRED_ACCOUNTS_LIST;
-      case ACTION_OK_DL_ACHIEVEMENTS_HARDCORE_PAUSE_LIST:
-         return MENU_ENUM_LABEL_DEFERRED_ACCOUNTS_LIST;
+      case ACTION_OK_DL_ACHIEVEMENTS_SUBMENU_LIST:
+         return MENU_ENUM_LABEL_DEFERRED_ACHIEVEMENTS_SUBMENU_LIST;
       case ACTION_OK_DL_INPUT_SETTINGS_LIST:
          return MENU_ENUM_LABEL_DEFERRED_INPUT_SETTINGS_LIST;
       case ACTION_OK_DL_INPUT_MENU_SETTINGS_LIST:
@@ -828,6 +835,14 @@ int generic_action_ok_displaylist_push(
          info_path          = path;
          info_label         = MENU_ENUM_LABEL_DEFERRED_DROPDOWN_BOX_LIST_RESOLUTION_STR;
          info.enum_idx      = MENU_ENUM_LABEL_DEFERRED_DROPDOWN_BOX_LIST_RESOLUTION;
+         dl_type            = DISPLAYLIST_GENERIC;
+         break;
+      case ACTION_OK_DL_DROPDOWN_BOX_LIST_CRT_SUPER_RESOLUTION:
+         info.type          = type;
+         info.directory_ptr = idx;
+         info_path          = path;
+         info_label         = MENU_ENUM_LABEL_DEFERRED_DROPDOWN_BOX_LIST_CRT_SUPER_RESOLUTION_STR;
+         info.enum_idx      = MENU_ENUM_LABEL_DEFERRED_DROPDOWN_BOX_LIST_CRT_SUPER_RESOLUTION;
          dl_type            = DISPLAYLIST_GENERIC;
          break;
       case ACTION_OK_DL_DROPDOWN_BOX_LIST_PLAYLIST_DEFAULT_CORE:
@@ -1756,7 +1771,7 @@ int generic_action_ok_displaylist_push(
       }
          break;
       case ACTION_OK_DL_ACCOUNTS_LIST:
-      case ACTION_OK_DL_ACHIEVEMENTS_HARDCORE_PAUSE_LIST:
+      case ACTION_OK_DL_ACHIEVEMENTS_SUBMENU_LIST:
       case ACTION_OK_DL_INPUT_SETTINGS_LIST:
       case ACTION_OK_DL_INPUT_MENU_SETTINGS_LIST:
       case ACTION_OK_DL_INPUT_TURBO_FIRE_SETTINGS_LIST:
@@ -2032,12 +2047,32 @@ static int action_ok_dl_from_map(const char *path,
       const char *label, unsigned type, size_t idx, size_t entry_idx)
 {
    size_t i;
-   /* The ok callback signature carries no enum_idx; the previous
-    * lookup keyed on 'type', but for these entries 'type' is the
-    * menu_settings_type (MENU_SETTING_ACTION), never the label enum,
-    * so every row missed and fell through to the archive/file browser.
-    * Key on the entry's canonical label instead, which is what the
-    * bind path matched on. */
+   /* The ok callback signature carries no enum_idx, so fetch the
+    * entry's cbs and key on the same cbs->enum_idx the bind path
+    * matched on. The entry's label string is not a usable key:
+    * saved Explore views are appended under
+    * MENU_ENUM_LABEL_GOTO_EXPLORE with the .lvw path in the label
+    * slot, so a string compare against the canonical label misses
+    * and falls through to the archive/file browser. */
+   struct menu_state *menu_st = menu_state_get_ptr();
+   menu_list_t *menu_list     = menu_st->entries.list;
+   file_list_t *selection_buf = menu_list
+         ? MENU_LIST_GET_SELECTION(menu_list, 0) : NULL;
+   menu_file_list_cbs_t *cbs  = selection_buf
+         ? (menu_file_list_cbs_t*)
+           file_list_get_actiondata_at_offset(selection_buf, idx) : NULL;
+
+   if (cbs && cbs->enum_idx != MSG_UNKNOWN)
+   {
+      for (i = 0; i < ARRAY_SIZE(ok_dl_map); i++)
+         if ((uint32_t)cbs->enum_idx == ok_dl_map[i].enum_idx)
+            return generic_action_ok_displaylist_push(path, NULL,
+                  label, type, idx, entry_idx,
+                  (unsigned)ok_dl_map[i].dl_id);
+   }
+
+   /* Entries reachable without a live selection buffer still
+    * resolve when their label is the canonical one. */
    for (i = 0; i < ARRAY_SIZE(ok_dl_map); i++)
       if (string_is_equal(label,
             msg_hash_to_str((enum msg_hash_enums)ok_dl_map[i].enum_idx)))
@@ -2409,7 +2444,7 @@ static int generic_action_ok(const char *path,
                   action_path);
 
             task_push_image_load(action_path,
-                  (video_driver_get_disp_flags() & VIDEO_FLAG_USE_RGBA), 0,
+                  gfx_surface_wants_rgba(), 0,
                   0,
                   menu_display_handle_wallpaper_upload, NULL);
          }
@@ -3540,6 +3575,7 @@ static int action_ok_wifi(const char *path, const char *label_setting,
       line.label_setting = label_setting;
       line.type          = type;
       line.idx           = (unsigned)idx;
+      line.text_type     = MENU_INPUT_DIALOG_KB_TYPE_PASSWORD;
       line.cb            = menu_input_wifi_cb;
       if (!menu_input_dialog_start(&line))
          return -1;
@@ -3917,9 +3953,11 @@ static int action_ok_video_filter_remove(const char *path,
       return -1;
    if (*settings->paths.path_softfilter_plugin)
    {
-      /* Unload video filter */
+      /* Unload video filter. The driver was set up for its output
+       * (pixel format and scale), so set it up again without it, as
+       * the reset does */
       settings->paths.path_softfilter_plugin[0] = '\0';
-      video_driver_filter_free();
+      command_event(CMD_EVENT_REINIT, NULL);
       /* Refresh menu */
       menu_st->flags         |=  MENU_ST_FLAG_ENTRIES_NEED_REFRESH
                              |  MENU_ST_FLAG_PREVENT_POPULATE;
@@ -3979,20 +4017,22 @@ static void menu_input_st_string_cb_cheat_file_save_as(
 }
 #endif
 
-DEFAULT_ACTION_DIALOG_START(action_ok_enable_settings,
+DEFAULT_ACTION_DIALOG_START_TYPE(action_ok_enable_settings,
    msg_hash_to_str(MSG_INPUT_ENABLE_SETTINGS_PASSWORD),
    (unsigned)entry_idx,
-   menu_input_st_string_cb_enable_settings)
+   menu_input_st_string_cb_enable_settings,
+   MENU_INPUT_DIALOG_KB_TYPE_PASSWORD)
 #ifdef HAVE_CHEATS
 DEFAULT_ACTION_DIALOG_START(action_ok_cheat_file_save_as,
    msg_hash_to_str(MSG_INPUT_CHEAT_FILENAME),
    (unsigned)idx,
    menu_input_st_string_cb_cheat_file_save_as)
 #endif
-DEFAULT_ACTION_DIALOG_START(action_ok_disable_kiosk_mode,
+DEFAULT_ACTION_DIALOG_START_TYPE(action_ok_disable_kiosk_mode,
    msg_hash_to_str(MSG_INPUT_KIOSK_MODE_PASSWORD),
    (unsigned)entry_idx,
-   menu_input_st_string_cb_disable_kiosk_mode)
+   menu_input_st_string_cb_disable_kiosk_mode,
+   MENU_INPUT_DIALOG_KB_TYPE_PASSWORD)
 static int action_ok_rename_entry(const char *path,
       const char *label_setting, unsigned type, size_t idx, size_t entry_idx)
 {
@@ -4004,6 +4044,7 @@ static int action_ok_rename_entry(const char *path,
    line.label_setting                 = label_setting;
    line.type                          = type;
    line.idx                           = (unsigned)entry_idx;
+   line.text_type                     = MENU_INPUT_DIALOG_KB_TYPE_TEXT;
    line.cb                            = menu_input_st_string_cb_rename_entry;
 
    if (!menu_input_dialog_start(&line))
@@ -4290,7 +4331,6 @@ static int action_ok_remap_file_flush(const char *path,
    /* Log result */
    if (ret)
    {
-      /* TODO/FIXME - localize */
       RARCH_LOG(
             "[Remap] Saved input remapping options to \"%s\".\n",
             path_remapfile ? path_remapfile : "UNKNOWN");
@@ -4300,7 +4340,6 @@ static int action_ok_remap_file_flush(const char *path,
    }
    else
    {
-      /* TODO/FIXME - localize */
       RARCH_LOG(
             "[Remap] Failed to save input remapping options to \"%s\".\n",
             path_remapfile ? path_remapfile : "UNKNOWN");
@@ -5202,6 +5241,9 @@ static int action_ok_halt_replay(const char *path,
    return 0;
 }
 
+#ifdef HAVE_CHEEVOS
+/* Both of these are bound by the achievement entries below, which are
+ * compiled only with achievements on. */
 static int action_ok_close_submenu(const char* path,
    const char* label, unsigned type, size_t idx, size_t entry_idx)
 {
@@ -5215,6 +5257,7 @@ static int action_ok_cheevos_toggle_hardcore_mode(const char *path,
    action_cancel_pop_default(path, label, type, idx);
    return generic_action_ok_command(CMD_EVENT_RESUME);
 }
+#endif
 
 static int action_ok_undo_load_state(const char *path,
       const char *label, unsigned type, size_t idx, size_t entry_idx)
@@ -6760,6 +6803,7 @@ static int action_ok_add_entry_to_new_playlist(const char *path,
    line.label_setting         = NULL;
    line.type                  = 0;
    line.idx                   = 0;
+   line.text_type             = MENU_INPUT_DIALOG_KB_TYPE_TEXT;
    line.cb                    = (string_is_equal(label, (char*)MENU_ENUM_LABEL_CREATE_NEW_PLAYLIST_STR) ?
                                       action_input_add_entry_to_new_playlist :
                                       action_input_add_entry_to_new_playlist_quickmenu);
@@ -7045,7 +7089,7 @@ STATIC_DEFAULT_ACTION_OK_FUNC(action_ok_steam_settings_list, ACTION_OK_DL_STEAM_
 STATIC_DEFAULT_ACTION_OK_FUNC(action_ok_push_core_manager_steam_list, ACTION_OK_DL_CORE_MANAGER_STEAM_LIST)
 #endif
 #ifdef HAVE_CHEEVOS
-DEFAULT_ACTION_OK_FUNC(action_ok_push_achievements_hardcore_pause_list, ACTION_OK_DL_ACHIEVEMENTS_HARDCORE_PAUSE_LIST)
+DEFAULT_ACTION_OK_FUNC(action_ok_push_achievements_submenu, ACTION_OK_DL_ACHIEVEMENTS_SUBMENU_LIST)
 #endif
 DEFAULT_ACTION_OK_FUNC(action_ok_push_core_information_list, ACTION_OK_DL_CORE_INFORMATION_LIST)
 #ifdef HAVE_MIST
@@ -7528,7 +7572,7 @@ static int action_ok_push_dropdown_setting_uint_item_special(const char *path,
          value = path_value;
    }
 
-   *setting->value.target.unsigned_integer = value;
+   setting_uint_set(setting, value);
 
    if (setting->actions->change)
       setting->actions->change(setting);
@@ -7548,12 +7592,13 @@ static int generic_action_ok_dropdown_setting(const char *path, const char *labe
    switch (setting->type)
    {
       case ST_INT:
-         *setting->value.target.integer = (int32_t)((idx * setting->step) + setting->offset_by);
+         setting_int_set(setting,
+               (int)((idx * setting->step) + setting->offset_by));
          break;
       case ST_UINT:
          {
             unsigned value = (unsigned)((idx * setting->step) + setting->offset_by);
-            *setting->value.target.unsigned_integer = value;
+            setting_uint_set(setting, value);
          }
          break;
       case ST_FLOAT:
@@ -7629,6 +7674,7 @@ int action_cb_push_dropdown_item_resolution(const char *path,
       const char *label, unsigned type, size_t idx, size_t entry_idx)
 {
    char *end            = NULL;
+   unsigned dims        = 0;
    unsigned width       = 0;
    unsigned height      = 0;
    float refreshrate    = 0.0f;
@@ -7636,12 +7682,17 @@ int action_cb_push_dropdown_item_resolution(const char *path,
    if (!path)
       return -1;
 
-   width = (unsigned)strtoul(path, &end, 0);
+   /* Each axis is parsed into a local first: VIDEO_SCALE_PACK reads
+    * its arguments twice, so a strtoul() written inside it runs twice,
+    * and the second call for the height parsed on from where the first
+    * had left 'end' - every mode picked from the list went out as Wx0 */
+   width  = (unsigned)strtoul(path, &end, 0);
    if (end == path || *end != 'x')
       return -1;
 
    ++end;
    height = (unsigned)strtoul(end, &end, 0);
+   dims   = VIDEO_SCALE_PACK(width, height);
    /* Skip whitespace and opening parenthesis: "2160 (120 Hz)" → "120 Hz)" */
    while (*end == ' ' || *end == '(')
       ++end;
@@ -7649,7 +7700,7 @@ int action_cb_push_dropdown_item_resolution(const char *path,
    refreshrate = (float)rstrtod(end, NULL);
 
 
-   if (video_display_server_set_resolution(width, height,
+   if (video_display_server_set_resolution(dims,
          floor(refreshrate), refreshrate, 0, 0, 0, 0))
    {
       settings_t *settings = config_get_ptr();
@@ -7680,8 +7731,8 @@ int action_cb_push_dropdown_item_resolution(const char *path,
        * applies changes this way. */
       driver_ctl(RARCH_DRIVER_CTL_SET_REFRESH_RATE, &refresh_exact);
 
-      settings->uints.video_fullscreen_x = width;
-      settings->uints.video_fullscreen_y = height;
+      settings->uints.video_fullscreen_x = VIDEO_SCALE_W(dims);
+      settings->uints.video_fullscreen_y = VIDEO_SCALE_H(dims);
 
       action_cancel_pop_default(NULL, NULL, 0, 0);
    }
@@ -7724,15 +7775,20 @@ static int action_ok_push_dropdown_item_video_shader_param_generic(const char *p
 
    video_shader_driver_get_current_shader(&shader_info);
 
-   param_prev    = &shader_info.data->parameters[entry_idx - offset];
    if (shader)
       param_menu = &shader->parameters [entry_idx - offset];
 
-   if (!param_prev || !param_menu)
+   if (!shader_info.data || !param_menu)
       return -1;
 
-   param_prev->current  = val;
-   param_menu->current  = param_prev->current;
+   /* Clamp against the live parameter's stable range, then submit
+    * through the owning-thread setter (see menu_cbs_right.c). */
+   param_prev           = &shader_info.data->parameters[entry_idx - offset];
+   val                  = MIN(MAX(param_prev->minimum, val),
+         param_prev->maximum);
+   video_shader_driver_set_parameter(shader_info.data,
+         entry_idx - offset, val);
+   param_menu->current  = val;
 
    shader->flags       |= SHDR_FLAG_MODIFIED;
 
@@ -7768,6 +7824,24 @@ static int action_ok_push_dropdown_item_resolution(const char *path,
             label, type, idx, entry_idx) == 1)
       return -1;
    return 0;
+}
+
+/* The super width the engine is asked for. The values are widths, not
+ * an index - 0 and 1 mean native and best-fit - so the row carries
+ * the value and the entry index only orders the list. */
+static int action_ok_push_dropdown_item_crt_super_resolution(const char *path,
+      const char *label, unsigned type, size_t idx, size_t entry_idx)
+{
+   settings_t *settings = config_get_ptr();
+   static const unsigned values[] = { 0, 1, 1920, 2560, 3840 };
+
+   if (idx >= sizeof(values) / sizeof(values[0]))
+      return -1;
+
+   configuration_set_uint(settings,
+         settings->uints.crt_switch_resolution_super, values[idx]);
+
+   return action_cancel_pop_default(NULL, NULL, 0, 0);
 }
 
 static int action_ok_push_dropdown_item_playlist_default_core(
@@ -8529,36 +8603,26 @@ static int generic_dropdown_box_list(size_t idx, unsigned lbl)
 static int action_ok_video_resolution(const char *path,
       const char *label, unsigned type, size_t idx, size_t entry_idx)
 {
-#if defined(GEKKO) || defined(PS2) || defined(__PS3__)
-   unsigned width   = 0;
-   unsigned  height = 0;
+#if defined(PS2)
+   unsigned dims    = 0;
    char desc[64]    = {0};
 
-   if (video_driver_get_video_output_size(&width, &height, desc, sizeof(desc)))
+   if (video_driver_get_video_output_size(&dims, desc, sizeof(desc)))
    {
       size_t _len;
       char msg[128];
       msg[0] = '\0';
 
-#if defined(_WIN32) || defined(__PS3__)
-      generic_action_ok_command(CMD_EVENT_REINIT);
-#endif
-      video_driver_set_video_mode(width, height, true);
-#ifdef GEKKO
-      if (width == 0 || height == 0)
-         _len = snprintf(msg, sizeof(msg),
-               msg_hash_to_str(MSG_SCREEN_RESOLUTION_APPLYING_DEFAULT));
-      else
-#endif
+      video_driver_set_video_mode(dims, true);
       {
          if (*desc)
             _len = snprintf(msg, sizeof(msg),
                   msg_hash_to_str(MSG_SCREEN_RESOLUTION_APPLYING_DESC),
-                  width, height, desc);
+                  VIDEO_SCALE_W(dims), VIDEO_SCALE_H(dims), desc);
          else
             _len = snprintf(msg, sizeof(msg),
                   msg_hash_to_str(MSG_SCREEN_RESOLUTION_APPLYING_NO_DESC),
-                  width, height);
+                  VIDEO_SCALE_W(dims), VIDEO_SCALE_H(dims));
       }
       runloop_msg_queue_push(msg, _len, 1, 100, true, NULL,
             MESSAGE_QUEUE_ICON_DEFAULT, MESSAGE_QUEUE_CATEGORY_INFO);
@@ -9641,12 +9705,15 @@ static int menu_cbs_init_bind_ok_compare_label(menu_file_list_cbs_t *cbs,
          {MENU_ENUM_LABEL_CORE_DELETE,                         action_ok_core_delete},
          {MENU_ENUM_LABEL_CORE_CREATE_BACKUP,                  action_ok_core_create_backup},
          {MENU_ENUM_LABEL_DELETE_PLAYLIST,                     action_ok_delete_playlist},
+#ifdef HAVE_CHEEVOS
+         {MENU_ENUM_LABEL_CHEEVOS_MENU_SUBMENU,                action_ok_push_achievements_submenu},
          {MENU_ENUM_LABEL_ACHIEVEMENT_PAUSE_MENU,              action_ok_push_default},
          {MENU_ENUM_LABEL_ACHIEVEMENT_PAUSE,                   action_ok_cheevos_toggle_hardcore_mode},
          {MENU_ENUM_LABEL_ACHIEVEMENT_PAUSE_CANCEL,            action_ok_close_submenu},
          {MENU_ENUM_LABEL_ACHIEVEMENT_RESUME,                  action_ok_cheevos_toggle_hardcore_mode},
          {MENU_ENUM_LABEL_ACHIEVEMENT_RESUME_CANCEL,           action_ok_close_submenu },
          {MENU_ENUM_LABEL_ACHIEVEMENT_RESUME_REQUIRES_RELOAD,  action_ok_close_submenu },
+#endif
 #ifdef HAVE_MICROPHONE
          {MENU_ENUM_LABEL_MICROPHONE_SETTINGS,                 action_ok_push_microphone_settings_list},
 #endif
@@ -9670,6 +9737,8 @@ static int menu_cbs_init_bind_ok_compare_label(menu_file_list_cbs_t *cbs,
          {MENU_ENUM_LABEL_CORE_INPUT_REMAPPING_OPTIONS,        action_ok_push_default},
          {MENU_ENUM_LABEL_DISC_INFORMATION,                    action_ok_push_default},
          {MENU_ENUM_LABEL_SYSTEM_INFORMATION,                  action_ok_push_default},
+         {MENU_ENUM_LABEL_DISPLAY_INFORMATION,                 action_ok_push_default},
+         {MENU_ENUM_LABEL_DISPLAY_EDID_INFORMATION,            action_ok_push_default},
          {MENU_ENUM_LABEL_NETWORK_INFORMATION,                 action_ok_push_default},
          {MENU_ENUM_LABEL_ACHIEVEMENT_LIST,                    action_ok_push_default},
          {MENU_ENUM_LABEL_DISK_OPTIONS,                        action_ok_push_default},
@@ -9956,6 +10025,9 @@ static int menu_cbs_init_bind_ok_compare_type(menu_file_list_cbs_t *cbs,
             break;
          case MENU_SETTING_DROPDOWN_ITEM_RESOLUTION:
             BIND_ACTION_OK(cbs, action_ok_push_dropdown_item_resolution);
+            break;
+         case MENU_SETTING_DROPDOWN_ITEM_CRT_SUPER_RESOLUTION:
+            BIND_ACTION_OK(cbs, action_ok_push_dropdown_item_crt_super_resolution);
             break;
          case MENU_SETTING_DROPDOWN_ITEM_VIDEO_SHADER_NUM_PASS:
             BIND_ACTION_OK(cbs, action_ok_push_dropdown_item_video_shader_num_pass);

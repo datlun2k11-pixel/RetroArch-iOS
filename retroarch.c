@@ -86,6 +86,7 @@
 #include <compat/getopt.h>
 #include <compat/posix_string.h>
 #include <file/file_path.h>
+#include <streams/rzip_stream.h>
 #include <retro_miscellaneous.h>
 #include <lists/dir_list.h>
 #ifdef __MACH__
@@ -150,6 +151,8 @@
 
 #include "audio/audio_driver.h"
 
+#include "gfx/gfx_display.h"
+
 #ifdef HAVE_GFX_WIDGETS
 #include "gfx/gfx_widgets.h"
 #endif
@@ -201,6 +204,7 @@
 #include "gfx/video_display_server.h"
 #ifdef HAVE_THREADS
 #include "gfx/video_thread_wrapper.h"
+#include "gfx/video_thread_hw.h"
 #endif
 #ifdef HAVE_BLUETOOTH
 #include "bluetooth/bluetooth_driver.h"
@@ -346,9 +350,6 @@ struct rarch_state
 
    struct retro_perf_counter *perf_counters_rarch[MAX_COUNTERS];
 
-#ifdef HAVE_THREAD_STORAGE
-   sthread_tls_t rarch_tls;               /* unsigned alignment */
-#endif
    unsigned perf_ptr_rarch;
    uint32_t flags;
 
@@ -373,10 +374,6 @@ void libnx_apply_overclock(void);
 #endif
 
 static struct rarch_state rarch_st        = {0};
-
-#ifdef HAVE_THREAD_STORAGE
-static const void *MAGIC_POINTER          = (void*)(uintptr_t)0x0DEFACED;
-#endif
 
 static access_state_t access_state_st     = {0};
 static struct global global_driver_st     = {0}; /* retro_time_t alignment */
@@ -592,6 +589,8 @@ static midi_event_t rarch_midi_drv_output_event; /* ptr alignment */
 static bool rarch_midi_drv_input_enabled;
 static bool rarch_midi_drv_output_enabled;
 static bool rarch_midi_drv_output_pending;
+static bool rarch_midi_drv_inited;
+static bool rarch_midi_drv_requested;
 
 static void null_midi_free(void *p) { }
 static void *null_midi_init(const char *input, const char *output) { return (void*)-1; }
@@ -654,13 +653,46 @@ static const void *midi_driver_find_handle(int index)
    return midi_drivers[index];
 }
 
+/* Not done at driver init: the first WinMM MIDI call after boot
+ * can block for seconds while Windows starts its MIDI service. */
+static bool midi_driver_enum_devices(void)
+{
+   union string_list_elem_attr attr = {0};
+
+   if (!rarch_midi_drv_inited)
+      return false;
+   if (rarch_midi_drv_inputs)
+      return true;
+
+   rarch_midi_drv_inputs  = string_list_new();
+   rarch_midi_drv_outputs = string_list_new();
+
+   if (     rarch_midi_drv_inputs
+         && rarch_midi_drv_outputs
+         && string_list_append_n(rarch_midi_drv_inputs, MIDI_DRIVER_OFF, STRLEN_CONST(MIDI_DRIVER_OFF), attr)
+         && string_list_append_n(rarch_midi_drv_outputs, MIDI_DRIVER_OFF, STRLEN_CONST(MIDI_DRIVER_OFF), attr)
+         && midi_drv->get_avail_inputs(rarch_midi_drv_inputs)
+         && midi_drv->get_avail_outputs(rarch_midi_drv_outputs))
+      return true;
+
+   if (rarch_midi_drv_inputs)
+      string_list_free(rarch_midi_drv_inputs);
+   if (rarch_midi_drv_outputs)
+      string_list_free(rarch_midi_drv_outputs);
+   rarch_midi_drv_inputs  = NULL;
+   rarch_midi_drv_outputs = NULL;
+   return false;
+}
+
 struct string_list *midi_driver_get_avail_inputs(void)
 {
+   midi_driver_enum_devices();
    return rarch_midi_drv_inputs;
 }
 
 struct string_list *midi_driver_get_avail_outputs(void)
 {
+   midi_driver_enum_devices();
    return rarch_midi_drv_outputs;
 }
 
@@ -673,25 +705,6 @@ bool midi_driver_set_all_sounds_off(void)
 
    if (!rarch_midi_drv_data || !rarch_midi_drv_output_enabled)
       return false;
-
-#ifdef HAVE_WASAPI
-   /* FIXME: Due to some mysterious reason Frame Delay does not
-    * work with WASAPI unless MIDI output is active, even when
-    * MIDI is not used. Frame Delay also breaks if MIDI sounds
-    * are "set off", which happens on menu toggle, therefore
-    * skip this if WASAPI is used and Frame Delay is active.. */
-   {
-      /* audio_driver_get_ident(), not current_audio->ident: with the
-       * threaded pipeline the latter is "audio-thread" and this check
-       * silently stopped applying. */
-      const char *ident = audio_driver_get_ident();
-      if (ident && memcmp(ident, "wasapi", 6) == 0)
-      {
-         if (video_state_get_ptr()->frame_delay_target > 0 || config_get_ptr()->bools.video_scanline_sync)
-            return false;
-      }
-   }
-#endif
 
    event.data       = data;
    event.data_size  = sizeof(data);
@@ -784,24 +797,15 @@ bool midi_driver_render_audio(float *out, size_t frames, unsigned rate)
    return midi_drv->render(rarch_midi_drv_data, out, frames, rate);
 }
 
-static void midi_driver_free(void)
+/* Closes the device and its I/O buffers. The driver stays selected
+ * and the device lists stay valid, so the menu can still offer
+ * another device and the next GET_MIDI_INTERFACE can retry. */
+static void midi_driver_close(void)
 {
    if (rarch_midi_drv_data)
    {
       midi_drv->free(rarch_midi_drv_data);
       rarch_midi_drv_data = NULL;
-   }
-
-   if (rarch_midi_drv_inputs)
-   {
-      string_list_free(rarch_midi_drv_inputs);
-      rarch_midi_drv_inputs = NULL;
-   }
-
-   if (rarch_midi_drv_outputs)
-   {
-      string_list_free(rarch_midi_drv_outputs);
-      rarch_midi_drv_outputs = NULL;
    }
 
    if (rarch_midi_drv_input_buffer)
@@ -820,87 +824,84 @@ static void midi_driver_free(void)
    rarch_midi_drv_output_enabled = false;
 }
 
-static bool midi_driver_init(void *data)
+static void midi_driver_free(void)
 {
-   union string_list_elem_attr
-      attr                        = {0};
-   bool ret                       = true;
-   settings_t *settings           = (settings_t*)data;
+   midi_driver_close();
 
-   rarch_midi_drv_inputs          = string_list_new();
-   rarch_midi_drv_outputs         = string_list_new();
+   if (rarch_midi_drv_inputs)
+   {
+      string_list_free(rarch_midi_drv_inputs);
+      rarch_midi_drv_inputs = NULL;
+   }
 
-   if (!rarch_midi_drv_inputs || !rarch_midi_drv_outputs)
-      ret = false;
-   else if (!string_list_append_n(rarch_midi_drv_inputs, MIDI_DRIVER_OFF, STRLEN_CONST(MIDI_DRIVER_OFF), attr) ||
-            !string_list_append_n(rarch_midi_drv_outputs, MIDI_DRIVER_OFF, STRLEN_CONST(MIDI_DRIVER_OFF), attr))
+   if (rarch_midi_drv_outputs)
+   {
+      string_list_free(rarch_midi_drv_outputs);
+      rarch_midi_drv_outputs = NULL;
+   }
+
+   rarch_midi_drv_inited         = false;
+}
+
+static bool midi_driver_open(settings_t *settings)
+{
+   bool ret = true;
+
+   if (rarch_midi_drv_data)
+      return true;
+
+   if (!midi_driver_enum_devices())
       ret = false;
    else
    {
       char * input  = NULL;
       char * output = NULL;
 
-      midi_drv      = midi_driver_find_driver(
-            settings->arrays.midi_driver);
-
-      if (strcmp(midi_drv->ident, settings->arrays.midi_driver))
+      if (string_is_not_equal(settings->arrays.midi_input, MIDI_DRIVER_OFF))
       {
-         configuration_set_string(settings,
-               settings->arrays.midi_driver, midi_drv->ident);
+         if (string_list_find_elem(rarch_midi_drv_inputs, settings->arrays.midi_input))
+            input = settings->arrays.midi_input;
+         else
+         {
+            RARCH_WARN("[MIDI] Input device \"%s\" unavailable.\n",
+                  settings->arrays.midi_input);
+            configuration_set_string(settings,
+                  settings->arrays.midi_input, MIDI_DRIVER_OFF);
+         }
       }
 
-      if (!midi_drv->get_avail_inputs(rarch_midi_drv_inputs))
-         ret = false;
-      else if (!midi_drv->get_avail_outputs(rarch_midi_drv_outputs))
+      if (string_is_not_equal(settings->arrays.midi_output, MIDI_DRIVER_OFF))
+      {
+         if (string_list_find_elem(rarch_midi_drv_outputs, settings->arrays.midi_output))
+            output = settings->arrays.midi_output;
+         else
+         {
+            RARCH_WARN("[MIDI] Output device \"%s\" unavailable.\n",
+                  settings->arrays.midi_output);
+            configuration_set_string(settings,
+                  settings->arrays.midi_output, MIDI_DRIVER_OFF);
+         }
+      }
+
+      rarch_midi_drv_data = midi_drv->init(input, output);
+      if (!rarch_midi_drv_data)
          ret = false;
       else
       {
-         if (string_is_not_equal(settings->arrays.midi_input, MIDI_DRIVER_OFF))
-         {
-            if (string_list_find_elem(rarch_midi_drv_inputs, settings->arrays.midi_input))
-               input = settings->arrays.midi_input;
-            else
-            {
-               RARCH_WARN("[MIDI] Input device \"%s\" unavailable.\n",
-                     settings->arrays.midi_input);
-               configuration_set_string(settings,
-                     settings->arrays.midi_input, MIDI_DRIVER_OFF);
-            }
-         }
+         rarch_midi_drv_input_enabled  = (input  != NULL);
+         rarch_midi_drv_output_enabled = (output != NULL);
 
-         if (string_is_not_equal(settings->arrays.midi_output, MIDI_DRIVER_OFF))
-         {
-            if (string_list_find_elem(rarch_midi_drv_outputs, settings->arrays.midi_output))
-               output = settings->arrays.midi_output;
-            else
-            {
-               RARCH_WARN("[MIDI] Output device \"%s\" unavailable.\n",
-                     settings->arrays.midi_output);
-               configuration_set_string(settings,
-                     settings->arrays.midi_output, MIDI_DRIVER_OFF);
-            }
-         }
-
-         rarch_midi_drv_data = midi_drv->init(input, output);
-         if (!rarch_midi_drv_data)
+         if (!midi_driver_init_io_buffers())
             ret = false;
          else
          {
-            rarch_midi_drv_input_enabled  = (input  != NULL);
-            rarch_midi_drv_output_enabled = (output != NULL);
+            if (input)
+               RARCH_LOG("[MIDI] Input device: \"%s\".\n", input);
 
-            if (!midi_driver_init_io_buffers())
-               ret = false;
-            else
+            if (output)
             {
-               if (input)
-                  RARCH_LOG("[MIDI] Input device: \"%s\".\n", input);
-
-               if (output)
-               {
-                  RARCH_LOG("[MIDI] Output device: \"%s\".\n", output);
-                  midi_driver_set_volume(settings->uints.midi_volume);
-               }
+               RARCH_LOG("[MIDI] Output device: \"%s\".\n", output);
+               midi_driver_set_volume(settings->uints.midi_volume);
             }
          }
       }
@@ -908,22 +909,46 @@ static bool midi_driver_init(void *data)
 
    if (!ret)
    {
-      midi_driver_free();
+      midi_driver_close();
       RARCH_ERR("[MIDI] Initialization failed.\n");
       return false;
    }
    return true;
 }
 
+static bool midi_driver_init(void *data)
+{
+   settings_t *settings = (settings_t*)data;
+
+   midi_drv             = midi_driver_find_driver(
+         settings->arrays.midi_driver);
+
+   if (strcmp(midi_drv->ident, settings->arrays.midi_driver))
+   {
+      configuration_set_string(settings,
+            settings->arrays.midi_driver, midi_drv->ident);
+   }
+
+   rarch_midi_drv_inited = true;
+
+   if (rarch_midi_drv_requested)
+      return midi_driver_open(settings);
+   return true;
+}
+
+void midi_driver_request(void)
+{
+   rarch_midi_drv_requested = true;
+   if (rarch_midi_drv_inited)
+      midi_driver_open(config_get_ptr());
+}
+
 bool midi_driver_set_input(const char *input)
 {
+   /* Not open yet: the setting is read when a core requests
+    * the interface, so there is nothing to apply now. */
    if (!rarch_midi_drv_data)
-   {
-#ifdef DEBUG
-      RARCH_ERR("[MIDI] midi_driver_set_input called on uninitialized driver.\n");
-#endif
-      return false;
-   }
+      return true;
 
    if (string_is_equal(input, MIDI_DRIVER_OFF))
       input = NULL;
@@ -949,13 +974,10 @@ bool midi_driver_set_input(const char *input)
 
 bool midi_driver_set_output(void *settings_data, const char *output)
 {
+   /* Not open yet: the setting is read when a core requests
+    * the interface, so there is nothing to apply now. */
    if (!rarch_midi_drv_data)
-   {
-#ifdef DEBUG
-      RARCH_ERR("[MIDI] midi_driver_set_output called on uninitialized driver.\n");
-#endif
-      return false;
-   }
+      return true;
 
    if (string_is_equal(output, MIDI_DRIVER_OFF))
       output = NULL;
@@ -1303,6 +1325,12 @@ static size_t find_driver_nonempty(
          return strlcpy(s, cloud_sync_drivers[i]->ident, len);
    }
 #endif
+   else if (!strcmp(label, "ui_companion_driver"))
+   {
+      const char *ident = ui_companion_wimp_find_ident(i);
+      if (ident)
+         return strlcpy(s, ident, len);
+   }
    return 0;
 }
 
@@ -1414,42 +1442,6 @@ static float audio_driver_monitor_adjust_system_rates(
    return inp_sample_rate;
 }
 
-static bool video_driver_monitor_adjust_system_rates(
-      float timing_skew_hz,
-      float video_refresh_rate,
-      bool vrr_runloop_enable,
-      float audio_max_timing_skew,
-      unsigned video_swap_interval,
-      unsigned black_frame_insertion,
-      unsigned shader_subframes,
-      double input_fps)
-{
-   float target_video_sync_rate = timing_skew_hz;
-
-   /* Same concept as for audio driver adjust. */
-   float refresh_ratio                   = target_video_sync_rate/input_fps;
-   unsigned refresh_closest_multiple     = (unsigned)(refresh_ratio + 0.5f);
-   float timing_skew                     = 0.0f;
-
-   if (refresh_closest_multiple > 1)
-      target_video_sync_rate /= (((float)black_frame_insertion + 1.0f) * (float)video_swap_interval * (float)shader_subframes);
-
-   if (!vrr_runloop_enable)
-   {
-      timing_skew         =
-         fabs(1.0f - input_fps / target_video_sync_rate);
-      /* We don't want to adjust pitch too much. If we have extreme cases,
-       * just don't readjust at all. */
-      if (timing_skew <= audio_max_timing_skew)
-         return true;
-      RARCH_LOG("[Video] Timings deviate too much. Will not adjust."
-            " (Target = %.2f Hz, Game = %.2f Hz)\n",
-            target_video_sync_rate,
-            (float)input_fps);
-   }
-   return input_fps <= target_video_sync_rate;
-}
-
 static void driver_adjust_system_rates(
       runloop_state_t *runloop_st,
       video_driver_state_t *video_st,
@@ -1464,16 +1456,42 @@ static void driver_adjust_system_rates(
    unsigned shader_subframes              = settings->uints.video_shader_subframes;
    bool vrr_runloop_enable                = settings->bools.vrr_runloop_enable;
    bool video_adaptive_vsync              = settings->bools.video_adaptive_vsync;
+   unsigned sync_plan                     = RUNLOOP_SYNC_VSYNC_HOLDS
+         | (vrr_runloop_enable ? RUNLOOP_SYNC_EXACT_RATE : 0);
 
    /* Update video swap interval if automatic
     * switching is enabled */
    runloop_set_video_swap_interval(settings);
    video_swap_interval = runloop_get_video_swap_interval(video_swap_interval);
 
+   if (input_fps > 0.0)
+   {
+      float timing_skew_hz          = video_refresh_rate;
+
+      if (retro_atomic_load_acquire_int(&video_st->crt_switching_active))
+         timing_skew_hz             = input_fps;
+      video_st->core_hz             = input_fps;
+
+      sync_plan = runloop_sync_plan_for(timing_skew_hz, (float)input_fps,
+            ((float)black_frame_insertion + 1.0f)
+            * (float)video_swap_interval * (float)shader_subframes,
+            audio_max_timing_skew, vrr_runloop_enable);
+
+      if (!(sync_plan & RUNLOOP_SYNC_WITHIN_SKEW) && !vrr_runloop_enable)
+         RARCH_LOG("[Video] Timings deviate too much. Will not adjust."
+               " (Display = %.2f Hz, Game = %.2f Hz)\n",
+               timing_skew_hz, (float)input_fps);
+      else if (vrr_runloop_enable
+            && (sync_plan & RUNLOOP_SYNC_VSYNC_HOLDS)
+            && !(sync_plan & RUNLOOP_SYNC_EXACT_RATE))
+         RARCH_LOG("[Video] Game FPS above what the display presents at "
+               "this interval; VSync paces it instead of the exact rate.\n");
+   }
+
    if (input_sample_rate > 0.0)
    {
       audio_driver_state_t *audio_st      = audio_state_get_ptr();
-      if (vrr_runloop_enable)
+      if (sync_plan & RUNLOOP_SYNC_EXACT_RATE)
          audio_st->input = input_sample_rate;
       else
          audio_st->input =
@@ -1492,40 +1510,23 @@ static void driver_adjust_system_rates(
 
    runloop_st->flags &= ~RUNLOOP_FLAG_FORCE_NONBLOCK;
 
-   if (input_fps > 0.0)
+   if (!(sync_plan & RUNLOOP_SYNC_VSYNC_HOLDS))
    {
-      float timing_skew_hz          = video_refresh_rate;
+      /* We won't be able to do VSync reliably
+         when game FPS > monitor FPS. */
+      runloop_st->flags |= RUNLOOP_FLAG_FORCE_NONBLOCK;
+      RARCH_LOG("[Video] Game FPS > Monitor FPS. Cannot rely on VSync.\n");
 
-      if (video_st->flags & VIDEO_FLAG_CRT_SWITCHING_ACTIVE)
-         timing_skew_hz             = input_fps;
-      video_st->core_hz             = input_fps;
-
-      if (!video_driver_monitor_adjust_system_rates(
-               timing_skew_hz,
-               video_refresh_rate,
-               vrr_runloop_enable,
-               audio_max_timing_skew,
-               video_swap_interval,
-               black_frame_insertion,
-               shader_subframes,
-               input_fps))
+      if (video_st->data)
       {
-         /* We won't be able to do VSync reliably
-            when game FPS > monitor FPS. */
-         runloop_st->flags |= RUNLOOP_FLAG_FORCE_NONBLOCK;
-         RARCH_LOG("[Video] Game FPS > Monitor FPS. Cannot rely on VSync.\n");
-
-         if (video_st->data)
-         {
-            if (video_st->current_video->set_nonblock_state)
-               video_st->current_video->set_nonblock_state(
-                     video_st->data, true,
-                     video_driver_test_all_flags(GFX_CTX_FLAGS_ADAPTIVE_VSYNC)
-                     && video_adaptive_vsync,
-                     video_swap_interval);
-         }
-         return;
+         if (video_st->current_video->set_nonblock_state)
+            video_st->current_video->set_nonblock_state(
+                  video_st->data, true,
+                  video_driver_test_all_flags(GFX_CTX_FLAGS_ADAPTIVE_VSYNC)
+                  && video_adaptive_vsync,
+                  video_swap_interval);
       }
+      return;
    }
 
    if (video_st->data)
@@ -1557,7 +1558,7 @@ void driver_set_nonblock_state(void)
    bool adaptive_vsync         = settings->bools.video_adaptive_vsync;
    unsigned swap_interval      = runloop_get_video_swap_interval(
          settings->uints.video_swap_interval);
-   bool video_driver_active    = (video_st->flags  & VIDEO_FLAG_ACTIVE) ? true : false;
+   bool video_driver_active    = (video_st->main_flags  & VIDEO_FLAG_ACTIVE) ? true : false;
    bool audio_driver_active    = (AUDIO_FLAGS_GET(audio_st)  & AUDIO_FLAG_ACTIVE) ? true : false;
    bool runloop_force_nonblock = (runloop_st->flags & RUNLOOP_FLAG_FORCE_NONBLOCK) ? true : false;
 
@@ -1590,9 +1591,6 @@ void drivers_init(
    audio_driver_state_t *audio_st    = audio_state_get_ptr();
    input_driver_state_t *input_st    = input_state_get_ptr();
    video_driver_state_t *video_st    = video_state_get_ptr();
-#ifdef HAVE_MICROPHONE
-   microphone_driver_state_t *mic_st = microphone_state_get_ptr();
-#endif
 #ifdef HAVE_MENU
    struct menu_state *menu_st     = menu_state_get_ptr();
 #endif
@@ -1637,6 +1635,13 @@ void drivers_init(
                verbosity_enabled))
          retroarch_fail(1, "video_driver_init_internal()");
 
+#ifdef HAVE_THREADS
+      /* An OpenGL core under the threaded wrapper renders on this
+       * thread with a context of its own; it must be current here
+       * before context_reset creates the core's objects in it. */
+      if (video_driver_thread_wrapper_active())
+         video_thread_hw_bind_core_context(video_state_get_ptr()->data);
+#endif
       if (   !video_driver_cache_context_ack_test()
             && hwr->context_reset)
          hwr->context_reset();
@@ -1718,10 +1723,13 @@ void drivers_init(
                      *settings->arrays.camera_device
                      ? settings->arrays.camera_device : NULL,
                      camera_st->cb.caps,
-                     settings->uints.camera_width
-                     ? settings->uints.camera_width  : camera_st->cb.width,
-                     settings->uints.camera_height
-                     ? settings->uints.camera_height : camera_st->cb.height);
+                     VIDEO_SCALE_PACK(
+                        VIDEO_SCALE_W(settings->uints.camera_dims)
+                        ? VIDEO_SCALE_W(settings->uints.camera_dims)
+                        : camera_st->cb.width,
+                        VIDEO_SCALE_H(settings->uints.camera_dims)
+                        ? VIDEO_SCALE_H(settings->uints.camera_dims)
+                        : camera_st->cb.height));
 
                if (!camera_st->data)
                {
@@ -1773,10 +1781,11 @@ void drivers_init(
        && video_st->current_video->gfx_widgets_enabled
        && video_st->current_video->gfx_widgets_enabled(video_st->data))
    {
-      bool rarch_force_fullscreen = (video_st->flags &
+      bool rarch_force_fullscreen = ((uint32_t)retro_atomic_load_relaxed_int(&video_st->flags) &
          VIDEO_FLAG_FORCE_FULLSCREEN) ? true : false;
       bool video_is_fullscreen    = settings->bools.video_fullscreen
                                  || rarch_force_fullscreen;
+      unsigned output_size        = VIDEO_DRIVER_OUTPUT_DIMS(video_st);
 
       p_dispwidget->active= gfx_widgets_init(
             p_disp,
@@ -1784,8 +1793,7 @@ void drivers_init(
             settings,
             (uintptr_t)&p_dispwidget->active,
             video_is_threaded,
-            video_st->width,
-            video_st->height,
+            output_size,
             video_is_fullscreen,
             settings->paths.directory_assets,
             settings->paths.path_font);
@@ -1970,15 +1978,20 @@ void driver_uninit(int flags, enum driver_lifetime_flags lifetime_flags)
 
    if (flags & DRIVER_VIDEO_AND_INPUT_MASK)
    {
+      /* video_driver_free_internal() releases driver memory the
+       * cached frame can point into (a lent software framebuffer),
+       * so retire while that memory is still mapped. */
+      video_driver_cached_frame_retire();
       video_driver_free_internal();
 #ifdef HAVE_THREADS
+#ifndef RETRO_ATOMIC_HAS_PTR
+      /* The volatile-backend title fallback's lock - the only
+       * backend on which a display lock exists at all. */
       slock_free(video_st->display_lock);
-      slock_free(video_st->context_lock);
       video_st->display_lock      = NULL;
-      video_st->context_lock      = NULL;
+#endif
 #endif
       video_st->data              = NULL;
-      video_driver_cached_frame_invalidate();
    }
 
    if (flags & DRIVER_AUDIO_MASK)
@@ -1996,7 +2009,12 @@ void driver_uninit(int flags, enum driver_lifetime_flags lifetime_flags)
 #endif
 
    if (flags & DRIVER_MIDI_MASK)
+   {
       midi_driver_free();
+      /* Reopen after a reinit, not after the core is unloaded */
+      if (!(lifetime_flags & DRIVER_LIFETIME_RESET))
+         rarch_midi_drv_requested = false;
+   }
 
 #ifdef HAVE_LAKKA
    cpu_scaling_driver_free();
@@ -2025,17 +2043,18 @@ static void retroarch_deinit_drivers(struct retro_callbacks *cbs)
    }
 #endif
 
-#if defined(HAVE_CRTSWITCHRES)
+#if defined(HAVE_MODELINE)
    /* Switchres deinit */
-   if (video_st->flags & VIDEO_FLAG_CRT_SWITCHING_ACTIVE)
+   if (retro_atomic_load_acquire_int(&video_st->crt_switching_active))
       crt_destroy_modes(&video_st->crt_switch_st);
 #endif
 
    /* Video */
    video_display_server_destroy();
 
+   video_st->main_flags &= ~VIDEO_FLAG_ACTIVE;
    video_driver_modify_disp_flags(0,
-         VIDEO_FLAG_ACTIVE      | VIDEO_FLAG_USE_RGBA      |
+         VIDEO_FLAG_USE_RGBA    |
          VIDEO_FLAG_HDR_SUPPORT | VIDEO_FLAG_CACHE_CONTEXT);
    video_driver_cache_context_ack_clear();
    video_st->record_gpu_buffer          = NULL;
@@ -2135,12 +2154,12 @@ bool driver_ctl(enum driver_ctl_state state, void *data)
                   && runloop_st->current_core_type == CORE_TYPE_DUMMY)
                video_st->av_info.timing.fps = *hz;
 
-            /* Sets audio monitor rate to new value. */
+            driver_adjust_system_rates(runloop_st, video_st, settings);
+
+            /* Use the input rate adjusted for the new display timing. */
             audio_st->src_ratio_orig   =
             audio_st->src_ratio_curr   =
             (double)audio_output_sample_rate / audio_st->input;
-
-            driver_adjust_system_rates(runloop_st, video_st, settings);
 
             /* driver_adjust_system_rates may have updated audio_st->input
              * for the new refresh rate; recompute the DRC threshold so
@@ -2262,28 +2281,20 @@ struct string_list *dir_list_new_special(const char *input_dir,
             video_context_driver_get_flags(&flags);
 
             if (BIT32_GET(flags.flags, GFX_CTX_FLAGS_SHADERS_CG))
-            {
                _len    += strlcpy_lit(ext_shaders + _len, "cgp", sizeof(ext_shaders) - _len);
-               _len    += strlcpy_lit(ext_shaders + _len, "|",   sizeof(ext_shaders) - _len);
-               _len    += strlcpy_lit(ext_shaders + _len, "cg",  sizeof(ext_shaders) - _len);
-            }
 
             if (BIT32_GET(flags.flags, GFX_CTX_FLAGS_SHADERS_GLSL))
             {
                if (_len > 0)
                   _len += strlcpy_lit(ext_shaders + _len, "|",     sizeof(ext_shaders) - _len);
                _len    += strlcpy_lit(ext_shaders + _len, "glslp", sizeof(ext_shaders) - _len);
-               _len    += strlcpy_lit(ext_shaders + _len, "|",     sizeof(ext_shaders) - _len);
-               _len    += strlcpy_lit(ext_shaders + _len, "glsl",  sizeof(ext_shaders) - _len);
             }
 
             if (BIT32_GET(flags.flags, GFX_CTX_FLAGS_SHADERS_SLANG))
             {
                if (_len > 0)
                   _len += strlcpy_lit(ext_shaders + _len, "|",      sizeof(ext_shaders) - _len);
-               _len    += strlcpy_lit(ext_shaders + _len, "slangp", sizeof(ext_shaders) - _len);
-               _len    += strlcpy_lit(ext_shaders + _len, "|",      sizeof(ext_shaders) - _len);
-               strlcpy_lit(ext_shaders + _len, "slang",  sizeof(ext_shaders) - _len);
+               strlcpy_lit(ext_shaders + _len, "slangp", sizeof(ext_shaders) - _len);
             }
 
             exts = ext_shaders;
@@ -2344,6 +2355,17 @@ static struct string_list *string_list_new_special(
          for (i = 0; camera_drivers[i]; i++)
          {
             const char *opt  = camera_drivers[i]->ident;
+            *len            += strlen(opt) + 1;
+
+            string_list_append(s, opt, attr);
+         }
+         break;
+      case STRING_LIST_UI_COMPANION_DRIVERS:
+         for (i = 0; ; i++)
+         {
+            const char *opt  = ui_companion_wimp_find_ident(i);
+            if (!opt)
+               break;
             *len            += strlen(opt) + 1;
 
             string_list_append(s, opt, attr);
@@ -3008,6 +3030,12 @@ enum rarch_content_type path_is_media_type(const char *path)
 #if defined(HAVE_AUDIOMIXER) && defined(HAVE_RAAC)
       case FILE_TYPE_AAC:
 #endif
+#if defined(HAVE_AUDIOMIXER) && defined(HAVE_RAC3)
+      case FILE_TYPE_AC3:
+#endif
+#if defined(HAVE_AUDIOMIXER) && defined(HAVE_RLPCM)
+      case FILE_TYPE_LPCM:
+#endif
 #if defined(HAVE_AUDIOMIXER) && defined(HAVE_ROPUS)
       case FILE_TYPE_OPUS:
 #endif
@@ -3250,8 +3278,8 @@ bool is_accessibility_enabled(bool accessibility_enable, bool accessibility_enab
 /* Everything closing content does once nothing is left running in
  * the core.
  *
- * Split out of CMD_EVENT_CORE_DEINIT unchanged, and still called
- * from exactly where it used to run.  It is separated because it has
+ * The tail half of CMD_EVENT_CORE_DEINIT, called from exactly
+ * where that body runs.  It is separated because it has
  * to become resumable: the wait above it is the freeze this work is
  * about, and removing that wait means this half runs later, from the
  * frame loop, once the tasks have finished.  Extracting it on its
@@ -3335,7 +3363,6 @@ bool command_event(enum event_command cmd, void *data)
 {
    struct rarch_state *p_rarch     = &rarch_st;
    runloop_state_t *runloop_st     = runloop_state_get_ptr();
-   uico_driver_state_t *uico_st    = uico_state_get_ptr();
 #if defined(HAVE_ACCESSIBILITY) || defined(HAVE_TRANSLATE)
    access_state_t *access_st       = access_state_get_ptr();
 #endif
@@ -3638,19 +3665,19 @@ bool command_event(enum event_command cmd, void *data)
       case CMD_EVENT_SET_PER_GAME_RESOLUTION:
 #if defined(GEKKO)
          {
-            unsigned width = 0, height = 0;
+            unsigned dims = 0;
             char desc[64] = {0};
 
             command_event(CMD_EVENT_VIDEO_SET_ASPECT_RATIO, NULL);
 
-            if (video_driver_get_video_output_size(&width, &height, desc, sizeof(desc)))
+            if (video_driver_get_video_output_size(&dims, desc, sizeof(desc)))
             {
                size_t _len;
                char msg[128];
 
-               video_driver_set_video_mode(width, height, true);
+               video_driver_set_video_mode(dims, true);
 
-               if (width == 0 || height == 0)
+               if (!VIDEO_SCALE_W(dims) || !VIDEO_SCALE_H(dims))
                   _len = strlcpy(msg, msg_hash_to_str(MSG_SCREEN_RESOLUTION_DEFAULT), sizeof(msg));
                else
                {
@@ -3658,10 +3685,10 @@ bool command_event(enum event_command cmd, void *data)
                   if (*desc)
                      _len = snprintf(msg, sizeof(msg),
                         msg_hash_to_str(MSG_SCREEN_RESOLUTION_DESC),
-                        width, height, desc);
+                        VIDEO_SCALE_W(dims), VIDEO_SCALE_H(dims), desc);
                   else
                      _len = snprintf(msg, sizeof(msg), msg_hash_to_str(MSG_SCREEN_RESOLUTION_NO_DESC),
-                        width, height);
+                        VIDEO_SCALE_W(dims), VIDEO_SCALE_H(dims));
                }
 
                runloop_msg_queue_push(msg, _len, 1, 100, true, NULL,
@@ -3792,6 +3819,11 @@ bool command_event(enum event_command cmd, void *data)
 
             runloop_msg_queue_push(_msg, strlen(_msg), 1, 60, true, NULL,
                   MESSAGE_QUEUE_ICON_DEFAULT, MESSAGE_QUEUE_CATEGORY_INFO);
+            /* The toggle is instant while the filter keeps the core's
+             * pixel format; one that changes it (ntsc_crt) needs the
+             * driver set up again for the frames it now receives */
+            if (video_driver_filter_changes_format())
+               command_event(CMD_EVENT_REINIT, NULL);
 #endif
          }
          break;
@@ -3810,7 +3842,14 @@ bool command_event(enum event_command cmd, void *data)
             runloop_msg_queue_push(_msg, strlen(_msg), 1, 120, true, NULL,
                   MESSAGE_QUEUE_ICON_DEFAULT, MESSAGE_QUEUE_CATEGORY_INFO);
 
-            core_reset();
+            /* A reset throws the game's audio away mid-waveform, and
+             * re-initialising the machine is long enough to empty the device
+             * on the way. See audio_driver_jump_fade_begin(). */
+            {
+               bool ramped = audio_driver_jump_fade_begin();
+               core_reset();
+               audio_driver_jump_fade_end(ramped);
+            }
 #ifdef HAVE_CHEEVOS
 #ifdef HAVE_GFX_WIDGETS
             rcheevos_reset_game(dispwidget_get_ptr()->active);
@@ -4000,6 +4039,11 @@ bool command_event(enum event_command cmd, void *data)
 
             runloop_st->flags              &= ~RUNLOOP_FLAG_CORE_RUNNING;
 
+            /* Persist core options before anything below calls
+             * back into the core (auto save-state, unload, deinit),
+             * so a crash there cannot lose them. */
+            runloop_core_options_save();
+
             /* The platform that uses ram_state_save calls it when the content
              * ends and writes it to a file */
             ram_state_to_file();
@@ -4176,18 +4220,18 @@ bool command_event(enum event_command cmd, void *data)
 
             if (want_widgets && !widgets_active)
             {
-               bool force_fs            = (video_st->flags &
+               bool force_fs            = ((uint32_t)retro_atomic_load_relaxed_int(&video_st->flags) &
                      VIDEO_FLAG_FORCE_FULLSCREEN) ? true : false;
                bool video_is_fullscreen = settings->bools.video_fullscreen
                      || force_fs;
+               unsigned output_size     = VIDEO_DRIVER_OUTPUT_DIMS(video_st);
                p_dispwidget->active     = gfx_widgets_init(
                      disp_get_ptr(),
                      anim_get_ptr(),
                      settings,
                      (uintptr_t)&p_dispwidget->active,
                      VIDEO_DRIVER_IS_THREADED_INTERNAL(video_st),
-                     video_st->width,
-                     video_st->height,
+                     output_size,
                      video_is_fullscreen,
                      settings->paths.directory_assets,
                      settings->paths.path_font);
@@ -4239,6 +4283,12 @@ bool command_event(enum event_command cmd, void *data)
       case CMD_EVENT_CHEATS_APPLY:
 #ifdef HAVE_CHEATS
          cheat_manager_apply_cheats(settings->bools.notification_show_cheats_applied);
+#endif
+         break;
+      case CMD_EVENT_SAVE_COMPRESSION_CODEC_APPLY:
+#ifdef HAVE_COMPRESSION
+         rzipstream_set_write_codec(settings->uints.save_compression_codec == 1
+               ? RZIP_CODEC_ZSTD : RZIP_CODEC_DEFLATE);
 #endif
          break;
       case CMD_EVENT_REWIND_DEINIT:
@@ -4339,10 +4389,10 @@ bool command_event(enum event_command cmd, void *data)
          }
 #endif
          break;
-      /* Plain stop and start. These used to be gated on the menu's
-       * pause and menu-sound settings because the menu toggle issued
-       * them; it no longer does, and the gate also disabled them for
-       * the callers that mean it, such as the 3DS sleep and wake hooks. */
+      /* Plain stop and start, deliberately ungated: a gate on the
+       * menu's pause and menu-sound settings would also disable
+       * them for the callers that mean it, such as the 3DS sleep
+       * and wake hooks (the menu toggle does not issue them). */
       case CMD_EVENT_AUDIO_STOP:
          if (!audio_driver_stop())
             return false;
@@ -4396,6 +4446,7 @@ bool command_event(enum event_command cmd, void *data)
 #ifdef HAVE_OVERLAY
          {
             bool *check_rotation           = (bool*)data;
+            unsigned output_size;
             video_driver_state_t
                *video_st                   = video_state_get_ptr();
             input_driver_state_t *input_st = input_state_get_ptr();
@@ -4409,14 +4460,13 @@ bool command_event(enum event_command cmd, void *data)
 
             ol->index                      = ol->next_index;
             ol->active                     = &ol->overlays[ol->index];
-            ((struct overlay *)ol->active)->viewport_override_logged = false;
+            video_driver_set_overlay_viewport(ol->active);
 
             input_overlay_opacity          = (ol->flags & INPUT_OVERLAY_IS_OSK)
                   ? settings->floats.input_osk_overlay_opacity
                   : settings->floats.input_overlay_opacity;
 
-            input_overlay_load_active(input_st->overlay_visibility,
-                  ol, input_overlay_opacity);
+            input_overlay_load_active(ol, input_overlay_opacity);
 
             ol->next_index                 =
                   (unsigned)((ol->index + 1) % ol->size);
@@ -4425,12 +4475,11 @@ bool command_event(enum event_command cmd, void *data)
             command_event(CMD_EVENT_VIDEO_SET_ASPECT_RATIO, NULL);
 
             /* Check orientation, if required */
+            output_size = VIDEO_DRIVER_OUTPUT_DIMS(video_st);
             if (inp_overlay_auto_rotate)
                if (check_rotation)
                   if (*check_rotation)
-                     input_overlay_auto_rotate_(
-                           video_st->width,
-                           video_st->height,
+                     input_overlay_auto_rotate_(output_size,
                            settings->bools.input_overlay_enable,
                            ol);
          }
@@ -4669,6 +4718,11 @@ bool command_event(enum event_command cmd, void *data)
          break;
       case CMD_EVENT_CORE_DEINIT:
          {
+            /* Persist core options before anything below calls
+             * back into the core (auto save-state, unload, deinit),
+             * so a crash there cannot lose them. */
+            runloop_core_options_save();
+
             /* Restore unpaused state. The recursive command_event call
              * here re-enters this dispatcher; the UNPAUSE branch is
              * deliberately small (clears flags, resumes audio) and
@@ -4806,7 +4860,7 @@ bool command_event(enum event_command cmd, void *data)
 #ifdef HAVE_OVERLAY
          {
             overlay_layout_desc_t layout_desc;
-            video_driver_state_t *video_st = video_state_get_ptr();
+            unsigned output_size;
             input_driver_state_t *input_st = input_state_get_ptr();
             input_overlay_t *ol            = input_st->overlay_ptr;
 
@@ -4839,10 +4893,8 @@ bool command_event(enum event_command cmd, void *data)
                layout_desc.auto_scale              = settings->bools.input_overlay_auto_scale;
             }
 
-            input_overlay_set_scale_factor(ol,
-                  &layout_desc,
-                  video_st->width,
-                  video_st->height);
+            output_size = VIDEO_DRIVER_OUTPUT_DIMS(video_state_get_ptr());
+            input_overlay_set_scale_factor(ol, &layout_desc, output_size);
          }
 #endif
          break;
@@ -4860,8 +4912,7 @@ bool command_event(enum event_command cmd, void *data)
                      ? settings->floats.input_osk_overlay_opacity
                      : settings->floats.input_overlay_opacity;
 
-               input_overlay_set_alpha_mod(input_st->overlay_visibility,
-                        ol, input_overlay_opacity);
+               input_overlay_set_alpha_mod(ol, input_overlay_opacity);
             }
          }
 #endif
@@ -4874,6 +4925,21 @@ bool command_event(enum event_command cmd, void *data)
       case CMD_EVENT_AUDIO_REINIT:
          driver_uninit(DRIVER_AUDIO_MASK, DRIVER_LIFETIME_RESET);
          drivers_init(settings, DRIVER_AUDIO_MASK, DRIVER_LIFETIME_RESET, verbosity_is_enabled());
+         /* The teardown drops the record that the core is held. */
+         {
+            bool core_held = !!(runloop_st->flags & RUNLOOP_FLAG_PAUSED);
+#ifdef HAVE_MENU
+            if (     (menu_st->flags & MENU_ST_FLAG_ALIVE)
+                  && settings->bools.menu_pause_libretro
+#ifdef HAVE_NETWORKING
+                  && netplay_driver_ctl(RARCH_NETPLAY_CTL_ALLOW_PAUSE, NULL)
+#endif
+               )
+               core_held = true;
+#endif
+            if (core_held)
+               audio_driver_pause_fade(true);
+         }
 #ifdef HAVE_MENU
          menu_st->flags |= MENU_ST_FLAG_ENTRIES_NEED_REFRESH;
 #endif
@@ -4928,18 +4994,6 @@ bool command_event(enum event_command cmd, void *data)
 #ifdef HAVE_MENU
          retroarch_menu_running_finished(false);
 #endif
-         if (uico_st->flags & UICO_ST_FLAG_IS_ON_FOREGROUND)
-         {
-#ifdef HAVE_QT
-            bool desktop_menu_enable = settings->bools.desktop_menu_enable;
-            bool ui_companion_toggle = settings->bools.ui_companion_toggle;
-#else
-            bool desktop_menu_enable = false;
-            bool ui_companion_toggle = false;
-#endif
-            ui_companion_driver_toggle(desktop_menu_enable,
-                  ui_companion_toggle, false);
-         }
          break;
       case CMD_EVENT_ADD_TO_FAVORITES:
          {
@@ -5114,9 +5168,11 @@ bool command_event(enum event_command cmd, void *data)
          break;
 #endif
       case CMD_EVENT_MENU_RESET_TO_DEFAULT_CONFIG:
-         config_set_defaults(global_get_ptr());
+         config_set_defaults(global_get_ptr(), config_get_ptr());
          break;
       case CMD_EVENT_MENU_SAVE_CURRENT_CONFIG:
+         /* Same as at quit: the companion's live layout first. */
+         ui_companion_event_command(CMD_EVENT_MENU_SAVE_CURRENT_CONFIG);
 #if !defined(HAVE_DYNAMIC)
          config_save_file_salamander();
 #endif
@@ -5267,9 +5323,7 @@ bool command_event(enum event_command cmd, void *data)
          runloop_pause_checks();
          break;
       case CMD_EVENT_MENU_PAUSE_LIBRETRO:
-         /* Audio is not stopped or started around the menu any more;
-          * see the menu toggle. Only the microphone follows the pause. */
-#if defined(HAVE_MENU) && defined(HAVE_MICROPHONE)
+#ifdef HAVE_MENU
          {
 #ifdef HAVE_NETWORKING
             bool menu_pause_libretro = settings->bools.menu_pause_libretro
@@ -5277,10 +5331,18 @@ bool command_event(enum event_command cmd, void *data)
 #else
             bool menu_pause_libretro = settings->bools.menu_pause_libretro;
 #endif
+            /* Changed from inside the menu: the core stops or resumes
+             * behind it on the next iteration, so the audio ramp follows
+             * the new state here rather than at the menu toggle. Either
+             * direction is a no-op when nothing changes. */
+            if (menu_st->flags & MENU_ST_FLAG_ALIVE)
+               audio_driver_pause_fade(menu_pause_libretro);
+#ifdef HAVE_MICROPHONE
             if (menu_pause_libretro)
                command_event(CMD_EVENT_MICROPHONE_STOP, NULL);
             else
                command_event(CMD_EVENT_MICROPHONE_START, NULL);
+#endif
          }
 #endif
          break;
@@ -5546,7 +5608,7 @@ bool command_event(enum event_command cmd, void *data)
                *input_st              = input_state_get_ptr();
             bool *userdata            = (bool*)data;
             bool video_fullscreen     = settings->bools.video_fullscreen;
-            bool ra_is_forced_fs      = (video_st->flags &
+            bool ra_is_forced_fs      = ((uint32_t)retro_atomic_load_relaxed_int(&video_st->flags) &
                VIDEO_FLAG_FORCE_FULLSCREEN) ? true : false;
             bool new_fullscreen_state = !video_fullscreen && !ra_is_forced_fs;
 
@@ -5787,7 +5849,7 @@ bool command_event(enum event_command cmd, void *data)
          break;
       case CMD_EVENT_UI_COMPANION_TOGGLE:
          {
-#ifdef HAVE_QT
+#ifdef HAVE_COMPANION_WIMP
             bool desktop_menu_enable = settings->bools.desktop_menu_enable;
             bool ui_companion_toggle = settings->bools.ui_companion_toggle;
 #else
@@ -5802,7 +5864,7 @@ bool command_event(enum event_command cmd, void *data)
          {
             bool video_fullscreen                         =
                   settings->bools.video_fullscreen
-               || (video_st->flags & VIDEO_FLAG_FORCE_FULLSCREEN);
+               || ((uint32_t)retro_atomic_load_relaxed_int(&video_st->flags) & VIDEO_FLAG_FORCE_FULLSCREEN);
             enum input_game_focus_cmd_type game_focus_cmd = GAME_FOCUS_CMD_TOGGLE;
             input_driver_state_t
                *input_st                                  = input_state_get_ptr();
@@ -6325,6 +6387,22 @@ static void sdl_exit(void)
  * Cleanly exit RetroArch.
  *
  **/
+/* Retire the task queue while every subsystem a finish callback can
+ * reach is still alive: the exit path tears drivers down before
+ * task_queue_deinit(), and deinit abandons whatever is still queued
+ * - handlers never run, finish callbacks never fire, cleanup
+ * callbacks never release their owners. Cancelling first lets
+ * cancellation-aware handlers wind down instead of completing their
+ * work, and the bound keeps a stuck transfer from hanging quit;
+ * whatever survives the bound meets the old abandonment, now the
+ * fallback instead of the rule. Scheduled-for-later tasks (a set
+ * 'when') do not hold the wait and are dropped as designed. */
+void retroarch_drain_tasks_for_exit(void)
+{
+   task_queue_reset();
+   task_queue_wait_timeout(NULL, NULL, 3 * 1000 * 1000);
+}
+
 void main_exit(void *args)
 {
    struct rarch_state *p_rarch  = &rarch_st;
@@ -6333,6 +6411,8 @@ void main_exit(void *args)
    struct menu_state  *menu_st  = menu_state_get_ptr();
 #endif
    settings_t     *settings     = config_get_ptr();
+
+   retroarch_drain_tasks_for_exit();
 
    video_driver_restore_cached(settings);
 
@@ -6403,11 +6483,17 @@ void main_exit(void *args)
 #endif
 
    ui_companion_driver_deinit();
-   retroarch_config_deinit();
 
    frontend_driver_shutdown(false);
 
    retroarch_deinit_drivers(&runloop_st->retro_ctx);
+   /* After the drivers: tearing them down reads settings - the Win32
+    * display server restores the original display mode through
+    * win32_monitor_info(), which asks for the monitor index - and a
+    * freed settings object is a crash on the way out, seen on Windows
+    * as a segfault in win32_display_server_destroy() once a run had
+    * changed the mode. */
+   retroarch_config_deinit();
    uico_state_get_ptr()->drv = NULL;
    frontend_driver_free();
 
@@ -6583,11 +6669,7 @@ int rarch_main(int argc, char *argv[], void *data)
    if (runloop_is_inited())
       driver_uninit(DRIVERS_CMD_ALL, (enum driver_lifetime_flags)0);
 
-#ifdef HAVE_THREAD_STORAGE
-   sthread_tls_create(&p_rarch->rarch_tls);
-   sthread_tls_set(&p_rarch->rarch_tls, MAGIC_POINTER);
-#endif
-   video_driver_modify_disp_flags(VIDEO_FLAG_ACTIVE, 0);
+   video_state_get_ptr()->main_flags |=  VIDEO_FLAG_ACTIVE;
    AUDIO_FLAGS_SET(audio_state_get_ptr(), AUDIO_FLAG_ACTIVE);
 
    {
@@ -6624,7 +6706,7 @@ int rarch_main(int argc, char *argv[], void *data)
    settings = config_get_ptr();
 
    ui_companion_driver_init_first(
-#ifdef HAVE_QT
+#ifdef HAVE_COMPANION_WIMP
          settings->bools.desktop_menu_enable,
          settings->bools.ui_companion_toggle,
 #else
@@ -6645,9 +6727,7 @@ int rarch_main(int argc, char *argv[], void *data)
    {
       int ret;
       bool app_exit     = false;
-#ifdef HAVE_QT
-      ui_companion_qt.application->process_events();
-#endif
+      ui_companion_driver_wimp_iterate();
       ret = runloop_iterate();
 
       task_queue_check();
@@ -6656,18 +6736,20 @@ int rarch_main(int argc, char *argv[], void *data)
    steam_poll();
 #endif
 
-#ifdef HAVE_QT
-      app_exit = ui_companion_qt.application->exiting;
-#endif
+      /* Whichever desktop companion is active, not Qt specifically. */
+      app_exit = ui_companion_driver_wimp_exiting();
 
       if (ret == -1 || app_exit)
       {
-#ifdef HAVE_QT
-         ui_companion_qt.application->quit();
-#endif
+         ui_companion_driver_wimp_quit();
          break;
       }
    }
+
+   /* Close the desktop companion window while its message pump and the
+    * drivers are still alive; leaving it for main_exit's teardown lets a
+    * native (Win32) companion window outlive the pump and hang. */
+   ui_companion_driver_wimp_deinit();
 
    main_exit(data);
 #endif
@@ -7042,7 +7124,7 @@ static void retroarch_print_features(void)
 #ifdef HAVE_ZLIB
    _len += _PSUPP_BUF(buf, _len, SUPPORTS_ZLIB,            "zlib",            "zlib support");
 #endif
-#if defined(HAVE_ZSTD) || defined(HAVE_RZSTD)
+#ifdef HAVE_RZSTD
    _len += _PSUPP_BUF(buf, _len, SUPPORTS_ZSTD,            "zstd",            "Zstandard support");
 #endif
 #ifdef HAVE_FFMPEG
@@ -8157,8 +8239,8 @@ static bool retroarch_parse_input_and_config(
                         retroarch_print_help(argv[0]);
                         retroarch_fail(1, "retroarch_parse_input()");
                      }
-                     rec_st->width  = (unsigned)w;
-                     rec_st->height = (unsigned)h;
+                     rec_st->out_dims = VIDEO_SCALE_PACK((unsigned)w,
+                           (unsigned)h);
                   }
                }
                break;
@@ -8443,7 +8525,7 @@ bool retroarch_main_init(int argc, char *argv[])
    core_info_set_savestate_probe(retroarch_core_info_savestate_probe);
 
    input_st->osk_idx             = OSK_LOWERCASE_LATIN;
-   video_driver_modify_disp_flags(VIDEO_FLAG_ACTIVE, 0);
+   video_state_get_ptr()->main_flags |=  VIDEO_FLAG_ACTIVE;
    AUDIO_FLAGS_SET(audio_state_get_ptr(), AUDIO_FLAG_ACTIVE);
 
    if (setjmp(global->error_sjlj_context) > 0)
@@ -8959,15 +9041,19 @@ void retroarch_init_task_queue(void)
 
    task_queue_deinit();
 #ifdef HAVE_NETWORKING
-   /* Before task_queue_init(), which is what spawns the task thread.
-    * net_http's DNS cache and connection pool locks used to be
-    * created lazily on first use, so the first two concurrent
-    * transfers of the process could each create one and then lock
-    * different objects. */
+   /* Before task_queue_init(), which is what spawns the task
+    * thread: net_http's DNS cache and connection pool locks must
+    * exist before any two transfers can race - created lazily on
+    * first use, the first two concurrent transfers of the process
+    * can each create one and then lock different objects. */
    net_http_init();
 #endif
    task_queue_init(threaded_enable, runloop_task_msg_queue_push);
 #ifdef HAVE_THREADS
+   /* The queue falls back to running tasks on the caller's thread when
+    * its worker or synchronisation primitives could not be created. */
+   if (threaded_enable && !task_queue_is_threaded())
+      RARCH_ERR("[Task] Threaded tasks were requested but could not be started; running tasks inline.\n");
    /* The main thread runs the emulation loop; on a mixed-core part
     * keep it off the slow cluster when asked. */
    if (settings->bools.thread_prefer_fast_cores)
@@ -9139,9 +9225,6 @@ bool retroarch_ctl(enum rarch_ctl_state state, void *data)
 
             runloop_is_inited_clear();
 
-#ifdef HAVE_THREAD_STORAGE
-            sthread_tls_delete(&p_rarch->rarch_tls);
-#endif
          }
          break;
 #ifdef HAVE_CONFIGFILE
@@ -9505,6 +9588,11 @@ bool retroarch_main_quit(void)
    video_driver_state_t*video_st = video_state_get_ptr();
    settings_t *settings          = config_get_ptr();
    bool config_save_on_exit      = settings->bools.config_save_on_exit;
+
+   /* Let the desktop companion snapshot its window/dock layout into
+    * settings_t before the config is written below; its own
+    * deinit runs only after the run loop has left, too late. */
+   ui_companion_event_command(CMD_EVENT_QUIT);
 
    /* Restore video driver before saving */
    video_driver_restore_cached(settings);

@@ -29,7 +29,7 @@
 
 #include "../gfx/display_servers/dispserv_apple.m"
 
-#if defined(HAVE_COCOATOUCH) || defined(HAVE_COCOA) || defined(HAVE_COCOA_METAL)
+#if defined(HAVE_COCOATOUCH) || defined(HAVE_COCOA)
 
 #include "../ui/drivers/cocoa/cocoa_common.m"
 #ifdef HAVE_RETROARCH_PLAYLIST_MANAGER
@@ -48,6 +48,7 @@
 
 #if TARGET_OS_OSX
 #include "../ui/drivers/ui_cocoa.m"
+#include "../ui/drivers/ui_cocoa_companion.m"
 #else
 #include "../ui/drivers/ui_cocoatouch.m"
 #endif

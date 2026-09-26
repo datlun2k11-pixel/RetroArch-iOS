@@ -35,7 +35,6 @@ typedef struct
 
 static void *xenon360_audio_init(const char *device,
       unsigned rate, unsigned latency,
-      unsigned block_frames,
       unsigned *new_rate)
 {
    static bool inited = false;
@@ -143,7 +142,6 @@ static void xenon360_audio_free(void *data)
 /* libxenon's sound API submits 16-bit big-endian PCM to the hardware;
  * the driver byteswaps for it. There is no float path. */
 static bool xenon360_use_float(void *data) { return false; }
-static size_t xenon360_write_avail(void *data) { return 0; }
 
 audio_driver_t audio_xenon360 = {
    xenon360_audio_init,
@@ -157,7 +155,10 @@ audio_driver_t audio_xenon360 = {
    "xenon360",
    NULL,
    NULL,
-   xenon360_write_avail,
+   /* write_avail - NULL disables rate control; a constant would
+    * instead feed it a fill that never changes. libxenon reports the
+    * unplayed bytes, so this could become a real measurement. */
+   NULL,
    NULL, /* buffer_size */
    NULL  /* write_raw */
 };

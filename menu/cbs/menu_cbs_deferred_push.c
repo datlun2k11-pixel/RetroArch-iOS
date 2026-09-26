@@ -153,8 +153,10 @@ GENERIC_DEFERRED_PUSH(deferred_push_xmb_font_path,                  DISPLAYLIST_
 GENERIC_DEFERRED_PUSH(deferred_push_ozone_font_path,                DISPLAYLIST_FONTS)
 GENERIC_DEFERRED_PUSH(deferred_push_disc_information,               DISPLAYLIST_DISC_INFO)
 GENERIC_DEFERRED_PUSH(deferred_push_system_information,             DISPLAYLIST_SYSTEM_INFO)
+GENERIC_DEFERRED_PUSH(deferred_push_display_information,            DISPLAYLIST_DISPLAY_INFO)
+GENERIC_DEFERRED_PUSH(deferred_push_display_edid_information,       DISPLAYLIST_DISPLAY_EDID_INFO)
 GENERIC_DEFERRED_PUSH(deferred_push_network_information,            DISPLAYLIST_NETWORK_INFO)
-GENERIC_DEFERRED_PUSH(deferred_push_achievement_pause_menu,         DISPLAYLIST_ACHIEVEMENT_PAUSE_MENU)
+GENERIC_DEFERRED_PUSH(deferred_push_achievement_submenu_list,       DISPLAYLIST_ACHIEVEMENT_SUBMENU_LIST)
 GENERIC_DEFERRED_PUSH(deferred_push_achievement_list,               DISPLAYLIST_ACHIEVEMENT_LIST)
 GENERIC_DEFERRED_PUSH(deferred_push_rdb_collection,                 DISPLAYLIST_PLAYLIST_COLLECTION)
 GENERIC_DEFERRED_PUSH(deferred_main_menu_list,                      DISPLAYLIST_MAIN_MENU)
@@ -462,6 +464,15 @@ static int general_push(menu_displaylist_info_t *info,
 #endif
                string_ext_list_merge_dedup(ext_filter, &_len, 2048, "aac");
 #endif
+#ifdef HAVE_RAC3
+               string_ext_list_merge_dedup(ext_filter, &_len, 2048, "ac3");
+               string_ext_list_merge_dedup(ext_filter, &_len, 2048, "eac3");
+               string_ext_list_merge_dedup(ext_filter, &_len, 2048, "ec3");
+#endif
+#ifdef HAVE_RLPCM
+               string_ext_list_merge_dedup(ext_filter, &_len, 2048, "lpcm");
+               string_ext_list_merge_dedup(ext_filter, &_len, 2048, "pcm");
+#endif
 #ifdef HAVE_ROPUS
                string_ext_list_merge_dedup(ext_filter, &_len, 2048, "opus");
 #endif
@@ -540,6 +551,7 @@ GENERIC_DEFERRED_PUSH_GENERAL(deferred_contentless_cores_list, PUSH_DEFAULT, DIS
 GENERIC_DEFERRED_PUSH_GENERAL(deferred_push_dropdown_box_list, PUSH_DEFAULT, DISPLAYLIST_DROPDOWN_LIST)
 GENERIC_DEFERRED_PUSH_GENERAL(deferred_push_dropdown_box_list_special, PUSH_DEFAULT, DISPLAYLIST_DROPDOWN_LIST_SPECIAL)
 GENERIC_DEFERRED_PUSH_GENERAL(deferred_push_dropdown_box_list_resolution, PUSH_DEFAULT, DISPLAYLIST_DROPDOWN_LIST_RESOLUTION)
+GENERIC_DEFERRED_PUSH_GENERAL(deferred_push_dropdown_box_list_crt_super_resolution, PUSH_DEFAULT, DISPLAYLIST_DROPDOWN_LIST_CRT_SUPER_RESOLUTION)
 GENERIC_DEFERRED_PUSH_GENERAL(deferred_push_dropdown_box_list_audio_device, PUSH_DEFAULT, DISPLAYLIST_DROPDOWN_LIST_AUDIO_DEVICE)
 GENERIC_DEFERRED_PUSH_GENERAL(deferred_push_dropdown_box_list_midi_device, PUSH_DEFAULT, DISPLAYLIST_DROPDOWN_LIST_MIDI_DEVICE)
 #ifdef HAVE_MICROPHONE
@@ -594,6 +606,7 @@ static int menu_cbs_init_bind_deferred_push_compare_label(
       {MENU_ENUM_LABEL_DEFERRED_DROPDOWN_BOX_LIST, deferred_push_dropdown_box_list},
       {MENU_ENUM_LABEL_DEFERRED_DROPDOWN_BOX_LIST_SPECIAL, deferred_push_dropdown_box_list_special},
       {MENU_ENUM_LABEL_DEFERRED_DROPDOWN_BOX_LIST_RESOLUTION, deferred_push_dropdown_box_list_resolution},
+      {MENU_ENUM_LABEL_DEFERRED_DROPDOWN_BOX_LIST_CRT_SUPER_RESOLUTION, deferred_push_dropdown_box_list_crt_super_resolution},
       {MENU_ENUM_LABEL_DEFERRED_DROPDOWN_BOX_LIST_AUDIO_DEVICE, deferred_push_dropdown_box_list_audio_device},
       {MENU_ENUM_LABEL_DEFERRED_DROPDOWN_BOX_LIST_MIDI_DEVICE, deferred_push_dropdown_box_list_midi_device},
 #ifdef HAVE_MICROPHONE
@@ -698,6 +711,8 @@ static int menu_cbs_init_bind_deferred_push_compare_label(
       {MENU_ENUM_LABEL_DEFERRED_ACCESSIBILITY_SETTINGS_LIST, deferred_push_accessibility_settings_list},
       {MENU_ENUM_LABEL_DISC_INFORMATION, deferred_push_disc_information},
       {MENU_ENUM_LABEL_SYSTEM_INFORMATION, deferred_push_system_information},
+      {MENU_ENUM_LABEL_DISPLAY_INFORMATION, deferred_push_display_information},
+      {MENU_ENUM_LABEL_DISPLAY_EDID_INFORMATION, deferred_push_display_edid_information},
       {MENU_ENUM_LABEL_DEFERRED_RPL_ENTRY_ACTIONS, deferred_push_rpl_entry_actions},
       {MENU_ENUM_LABEL_DEFERRED_NETPLAY, deferred_push_netplay_sublist},
       {MENU_ENUM_LABEL_DEFERRED_DRIVER_SETTINGS_LIST, deferred_push_driver_settings_list},
@@ -761,7 +776,7 @@ static int menu_cbs_init_bind_deferred_push_compare_label(
       {MENU_ENUM_LABEL_CONFIGURATIONS, deferred_push_configurations},
       {MENU_ENUM_LABEL_DEFERRED_ACCOUNTS_CHEEVOS_LIST, deferred_push_accounts_cheevos_list},
       {MENU_ENUM_LABEL_DATABASE_MANAGER_LIST, deferred_push_database_manager_list},
-      {MENU_ENUM_LABEL_ACHIEVEMENT_PAUSE_MENU, deferred_push_achievement_pause_menu},
+      {MENU_ENUM_LABEL_DEFERRED_ACHIEVEMENTS_SUBMENU_LIST, deferred_push_achievement_submenu_list},
       {MENU_ENUM_LABEL_ACHIEVEMENT_LIST, deferred_push_achievement_list},
       {MENU_ENUM_LABEL_CORE_COUNTERS, deferred_push_core_counters},
       {MENU_ENUM_LABEL_FRONTEND_COUNTERS, deferred_push_frontend_counters},
@@ -929,6 +944,7 @@ static int menu_cbs_init_bind_deferred_push_compare_label(
          { MENU_ENUM_LABEL_DEFERRED_REWIND_SETTINGS_LIST, deferred_push_rewind_settings_list },
          { MENU_ENUM_LABEL_DEFERRED_CHEEVOS_APPEARANCE_SETTINGS_LIST, deferred_push_cheevos_appearance_settings_list },
          { MENU_ENUM_LABEL_DEFERRED_CHEEVOS_VISIBILITY_SETTINGS_LIST, deferred_push_cheevos_visibility_settings_list },
+         { MENU_ENUM_LABEL_DEFERRED_ACHIEVEMENTS_SUBMENU_LIST, deferred_push_achievement_submenu_list },
          { MENU_ENUM_LABEL_DEFERRED_ONSCREEN_DISPLAY_SETTINGS_LIST, deferred_push_onscreen_display_settings_list },
          { MENU_ENUM_LABEL_DEFERRED_AUDIO_SETTINGS_LIST, deferred_push_audio_settings_list },
          { MENU_ENUM_LABEL_DEFERRED_AUDIO_OUTPUT_SETTINGS_LIST, deferred_push_audio_output_settings_list },

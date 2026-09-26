@@ -116,9 +116,6 @@ void get_ios_version(int *major, int *minor);
 /* Sets the title of the window this view is in; the target of a
  * performSelectorOnMainThread: from ui_window_cocoa_set_title(). */
 - (void)setWindowTitle:(NSString *)title;
-#if !defined(HAVE_COCOA) && !defined(HAVE_COCOA_METAL)
-- (void)display;
-#endif
 
 #if __MAC_OS_X_VERSION_MAX_ALLOWED >= 140000
 @property(nonatomic,readwrite,retain) CADisplayLink *displayLink API_AVAILABLE(macos(14.0));
@@ -135,20 +132,18 @@ void get_ios_version(int *major, int *minor);
 #if defined(__clang__)
 /* ARC is only available for Clang */
 #if __has_feature(objc_arc)
-#define RELEASE(x)   x = nil
+#define RELEASE(x)   do { x = nil; } while (0)
 #define BRIDGE       __bridge
 #define UNSAFE_UNRETAINED __unsafe_unretained
 #else
-#define RELEASE(x)   [x release]; \
-   x = nil
+#define RELEASE(x)   do { [x release]; x = nil; } while (0)
 #define BRIDGE
 #define UNSAFE_UNRETAINED
 #endif
 #else
 /* On compilers other than Clang (e.g. GCC), assume ARC 
    is going to be unavailable */
-#define RELEASE(x)   [x release]; \
-   x = nil
+#define RELEASE(x)   do { [x release]; x = nil; } while (0)
 #define BRIDGE
 #define UNSAFE_UNRETAINED
 #endif
@@ -193,7 +188,7 @@ bool cocoa_get_metrics(
  * funnel here so there is only one implementation per platform. */
 float cocoa_get_refresh_rate(void);
 
-void  cocoa_get_video_output_size(unsigned *width, unsigned *height,
+void  cocoa_get_video_output_size(unsigned *dims,
       char *desc, size_t desc_len);
 
 #endif
