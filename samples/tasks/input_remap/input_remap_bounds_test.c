@@ -54,6 +54,13 @@
  * (and clamps to RARCH_UNMAPPED), and the use sites in
  * input_driver.c bound on ARRAY_SIZE rather than sizeof.
  *
+ * The mapped port (input_remap_port_pN) had the same gap: it was
+ * stored as read, and is used to index per-port arrays of MAX_USERS
+ * entries (the port's libretro device, its input descriptors, its
+ * analog requests).  The load now puts a port outside
+ * [0, MAX_USERS] back to the user's own; MAX_USERS itself is 'None',
+ * which the use sites skip.
+ *
  * IMPORTANT: this test keeps verbatim copies of the post-fix
  * predicates from configuration.c and input/input_driver.c.
  * If those amend, the copies below must follow.  Following
@@ -99,6 +106,21 @@ static int validate_loaded_remap(int _remap)
       _remap = RARCH_UNMAPPED;
 
    return _remap;
+}
+/* === end verbatim copy === */
+
+/* Mirror: MAX_USERS from input/input_defines.h. */
+#define MAX_USERS 16
+
+/* === verbatim copy of the mapped-port check from
+ *     configuration.c::input_remapping_load_file().  Returns the
+ *     value kept in settings->uints.input_remap_ports[user] given
+ *     what CONFIG_GET_INT_BASE stored there. === */
+static unsigned validate_loaded_remap_port(unsigned port, unsigned i)
+{
+   if (port > MAX_USERS)
+      port = i;
+   return port;
 }
 /* === end verbatim copy === */
 
@@ -232,7 +254,7 @@ static void test_button_to_analog_in_range(void)
 {
    /* Valid remap_button values are RARCH_FIRST_CUSTOM_BIND ..
     * RARCH_ANALOG_BIND_LIST_END - 1, i.e. 16..23. */
-   mock_mapper_t handle = {0};
+   mock_mapper_t handle = {{{0}}};
    unsigned k;
    for (k = RARCH_FIRST_CUSTOM_BIND; k < RARCH_ANALOG_BIND_LIST_END; k++)
    {
@@ -328,6 +350,44 @@ static void test_analog_to_analog_sizeof_vs_array_size_bug(void)
    printf("[SUCCESS] sizeof-vs-ARRAY_SIZE bug correctly fixed\n");
 }
 
+/* A mapped port from a remap file: one a port array has is kept, and
+ * so is MAX_USERS ('None': the user feeds no core port); anything
+ * else is the user's own port.  The array read below is the shape of
+ * the use sites, which skip 'None'; under ASan a port that got
+ * through would be reported there. */
+static void test_remap_port_in_range_kept_out_of_range_reset(void)
+{
+   static const int raw[] = { 0, 1, 15, 16, 17, 99, 1024, -1, -99 };
+   unsigned *per_port = (unsigned*)calloc(MAX_USERS, sizeof(*per_port));
+   unsigned user;
+   size_t k;
+
+   for (user = 0; user < MAX_USERS; user++)
+   {
+      for (k = 0; k < ARRAY_SIZE(raw); k++)
+      {
+         /* CONFIG_GET_INT_BASE stores the int into an unsigned */
+         unsigned stored = (unsigned)raw[k];
+         unsigned port   = validate_loaded_remap_port(stored, user);
+         unsigned want   = (raw[k] >= 0 && raw[k] <= MAX_USERS)
+            ? (unsigned)raw[k] : user;
+
+         if (port != want)
+         {
+            printf("[FAILED] mapped port %d for user %u kept as %u, want %u\n",
+                  raw[k], user, port, want);
+            failures++;
+            continue;
+         }
+         if (port < MAX_USERS)
+            per_port[port]++;
+      }
+   }
+   free(per_port);
+   printf("[SUCCESS] mapped port: 0..%d and 'None' kept, anything else is the user's own\n",
+         MAX_USERS - 1);
+}
+
 int main(void)
 {
    test_validate_accepts_legitimate_button_indices();
@@ -337,6 +397,7 @@ int main(void)
    test_button_to_analog_in_range();
    test_button_to_analog_out_of_range_no_oob();
    test_analog_to_analog_sizeof_vs_array_size_bug();
+   test_remap_port_in_range_kept_out_of_range_reset();
 
    if (failures)
    {

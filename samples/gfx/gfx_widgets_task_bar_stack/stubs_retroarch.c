@@ -63,6 +63,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
+#include <compat/strl.h>
 #include <boolean.h>
 #include <features/features_cpu.h>
 
@@ -226,6 +227,9 @@ float gfx_display_get_dpi_scale(gfx_display_t *p_disp, void *settings_data,
 { (void)p_disp; (void)settings_data; (void)dims;
   (void)fullscreen; (void)is_widget; return 1.0f; }
 
+void gfx_display_texture_loads_cancel(const void *base, size_t len)
+{ (void)base; (void)len; }
+
 bool gfx_display_reset_textures_list_buffer(uintptr_t *item,
       enum texture_filter_type filter_type, void *buffer,
       unsigned buffer_len, enum image_type_enum image_type,
@@ -252,7 +256,9 @@ font_data_t *gfx_display_font_file(gfx_display_t *p_disp, char *fontpath,
 /* --- animation --- */
 bool gfx_animation_push_widget(gfx_animation_ctx_entry_t *entry)
 { (void)entry; return true; }
-bool gfx_animation_kill_widget_by_tag(uintptr_t *tag) { (void)tag; return true; }
+uintptr_t stub_last_killed_animation_tag;
+bool gfx_animation_kill_widget_by_tag(uintptr_t *tag)
+{ stub_last_killed_animation_tag = *tag; return true; }
 void gfx_animation_timer_start_widget(float *timer,
       gfx_timer_ctx_entry_t *timer_entry)
 { (void)timer_entry; if (timer) *timer = 0.0f; }

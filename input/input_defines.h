@@ -231,6 +231,20 @@ enum input_combo_type
    INPUT_COMBO_LAST
 };
 
+/* input_rotation: 0 to 3 are quarter turns, as Video Rotation counts
+ * them; this one follows that setting. */
+#define INPUT_ROTATION_AUTO 4
+
+/* What a core sees of two opposite D-Pad directions held together. */
+enum input_socd_mode
+{
+   INPUT_SOCD_OFF = 0,  /* both, as before */
+   INPUT_SOCD_NEUTRAL,  /* neither */
+   INPUT_SOCD_LAST,     /* the one pressed later */
+   INPUT_SOCD_FIRST,    /* the one pressed first */
+   INPUT_SOCD_UP        /* up; up + down only */
+};
+
 enum input_turbo_mode
 {
    INPUT_TURBO_MODE_CLASSIC = 0,

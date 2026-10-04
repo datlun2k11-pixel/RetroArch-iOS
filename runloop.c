@@ -103,6 +103,7 @@
 #if defined(ANDROID)
 #include "play_feature_delivery/play_feature_delivery.h"
 #include "frontend/drivers/platform_unix.h"
+#include "input/drivers/android_input.h"
 #endif
 
 #if defined(ANDROID) && defined(HAVE_SAF)
@@ -411,7 +412,7 @@ static void runloop_game_ai_think_cb(void *userdata,
 #define PERF_LOG_FMT "[PERF] Avg (%s): %llu ticks, %llu runs.\n"
 #endif
 
-static runloop_state_t runloop_state      = {0};
+static runloop_state_t runloop_state;
 
 /* Defined here, before its first user: the SET_MESSAGE_EXT STATUS
  * path in the environment callback defers through this machinery,
@@ -455,9 +456,22 @@ runloop_state_t *runloop_state_get_ptr(void)
    return &runloop_state;
 }
 
+void runloop_frame_work_set(unsigned bit, bool on)
+{
+   if (on)
+      runloop_state.frame_work |=  bit;
+   else
+      runloop_state.frame_work &= ~bit;
+}
+
 bool runloop_is_content_closing(void)
 {
    return runloop_state.content_closing;
+}
+
+bool runloop_is_content_switching(void)
+{
+   return runloop_state.content_switching;
 }
 
 bool state_manager_frame_is_reversed(void)
@@ -535,6 +549,117 @@ static void runloop_perf_log(void)
          runloop_state.perf_ptr_libretro);
 }
 
+/* ---- what a core reports of itself before it is loaded ----
+ *
+ * libretro_get_system_info() answers for a core that is not running
+ * - its name, extensions, whether it takes a path, whether it runs
+ * without content, which extensions it overrides - by opening the
+ * library, asking, and closing it again: the system loader's whole
+ * work, for a handful of values.  The answers are the binary's own,
+ * so they are kept, keyed by the core file's size and modification
+ * time, and a core is opened only when its file is new or has
+ * changed.  The record persists next to the core info cache.
+ *
+ * A core that declares subsystems is always opened: its declaration
+ * is a table of its own, which the probe copies out in full. */
+
+/* Extension lists sized like the system info strings */
+#define CORE_PROBE_EXTS_SIZE 256
+
+enum core_probe_flags
+{
+   CORE_PROBE_FLAG_NEED_FULLPATH  = (1 << 0),
+   CORE_PROBE_FLAG_BLOCK_EXTRACT  = (1 << 1),
+   CORE_PROBE_FLAG_NO_GAME        = (1 << 2),
+   /* Declared subsystems: never answered from the record */
+   CORE_PROBE_FLAG_SUBSYSTEMS     = (1 << 3),
+   /* The override lists overflowed, so they are not known */
+   CORE_PROBE_FLAG_OVERRIDES_CUT  = (1 << 4),
+   /* size and mtime were read: the record may be served and kept */
+   CORE_PROBE_FLAG_STAMPED        = (1 << 5)
+};
+
+typedef struct core_probe
+{
+   int64_t size;
+   int64_t mtime;
+   char   *path;
+   char    library_name[NAME_MAX_LENGTH];
+   char    library_version[64];
+   char    valid_extensions[CORE_PROBE_EXTS_SIZE];
+   /* Extensions the core's content info overrides declare to take a
+    * path, and those declared to be read into memory, '|' separated;
+    * an extension in neither follows need_fullpath */
+   char    fullpath_exts[CORE_PROBE_EXTS_SIZE];
+   char    memory_exts[CORE_PROBE_EXTS_SIZE];
+   uint8_t flags;
+} core_probe_t;
+
+/* Filled by runloop_environ_cb_get_system_info() while a probe runs */
+static core_probe_t *core_probe_capture = NULL;
+
+static bool core_probe_ext_listed(const char *list, const char *ext,
+      size_t ext_len)
+{
+   const char *p = list;
+   while (*p)
+   {
+      const char *end = p;
+      while (*end && *end != '|')
+         end++;
+      if ((size_t)(end - p) == ext_len)
+      {
+         size_t i;
+         for (i = 0; i < ext_len; i++)
+            if (tolower((unsigned char)p[i]) != tolower((unsigned char)ext[i]))
+               break;
+         if (i == ext_len)
+            return true;
+      }
+      p = *end ? end + 1 : end;
+   }
+   return false;
+}
+
+/* Records a content info override declaration the way
+ * content_file_override_set() reads it: an extension's first
+ * declaration is the one that counts. */
+static void core_probe_capture_overrides(core_probe_t *probe,
+      const struct retro_system_content_info_override *overrides)
+{
+   size_t i;
+   for (i = 0; overrides[i].extensions; i++)
+   {
+      const char *ptr = overrides[i].extensions;
+      char *dst       = overrides[i].need_fullpath
+         ? probe->fullpath_exts : probe->memory_exts;
+      while (*ptr)
+      {
+         const char *delim = ptr;
+         size_t _len, dst_len;
+         while (*delim && *delim != '|')
+            delim++;
+         _len = (size_t)(delim - ptr);
+         if (     _len
+               && !core_probe_ext_listed(probe->fullpath_exts, ptr, _len)
+               && !core_probe_ext_listed(probe->memory_exts, ptr, _len))
+         {
+            dst_len = strlen(dst);
+            if (dst_len + (dst_len ? 1 : 0) + _len >= CORE_PROBE_EXTS_SIZE)
+               probe->flags |= CORE_PROBE_FLAG_OVERRIDES_CUT;
+            else
+            {
+               if (dst_len)
+                  dst[dst_len++] = '|';
+               memcpy(dst + dst_len, ptr, _len);
+               dst[dst_len + _len] = '\0';
+            }
+         }
+         ptr = *delim ? delim + 1 : delim;
+      }
+   }
+}
+
 static bool runloop_environ_cb_get_system_info(unsigned cmd, void *data)
 {
    runloop_state_t *runloop_st    = &runloop_state;
@@ -554,6 +679,8 @@ static bool runloop_environ_cb_get_system_info(unsigned cmd, void *data)
          bool do_debug_log       = (log_level == RETRO_LOG_DEBUG);
 
          runloop_st->subsystem_current_count = 0;
+         if (core_probe_capture)
+            core_probe_capture->flags |= CORE_PROBE_FLAG_SUBSYSTEMS;
 
          RARCH_LOG("[Environ] SET_SUBSYSTEM_INFO.\n");
 
@@ -640,6 +767,11 @@ static bool runloop_environ_cb_get_system_info(unsigned cmd, void *data)
          }
          break;
       }
+      case RETRO_ENVIRONMENT_SET_CONTENT_INFO_OVERRIDE:
+         if (core_probe_capture && data)
+            core_probe_capture_overrides(core_probe_capture,
+                  (const struct retro_system_content_info_override*)data);
+         break;
       default:
          return false;
    }
@@ -2171,13 +2303,13 @@ bool runloop_environment_cb(unsigned cmd, void *data)
          break;
 
       case RETRO_ENVIRONMENT_GET_LANGUAGE:
-#ifdef HAVE_LANGEXTRA
+         /* Builds without HAVE_LANGEXTRA have no language setting and
+          * hold English here, which is what their menus show. */
          {
             unsigned user_lang = *msg_hash_get_uint(MSG_HASH_USER_LANGUAGE);
             *(unsigned *)data  = user_lang;
             RARCH_LOG("[Environ] GET_LANGUAGE: \"%u\".\n", user_lang);
          }
-#endif
          break;
 
       case RETRO_ENVIRONMENT_SET_PIXEL_FORMAT:
@@ -2354,6 +2486,9 @@ bool runloop_environment_cb(unsigned cmd, void *data)
                      unsigned mapped_port = settings->uints.input_remap_ports[p];
 
                      RARCH_DBG("%s %u:\n", msg_hash_to_str(MENU_ENUM_LABEL_VALUE_PORT), p + 1);
+
+                     if (mapped_port >= MAX_USERS)
+                        continue;
 
                      for (retro_id = 0; retro_id < RARCH_FIRST_CUSTOM_BIND; retro_id++)
                      {
@@ -2574,6 +2709,7 @@ bool runloop_environment_cb(unsigned cmd, void *data)
          bool state = *(const bool*)data;
          RARCH_LOG("[Environ] SET_SUPPORT_NO_GAME: %s.\n", state ? "yes" : "no");
 
+         runloop_st->system.load_no_content = state;
          if (state)
             content_set_does_not_need_content();
          else
@@ -4123,6 +4259,284 @@ bool runloop_environment_cb(unsigned cmd, void *data)
    return true;
 }
 
+#ifdef HAVE_DYNAMIC
+/* The records, one per core file probed; touched only on the main
+ * thread (libretro_get_system_info and the load's own lookups). */
+static core_probe_t *core_probes       = NULL;
+static size_t        core_probes_count = 0;
+static size_t        core_probes_cap   = 0;
+static bool          core_probes_read  = false;
+
+#define CORE_PROBE_FILE_HEADER "core_probe 1\n"
+
+static bool core_probe_file_path(char *s, size_t len)
+{
+   settings_t *settings = config_get_ptr();
+   const char *dir      = settings ? settings->paths.path_libretro_info : NULL;
+   if (!dir || !*dir)
+      return false;
+   fill_pathname_join_special(s, dir, FILE_PATH_CORE_PROBE_CACHE, len);
+   return true;
+}
+
+static bool core_probe_stamp(const char *path, int64_t *size, int64_t *mtime)
+{
+   *size = path_get_size(path);
+   return *size > 0 && path_get_mtime(path, mtime);
+}
+
+static core_probe_t *core_probe_find(const char *path)
+{
+   size_t i;
+   for (i = 0; i < core_probes_count; i++)
+      if (string_is_equal(core_probes[i].path, path))
+         return &core_probes[i];
+   return NULL;
+}
+
+/* Copies @src in, replacing the record of the same path */
+static core_probe_t *core_probe_put(const core_probe_t *src)
+{
+   core_probe_t *dst = core_probe_find(src->path);
+   char *path;
+
+   if (!dst)
+   {
+      if (core_probes_count == core_probes_cap)
+      {
+         size_t cap        = core_probes_cap ? core_probes_cap * 2 : 8;
+         core_probe_t *tmp = (core_probe_t*)realloc(core_probes,
+               cap * sizeof(*tmp));
+         if (!tmp)
+            return NULL;
+         core_probes       = tmp;
+         core_probes_cap   = cap;
+      }
+      if (!(path = strdup(src->path)))
+         return NULL;
+      dst = &core_probes[core_probes_count++];
+   }
+   else
+      path = dst->path;
+
+   *dst      = *src;
+   dst->path = path;
+   return dst;
+}
+
+/* Splits the next tab-separated field off *line, in place */
+static char *core_probe_field(char **line)
+{
+   char *start = *line;
+   char *end;
+   if (!start)
+      return NULL;
+   for (end = start; *end && *end != '\t'; end++) { }
+   if (*end)
+   {
+      *end  = '\0';
+      *line = end + 1;
+   }
+   else
+      *line = NULL;
+   return start;
+}
+
+static bool core_probe_parse_int64(const char *s, int64_t *out)
+{
+   int64_t v = 0;
+   bool neg  = (*s == '-');
+   if (neg)
+      s++;
+   if (!*s)
+      return false;
+   for (; *s; s++)
+   {
+      if (*s < '0' || *s > '9')
+         return false;
+      v = v * 10 + (*s - '0');
+   }
+   *out = neg ? -v : v;
+   return true;
+}
+
+/* Reads the persisted records once, the first time one is asked for.
+ * A line that does not parse is skipped: the core it names is opened
+ * the next time, as if never seen. */
+static void core_probe_read_file(void)
+{
+   /* Off the stack: libretro_get_system_info() holds a record there */
+   char *file_path = (char*)malloc(PATH_MAX_LENGTH);
+   void *buf       = NULL;
+   int64_t len     = 0;
+   char *line, *next;
+
+   core_probes_read = true;
+   if (     file_path
+         && core_probe_file_path(file_path, PATH_MAX_LENGTH)
+         && path_is_valid(file_path))
+      filestream_read_file(file_path, &buf, &len);
+   free(file_path);
+   if (!buf)
+      return;
+
+   line = (char*)buf;
+   if (strncmp(line, CORE_PROBE_FILE_HEADER,
+            STRLEN_CONST(CORE_PROBE_FILE_HEADER)))
+   {
+      free(buf);
+      return;
+   }
+   line += STRLEN_CONST(CORE_PROBE_FILE_HEADER);
+
+   for (; line && *line; line = next)
+   {
+      core_probe_t rec;
+      char *fields[9];
+      char *cur = line;
+      unsigned n;
+      int64_t flags;
+
+      if ((next = strchr(line, '\n')))
+         *next++ = '\0';
+
+      for (n = 0; n < 9 && cur; n++)
+         fields[n] = core_probe_field(&cur);
+      if (     n != 9 || cur
+            || !core_probe_parse_int64(fields[0], &rec.size)
+            || !core_probe_parse_int64(fields[1], &rec.mtime)
+            || !core_probe_parse_int64(fields[2], &flags)
+            || !*fields[3])
+         continue;
+
+      rec.flags = (uint8_t)flags;
+      rec.path  = fields[3];
+      strlcpy(rec.library_name,     fields[4], sizeof(rec.library_name));
+      strlcpy(rec.library_version,  fields[5], sizeof(rec.library_version));
+      strlcpy(rec.valid_extensions, fields[6], sizeof(rec.valid_extensions));
+      strlcpy(rec.fullpath_exts,    fields[7], sizeof(rec.fullpath_exts));
+      strlcpy(rec.memory_exts,      fields[8], sizeof(rec.memory_exts));
+      if (     (rec.flags & CORE_PROBE_FLAG_STAMPED)
+            && !(rec.flags & CORE_PROBE_FLAG_SUBSYSTEMS)
+            && !core_probe_find(rec.path))
+         core_probe_put(&rec);
+   }
+
+   free(buf);
+}
+
+static bool core_probe_field_ok(const char *s)
+{
+   return !strchr(s, '\t') && !strchr(s, '\n') && !strchr(s, '\r');
+}
+
+/* Writes every record that can be served, atomically.  Called when a
+ * record changes - a core file seen for the first time or changed -
+ * which has just cost a full open of the core. */
+static void core_probe_write_file(void)
+{
+   char *file_path;
+   char *buf;
+   size_t i, cap, len;
+
+   cap = STRLEN_CONST(CORE_PROBE_FILE_HEADER) + 1;
+   for (i = 0; i < core_probes_count; i++)
+      cap += 3 * 24 + 6 + strlen(core_probes[i].path)
+           + sizeof(core_probes[i].library_name)
+           + sizeof(core_probes[i].library_version)
+           + 3 * CORE_PROBE_EXTS_SIZE;
+   /* The path rides behind the records, off the stack */
+   if (!(buf = (char*)malloc(cap + PATH_MAX_LENGTH)))
+      return;
+   file_path = buf + cap;
+   if (!core_probe_file_path(file_path, PATH_MAX_LENGTH))
+   {
+      free(buf);
+      return;
+   }
+
+   len = strlcpy(buf, CORE_PROBE_FILE_HEADER, cap);
+   for (i = 0; i < core_probes_count; i++)
+   {
+      const core_probe_t *rec = &core_probes[i];
+      int n;
+      if (     !(rec->flags & CORE_PROBE_FLAG_STAMPED)
+            ||  (rec->flags & CORE_PROBE_FLAG_SUBSYSTEMS)
+            || !core_probe_field_ok(rec->path)
+            || !core_probe_field_ok(rec->library_name)
+            || !core_probe_field_ok(rec->library_version)
+            || !core_probe_field_ok(rec->valid_extensions)
+            || !core_probe_field_ok(rec->fullpath_exts)
+            || !core_probe_field_ok(rec->memory_exts))
+         continue;
+      n = snprintf(buf + len, cap - len,
+            "%" PRId64 "\t%" PRId64 "\t%u\t%s\t%s\t%s\t%s\t%s\t%s\n",
+            rec->size, rec->mtime, (unsigned)rec->flags, rec->path,
+            rec->library_name, rec->library_version,
+            rec->valid_extensions, rec->fullpath_exts, rec->memory_exts);
+      if (n < 0 || (size_t)n >= cap - len)
+         break;
+      len += (size_t)n;
+   }
+
+   if (!filestream_write_file_atomic(file_path, buf, (int64_t)len))
+      RARCH_WARN("[Core] Could not write \"%s\".\n", file_path);
+   free(buf);
+}
+
+/* The record for @path if it still describes the file there */
+static const core_probe_t *core_probe_lookup(const char *path)
+{
+   int64_t size, mtime;
+   const core_probe_t *rec;
+
+   if (!core_probes_read)
+      core_probe_read_file();
+   if (     !(rec = core_probe_find(path))
+         || !(rec->flags & CORE_PROBE_FLAG_STAMPED)
+         ||  (rec->flags & CORE_PROBE_FLAG_SUBSYSTEMS)
+         || !core_probe_stamp(path, &size, &mtime)
+         ||  size  != rec->size
+         ||  mtime != rec->mtime)
+      return NULL;
+   return rec;
+}
+
+void runloop_core_probe_cache_free(void)
+{
+   size_t i;
+   for (i = 0; i < core_probes_count; i++)
+      free(core_probes[i].path);
+   free(core_probes);
+   core_probes       = NULL;
+   core_probes_count = 0;
+   core_probes_cap   = 0;
+   core_probes_read  = false;
+}
+
+bool runloop_core_probe_need_fullpath(const char *core_path,
+      const char *ext, bool *need_fullpath)
+{
+   const core_probe_t *rec;
+   size_t ext_len;
+
+   if (     !core_path || !*core_path
+         || !(rec = core_probe_find(core_path))
+         ||  (rec->flags & CORE_PROBE_FLAG_OVERRIDES_CUT))
+      return false;
+
+   *need_fullpath = (rec->flags & CORE_PROBE_FLAG_NEED_FULLPATH) != 0;
+   if (ext && (ext_len = strlen(ext)))
+   {
+      if (core_probe_ext_listed(rec->fullpath_exts, ext, ext_len))
+         *need_fullpath = true;
+      else if (core_probe_ext_listed(rec->memory_exts, ext, ext_len))
+         *need_fullpath = false;
+   }
+   return true;
+}
+#endif
+
 bool libretro_get_system_info(
       const char *path,
       struct retro_system_info *sysinfo,
@@ -4130,6 +4544,8 @@ bool libretro_get_system_info(
 {
    struct retro_system_info dummy_info;
 #ifdef HAVE_DYNAMIC
+   core_probe_t probe;
+   const core_probe_t *cached = NULL;
    dylib_t lib;
 #endif
    runloop_state_t *runloop_st  = &runloop_state;
@@ -4145,14 +4561,60 @@ bool libretro_get_system_info(
    dummy_info.block_extract     = false;
 
 #ifdef HAVE_DYNAMIC
-   if (!(lib = libretro_get_system_info_lib(
-         path, &dummy_info, load_no_content)))
+   if ((cached = core_probe_lookup(path)))
    {
-      RARCH_ERR("[Core] %s: \"%s\"\n",
-            msg_hash_to_str(MSG_FAILED_TO_OPEN_LIBRETRO_CORE),
-            path);
-      RARCH_ERR("[Core] Error(s): %s\n", dylib_error());
-      return false;
+      dummy_info.library_name     = cached->library_name;
+      dummy_info.library_version  = cached->library_version;
+      dummy_info.valid_extensions = cached->valid_extensions;
+      dummy_info.need_fullpath    =
+         (cached->flags & CORE_PROBE_FLAG_NEED_FULLPATH) != 0;
+      dummy_info.block_extract    =
+         (cached->flags & CORE_PROBE_FLAG_BLOCK_EXTRACT) != 0;
+      if (load_no_content)
+         *load_no_content = (cached->flags & CORE_PROBE_FLAG_NO_GAME) != 0;
+      lib = NULL;
+   }
+   else
+   {
+      bool no_game = false;
+      memset(&probe, 0, sizeof(probe));
+      core_probe_capture = &probe;
+      lib = libretro_get_system_info_lib(path, &dummy_info, &no_game);
+      core_probe_capture = NULL;
+      if (!lib)
+      {
+         RARCH_ERR("[Core] %s: \"%s\"\n",
+               msg_hash_to_str(MSG_FAILED_TO_OPEN_LIBRETRO_CORE),
+               path);
+         RARCH_ERR("[Core] Error(s): %s\n", dylib_error());
+         return false;
+      }
+      if (load_no_content)
+         *load_no_content = no_game;
+
+      /* Kept for the session, and on disk once its file is stamped */
+      probe.path = (char*)path;
+      if (dummy_info.library_name)
+         strlcpy(probe.library_name, dummy_info.library_name,
+               sizeof(probe.library_name));
+      if (dummy_info.library_version)
+         strlcpy(probe.library_version, dummy_info.library_version,
+               sizeof(probe.library_version));
+      if (dummy_info.valid_extensions)
+         strlcpy(probe.valid_extensions, dummy_info.valid_extensions,
+               sizeof(probe.valid_extensions));
+      if (dummy_info.need_fullpath)
+         probe.flags |= CORE_PROBE_FLAG_NEED_FULLPATH;
+      if (dummy_info.block_extract)
+         probe.flags |= CORE_PROBE_FLAG_BLOCK_EXTRACT;
+      if (no_game)
+         probe.flags |= CORE_PROBE_FLAG_NO_GAME;
+      if (core_probe_stamp(path, &probe.size, &probe.mtime))
+         probe.flags |= CORE_PROBE_FLAG_STAMPED;
+      if (!core_probes_read)
+         core_probe_read_file();
+      if (core_probe_put(&probe) && (probe.flags & CORE_PROBE_FLAG_STAMPED))
+         core_probe_write_file();
    }
 #else
    if (load_no_content)
@@ -4201,7 +4663,8 @@ bool libretro_get_system_info(
    sysinfo->valid_extensions = runloop_st->current_valid_extensions;
 
 #ifdef HAVE_DYNAMIC
-   dylib_close(lib);
+   if (lib)
+      dylib_close(lib);
 #endif
    return true;
 }
@@ -4260,12 +4723,14 @@ bool runloop_init_libretro_symbols(
             {
                /* for a secondary core, we already have a
                 * primary library loaded, so we can skip
-                * some checks and just load the library */
-               lib_handle_local = dylib_load(lib_path);
-
-               if (!lib_handle_local)
-                  return false;
-               *lib_handle_p = lib_handle_local;
+                * some checks and just load the library -
+                * unless the caller has opened it already */
+               if (!(lib_handle_local = *lib_handle_p))
+               {
+                  if (!(lib_handle_local = dylib_load(lib_path)))
+                     return false;
+                  *lib_handle_p = lib_handle_local;
+               }
             }
 #endif
 #endif
@@ -4476,23 +4941,29 @@ static retro_time_t runloop_core_runtime_tick(
       float slowmotion_ratio,
       retro_time_t current_time)
 {
-   uint32_t flags = runloop_st->flags;
+   video_driver_state_t *video_st = video_state_get_ptr();
+   uint32_t flags                 = runloop_st->flags;
+   double fps                     = video_st->av_info.timing.fps;
+   retro_time_t frame_time        = 0;
 
-   /* Account for slow motion — no need to touch video state */
-   if (flags & RUNLOOP_FLAG_SLOWMOTION)
+   /* A core that reports no frame rate - the dummy core, or one that
+    * has not set its timing yet - has no frame time to count, and
+    * neither has a rate so small that one frame outlasts a day.
+    * Any other rate is counted exactly as it always was. */
+   if (fps > 0.0)
    {
-      video_driver_state_t *video_st = video_state_get_ptr();
-      retro_time_t frame_time        =
-         (retro_time_t)((1.0 / video_st->av_info.timing.fps) * 1000000.0);
-      return (retro_time_t)(frame_time * slowmotion_ratio);
+      double frame_usec = (1.0 / fps) * 1000000.0;
+      if (frame_usec < 86400000000.0)
+         frame_time = (retro_time_t)frame_usec;
    }
+
+   /* Account for slow motion */
+   if (flags & RUNLOOP_FLAG_SLOWMOTION)
+      return (retro_time_t)(frame_time * slowmotion_ratio);
 
    /* Account for fast forward */
    if (flags & RUNLOOP_FLAG_FASTMOTION)
    {
-      video_driver_state_t *video_st = video_state_get_ptr();
-      retro_time_t frame_time        =
-         (retro_time_t)((1.0 / video_st->av_info.timing.fps) * 1000000.0);
       retro_time_t potential_frame_time = current_time
          - runloop_st->core_runtime_last;
       runloop_st->core_runtime_last     = current_time;
@@ -4503,10 +4974,7 @@ static retro_time_t runloop_core_runtime_tick(
       return frame_time;
    }
 
-   {
-      video_driver_state_t *video_st = video_state_get_ptr();
-      return (retro_time_t)((1.0 / video_st->av_info.timing.fps) * 1000000.0);
-   }
+   return frame_time;
 }
 
 static bool core_unload_game(void)
@@ -4677,6 +5145,11 @@ void runloop_event_deinit_core(void)
 #endif
    }
 
+   /* A core may turn its LEDs or motors off as it unloads; no frame
+    * follows to write that. */
+   input_driver_flush_rumble();
+   led_driver_flush();
+
    /* retro_deinit() may call
     * RETRO_ENVIRONMENT_SET_FASTFORWARDING_OVERRIDE
     * (i.e. to ensure that fastforwarding is
@@ -4705,7 +5178,11 @@ void runloop_event_deinit_core(void)
    if (settings->bools.video_frame_delay_auto)
       video_st->frame_delay_target = 0;
 
-   driver_uninit(DRIVERS_CMD_ALL, (enum driver_lifetime_flags)0);
+   /* A staged content load keeps the drivers up through the close
+    * and the next core's init, so the window keeps presenting; it
+    * frees them itself, right before the new session's drivers_init. */
+   if (!runloop_st->content_switching)
+      driver_uninit(DRIVERS_CMD_ALL, (enum driver_lifetime_flags)0);
 
 #ifdef HAVE_CONFIGFILE
    /* Reload the original config */
@@ -5056,8 +5533,11 @@ static void runloop_runtime_log_init(runloop_state_t *runloop_st)
 /* The facts the pace decision reads, from this iteration's state, as
  * one word. Read here, in one place, so every path sees the same
  * iteration. */
+static unsigned runloop_menu_rate(settings_t *settings,
+      runloop_state_t *runloop_st, bool menu_pause_libretro);
+
 static runloop_pace_facts_t runloop_pace_gather(settings_t *settings,
-      bool menu_early_exit)
+      bool menu_pause_libretro)
 {
    runloop_state_t *runloop_st    = &runloop_state;
    input_driver_state_t *input_st = input_state_get_ptr();
@@ -5073,7 +5553,7 @@ static runloop_pace_facts_t runloop_pace_gather(settings_t *settings,
 #ifdef HAVE_MENU
    if (menu_state_get_ptr()->flags & MENU_ST_FLAG_ALIVE)   f |= PACE_FACT_MENU_ALIVE;
 #endif
-   if (menu_early_exit)                                    f |= PACE_FACT_MENU_EARLY_EXIT;
+   f |= runloop_menu_rate(settings, runloop_st, menu_pause_libretro);
    if (settings->bools.vrr_runloop_enable)                 f |= PACE_FACT_VRR;
 #ifdef HAVE_THREADS
    if (video_st->thread_wrapper_active)                    f |= PACE_FACT_WRAPPER;
@@ -5246,37 +5726,54 @@ static bool core_verify_api_version(runloop_state_t *runloop_st)
    return true;
 }
 
-static int16_t core_input_state_poll_late(unsigned port,
+/* The poll mode in force: the core's override if it has set one, the
+ * user's setting otherwise. */
+static INLINE enum poll_type core_poll_type_current(void)
+{
+   const enum poll_type_override_t
+      core_poll_type_override  = runloop_state.core_poll_type_override;
+   return (core_poll_type_override > POLL_TYPE_OVERRIDE_DONTCARE)
+      ? (enum poll_type)(core_poll_type_override - 1)
+      : (enum poll_type)(runloop_state.current_core.poll_type);
+}
+
+/* The core's input_state callback, in every poll mode.
+ *
+ * Under late polling the frame's first query polls. Whether late
+ * polling is in force is read here, at the call, and not when the
+ * callback is given to the core. The callback used to be chosen once,
+ * at load, between this one and a plain one with no poll in it; the
+ * mode, though, can change afterwards - Poll Type Behavior in the menu,
+ * or a core's override. A core loaded with normal or early polling and
+ * switched to late kept the plain callback: nothing polled during the
+ * frame, the only poll left was the fallback after retro_run(), and
+ * the core read input sampled before the previous frame's pacing wait,
+ * up to a frame older than late polling is for.
+ *
+ * RETRO_CORE_FLAG_INPUT_POLLED is set by whichever poll the mode calls
+ * for - before retro_run() (early), in input_poll (normal), or here
+ * (late) - so past the frame's poll a query costs one test in every
+ * mode. */
+static int16_t core_input_state_cb(unsigned port,
       unsigned device, unsigned idx, unsigned id)
 {
-   if (!(runloop_state.current_core.flags & RETRO_CORE_FLAG_INPUT_POLLED))
+   if (     !(runloop_state.current_core.flags & RETRO_CORE_FLAG_INPUT_POLLED)
+         && core_poll_type_current() == POLL_TYPE_LATE)
+   {
       input_driver_poll();
-   runloop_state.current_core.flags |= RETRO_CORE_FLAG_INPUT_POLLED;
+      runloop_state.current_core.flags |= RETRO_CORE_FLAG_INPUT_POLLED;
+   }
 
    return input_driver_state_wrapper(port, device, idx, id);
 }
 
 static void core_input_state_poll_maybe(void)
 {
-   const enum poll_type_override_t
-      core_poll_type_override  = runloop_state.core_poll_type_override;
-   enum poll_type new_poll_type = (core_poll_type_override > POLL_TYPE_OVERRIDE_DONTCARE)
-      ? (enum poll_type)(core_poll_type_override - 1)
-      : (enum poll_type)(runloop_state.current_core.poll_type);
-   if (new_poll_type == POLL_TYPE_NORMAL)
+   if (core_poll_type_current() == POLL_TYPE_NORMAL)
+   {
       input_driver_poll();
-}
-
-static retro_input_state_t core_input_state_poll_return_cb(void)
-{
-   const enum poll_type_override_t
-      core_poll_type_override  = runloop_state.core_poll_type_override;
-   enum poll_type new_poll_type = (core_poll_type_override > POLL_TYPE_OVERRIDE_DONTCARE)
-      ? (enum poll_type)(core_poll_type_override - 1)
-      : (enum poll_type)(runloop_state.current_core.poll_type);
-   if (new_poll_type == POLL_TYPE_LATE)
-      return core_input_state_poll_late;
-   return input_driver_state_wrapper;
+      runloop_state.current_core.flags |= RETRO_CORE_FLAG_INPUT_POLLED;
+   }
 }
 
 
@@ -5290,7 +5787,7 @@ static retro_input_state_t core_input_state_poll_return_cb(void)
 static void core_init_libretro_cbs(runloop_state_t *runloop_st,
       struct retro_callbacks *cbs)
 {
-   retro_input_state_t state_cb = core_input_state_poll_return_cb();
+   retro_input_state_t state_cb = core_input_state_cb;
 
    runloop_st->current_core.retro_set_video_refresh(video_driver_frame);
    runloop_st->current_core.retro_set_audio_sample(audio_driver_sample);
@@ -5354,7 +5851,18 @@ bool runloop_event_init_core(
 
    /* Init core info files */
    command_event(CMD_EVENT_CORE_INFO_INIT, NULL);
-   command_event(CMD_EVENT_LOAD_CORE_PERSIST, NULL);
+   {
+      /* What CMD_EVENT_LOAD_CORE_PERSIST provides, without its open
+       * and close of the core: the system info, library strings and
+       * no-game support come from the handle opened below. */
+      const char *core_path = path_get(RARCH_PATH_CORE);
+#ifdef HAVE_DYNAMIC
+      if (     core_path && *core_path
+            && !string_ends_with_size(core_path, "builtin",
+               strlen(core_path), STRLEN_CONST("builtin")))
+#endif
+         core_info_load(core_path);
+   }
 
    /* Load symbols */
    if (!runloop_init_libretro_symbols(runloop_st,
@@ -5369,6 +5877,22 @@ bool runloop_event_init_core(
       runloop_st->current_core.retro_run   = retro_run_null;
    runloop_st->current_core.flags         |= RETRO_CORE_FLAG_SYMBOLS_INITED;
    runloop_st->current_core.retro_get_system_info(&sys_info->info);
+
+   runloop_st->current_library_name[0]     = '\0';
+   runloop_st->current_library_version[0]  = '\0';
+   runloop_st->current_valid_extensions[0] = '\0';
+   if (sys_info->info.library_name)
+      strlcpy(runloop_st->current_library_name,
+            sys_info->info.library_name,
+            sizeof(runloop_st->current_library_name));
+   if (sys_info->info.library_version)
+      strlcpy(runloop_st->current_library_version,
+            sys_info->info.library_version,
+            sizeof(runloop_st->current_library_version));
+   if (sys_info->info.valid_extensions)
+      strlcpy(runloop_st->current_valid_extensions,
+            sys_info->info.valid_extensions,
+            sizeof(runloop_st->current_valid_extensions));
 
    if (!sys_info->info.library_name)
       sys_info->info.library_name = msg_hash_to_str(MSG_UNKNOWN);
@@ -5437,7 +5961,9 @@ bool runloop_event_init_core(
    /* Set save redirection paths */
    runloop_path_set_redirect(settings, old_savefile_dir, old_savestate_dir);
 
-   /* Set core environment */
+   /* Set core environment.  A core declares no-game support from
+    * retro_set_environment, so the flag starts clear for this one. */
+   sys_info->load_no_content = false;
    runloop_st->current_core.retro_set_environment(runloop_environment_cb);
 
    /* Load any input remap files
@@ -6355,6 +6881,124 @@ static INLINE bool runloop_is_libretro_running(runloop_state_t* runloop_st, bool
       &&    runloop_st->flags & RUNLOOP_FLAG_CORE_RUNNING);
 }
 
+/* Which Menu Frame Rate holds this iteration, as the pace fact that
+ * names it, or 0 when neither does: the menu is down; netplay is on,
+ * whose sessions keep the core's own pacing; or, at 'Content Rate', the
+ * core is running behind the menu, which then runs at the content's rate
+ * already, or there is no content rate to hold to. */
+static unsigned runloop_menu_rate(settings_t *settings,
+      runloop_state_t *runloop_st, bool menu_pause_libretro)
+{
+#ifdef HAVE_MENU
+   if (!(menu_state_get_ptr()->flags & MENU_ST_FLAG_ALIVE))
+      return 0;
+#ifdef HAVE_NETWORKING
+   if (netplay_driver_ctl(RARCH_NETPLAY_CTL_IS_ENABLED, NULL))
+      return 0;
+#endif
+   if (settings->uints.menu_frame_rate != MENU_FRAME_RATE_CONTENT)
+      return PACE_FACT_MENU_DISPLAY_RATE;
+   if (     runloop_is_libretro_running(runloop_st, menu_pause_libretro)
+         || !(video_state_get_ptr()->av_info.timing.fps > 0.0))
+      return 0;
+   return PACE_FACT_MENU_CONTENT_RATE;
+#else
+   return 0;
+#endif
+}
+
+bool runloop_menu_display_rate(void)
+{
+   settings_t *settings = config_get_ptr();
+   return (runloop_menu_rate(settings, &runloop_state,
+            settings->bools.menu_pause_libretro)
+         & PACE_FACT_MENU_DISPLAY_RATE) != 0;
+}
+
+bool runloop_menu_content_rate(void)
+{
+   settings_t *settings = config_get_ptr();
+   return (runloop_menu_rate(settings, &runloop_state,
+            settings->bools.menu_pause_libretro)
+         & PACE_FACT_MENU_CONTENT_RATE) != 0;
+}
+
+#ifdef HAVE_MENU
+/* The display's rate as the frame limiter paces to it: the configured
+ * one (the original one, under a refresh rate switch) or, with @window,
+ * that of the monitor the window is on, where one is known - which on a
+ * desktop of several is the one that matters. */
+static float runloop_display_hz(video_driver_state_t *video_st,
+      settings_t *settings, bool window)
+{
+   float hz = 0.0f;
+   if (window)
+      hz = video_driver_get_window_refresh_rate();
+   if (!(hz > 0.0f))
+      hz = (video_st->video_refresh_rate_original)
+         ? video_st->video_refresh_rate_original
+         : settings->floats.video_refresh_rate;
+   /* A rate of nothing paces nothing; the frame time helpers take
+    * 60 Hz for it too */
+   return (hz > 0.0f) ? hz : 60.0f;
+}
+
+/* Whether the core running behind the menu at 'Display Rate' is due a
+ * frame. It runs on the content's own clock - a period a frame, from
+ * when it was last due - while the menu runs at the display's, so a
+ * 60 fps core keeps its speed under a 240 Hz menu. A frame due within
+ * half a display period runs now: the next iteration would be half a
+ * period late, and holding to the nearest vblank keeps the cadence even
+ * where the display is a whole multiple of the content. */
+static bool runloop_menu_core_due(runloop_state_t *runloop_st,
+      video_driver_state_t *video_st, settings_t *settings,
+      retro_time_t now_us)
+{
+   float   refresh = runloop_display_hz(video_st, settings, true);
+   int64_t period  = runloop_content_frame_time_ns(
+         (float)video_st->av_info.timing.fps);
+   int64_t now     = (int64_t)now_us * 1000;
+   int64_t half    = (refresh > 0.0f)
+      ? (int64_t)(500000000.0 / (double)refresh) : 0;
+
+   if (runloop_st->flags & RUNLOOP_FLAG_SLOWMOTION)
+      period = (int64_t)((double)period * settings->floats.slowmotion_ratio);
+
+   /* The first frame under the menu, or after a stall of more than a
+    * few frames: due now, and the schedule restarts from here rather
+    * than catching up. */
+   if (     !runloop_st->menu_core_due_ns
+         || now - runloop_st->menu_core_due_ns > 4 * period)
+      runloop_st->menu_core_due_ns = now;
+
+   if (now + half < runloop_st->menu_core_due_ns)
+      return false;
+   runloop_st->menu_core_due_ns += period;
+   return true;
+}
+
+/* The menu's audio writes block only where the menu is held to the
+ * content's rate. At 'Display Rate' they never hold the loop: the
+ * silence it feeds is measured out by the clock and the core behind
+ * it, if running, writes what it makes. Brought back into line every
+ * menu iteration, so a setting changed in the menu, or a core started
+ * or stopped behind it, takes effect at once; leaving the menu restores
+ * the usual state through driver_set_nonblock_state(). */
+static void runloop_menu_audio_nonblock(settings_t *settings,
+      input_driver_state_t *input_st, audio_driver_state_t *audio_st,
+      bool display_rate)
+{
+   bool want = display_rate
+      || !settings->bools.audio_sync
+      || (input_st->flags & INP_FLAG_NONBLOCKING);
+   bool have = (AUDIO_FLAGS_GET(audio_st) & AUDIO_FLAG_NONBLOCK) != 0;
+   if (     want != have
+         && (AUDIO_FLAGS_GET(audio_st) & AUDIO_FLAG_ACTIVE)
+         && audio_st->context_audio_data)
+      audio_driver_set_nonblock_state(want);
+}
+#endif
+
 static retro_atomic_int_t runloop_inited
    = RETRO_ATOMIC_INT_INITIALIZER(0);
 
@@ -6591,6 +7235,29 @@ static enum runloop_state_enum runloop_check_state(
 
          last_controller_connected = controller_connected;
       }
+
+#if defined(ANDROID)
+      /* Hide the on-screen overlay while a stylus is in use, and bring
+       * it back once the pen has been idle for a moment (the window is
+       * android_input.c's). The overlay is hidden, not unloaded:
+       * unloading and reloading a pack is file and texture work, and a
+       * pen leaving and returning would trigger it over and over while
+       * a core runs. While hidden it takes no touches and answers no
+       * pointer queries (INPUT_OVERLAY_STYLUS_HIDDEN), so the pen
+       * reaches the core through the input driver whether or not the
+       * overlay is set up as a pointing device.
+       * Level-triggered, like the gamepad soft-hide above: the overlay
+       * can be replaced at any time, so the flag is set on whichever
+       * one is current this frame. */
+      if (input_st->overlay_ptr)
+      {
+         if (     settings->bools.input_stylus_enable
+               && android_input_stylus_recently_active())
+            input_st->overlay_ptr->flags |=  INPUT_OVERLAY_STYLUS_HIDDEN;
+         else
+            input_st->overlay_ptr->flags &= ~INPUT_OVERLAY_STYLUS_HIDDEN;
+      }
+#endif
 
       /* Check next overlay hotkey */
       HOTKEY_CHECK(RARCH_OVERLAY_NEXT, CMD_EVENT_OVERLAY_NEXT, true, &check_next_rotation);
@@ -6929,6 +7596,13 @@ static enum runloop_state_enum runloop_check_state(
 
       /* Get current time */
       menu_st->current_time_us      = current_time;
+      /* 'current_bits' was collected from the previous poll. On the
+       * first menu frame that poll was taken outside the menu, so
+       * the current time stands in for it. */
+      if (!menu_was_alive)
+         menu_st->input_poll_time_us = current_time;
+      menu_st->input_time_us        = menu_st->input_poll_time_us;
+      menu_st->input_poll_time_us   = current_time;
 
       cbs->poll_cb();
 
@@ -7020,7 +7694,13 @@ static enum runloop_state_enum runloop_check_state(
        * free and recreate the menu driver), so it must never run from
        * within menu iteration. Exit afterwards to start the next frame
        * with a freshly (re)built menu. */
-      if (menu_st->flags & MENU_ST_FLAG_PENDING_CONFIG_REPLACE)
+      /* A content load in flight owns the session until it is through:
+       * a pending config replace or close starts another load (of the
+       * dummy core) and a pending core reload loads a library into a
+       * session the job is still building, so each waits, flag set,
+       * for the frame after the load. */
+      if (     (menu_st->flags & MENU_ST_FLAG_PENDING_CONFIG_REPLACE)
+            && !runloop_st->content_switching)
       {
          bool config_save_on_exit = settings->bools.config_save_on_exit;
          menu_st->flags          &= ~MENU_ST_FLAG_PENDING_CONFIG_REPLACE;
@@ -7142,8 +7822,9 @@ static enum runloop_state_enum runloop_check_state(
          menu_st->flags &= ~MENU_ST_FLAG_PENDING_STARTUP_PAGE;
          return RUNLOOP_STATE_POLLED_AND_CONTINUE;
       }
-      else if ((menu_st->flags & MENU_ST_FLAG_PENDING_CLOSE_CONTENT)
-            || (menu_st->flags & MENU_ST_FLAG_PENDING_ENV_SHUTDOWN_FLUSH))
+      else if (   ((menu_st->flags & MENU_ST_FLAG_PENDING_CLOSE_CONTENT)
+               || (menu_st->flags & MENU_ST_FLAG_PENDING_ENV_SHUTDOWN_FLUSH))
+               && !runloop_st->content_switching)
       {
          menu_list_t *menu_list    = menu_st->entries.list;
          file_list_t *menu_stack   = menu_list ? MENU_LIST_GET(menu_list, (unsigned)0) : NULL;
@@ -7245,7 +7926,8 @@ static enum runloop_state_enum runloop_check_state(
       }
 
       /* Handle pending core reload separately after menu driver iterate */
-      if (menu_st->flags & MENU_ST_FLAG_PENDING_RELOAD_CORE)
+      if (     (menu_st->flags & MENU_ST_FLAG_PENDING_RELOAD_CORE)
+            && !runloop_st->content_switching)
       {
 #ifdef HAVE_DYNAMIC
          const char *a = path_get(RARCH_PATH_CORE_LAST);
@@ -7279,12 +7961,33 @@ static enum runloop_state_enum runloop_check_state(
       if (focused || !(runloop_st->flags & RUNLOOP_FLAG_IDLE))
       {
 #ifdef HAVE_NETWORKING
-         const bool libretro_running = runloop_is_libretro_running(runloop_st,
-               menu_pause_libretro && netplay_allow_pause);
+         const bool menu_pauses_core = menu_pause_libretro && netplay_allow_pause;
 #else
-         const bool libretro_running = runloop_is_libretro_running(runloop_st,
-               menu_pause_libretro);
+         const bool menu_pauses_core = menu_pause_libretro;
 #endif
+         const bool libretro_running = runloop_is_libretro_running(runloop_st,
+               menu_pauses_core);
+         const bool display_rate     = (runloop_menu_rate(settings,
+                  runloop_st, menu_pauses_core)
+               & PACE_FACT_MENU_DISPLAY_RATE) != 0;
+         /* At 'Display Rate' a core running behind the menu keeps its
+          * own clock (see runloop_menu_core_due()); fast-forward still
+          * runs it every iteration, as fast as the menu goes. */
+         bool core_due               = true;
+         runloop_st->menu_core_skipped = false;
+         if (     libretro_running
+               && display_rate
+               && !(runloop_st->flags & RUNLOOP_FLAG_FASTMOTION))
+         {
+            core_due = runloop_menu_core_due(runloop_st, video_st,
+                  settings, current_time);
+            runloop_st->menu_core_skipped = !core_due;
+         }
+         else
+            runloop_st->menu_core_due_ns = 0;
+
+         runloop_menu_audio_nonblock(settings, input_st, audio_st,
+               display_rate);
 
          /* menu_driver_iterate() above dispatches entry actions, which
           * can tear down and recreate the menu handle (menu driver
@@ -7326,9 +8029,11 @@ static enum runloop_state_enum runloop_check_state(
 
             if (      (menu_st->flags & MENU_ST_FLAG_ALIVE)
                   && !(runloop_st->flags & RUNLOOP_FLAG_IDLE))
+               /* A frame the core is not due presents the last one it
+                * made, with the menu over it */
                if (display_menu_libretro(runloop_st, input_st,
                         settings->floats.slowmotion_ratio,
-                        libretro_running, current_time))
+                        libretro_running && core_due, current_time))
                   video_driver_cached_frame();
 
             /* Core execution inside display_menu_libretro() can trigger
@@ -7353,7 +8058,7 @@ static enum runloop_state_enum runloop_check_state(
           * through audio_driver_flush(), which in the menu is driven only
           * from here. */
          if (!libretro_running)
-            audio_driver_menu_sample();
+            audio_driver_menu_sample(display_rate);
       }
 
       /* Note: 'old_input' is recorded earlier, immediately after
@@ -8238,6 +8943,70 @@ end:
  * button input in order to wake up the loop,
  * -1 if we forcibly quit out of the RetroArch iteration loop.
  **/
+/* Recovery from a lost GPU device, with a bound on how hard it is
+ * tried. A device lost once - a TDR, a driver update, a GPU reset -
+ * comes back on the first rebuild, and that rebuild happens at once.
+ * A device that is lost again straight after being rebuilt is a
+ * driver or hardware that is failing, and rebuilding every frame on
+ * it is a busy loop of full driver reinitialisations, each of which
+ * fails: the retries back off instead, doubling from one second, and
+ * after a run of them the rebuild is abandoned with a message rather
+ * than attempted forever. A loss well clear of the previous one (a
+ * minute or more) is a fresh incident and starts the count again. */
+#define GPU_LOST_RETRY_BASE_USEC   1000000
+#define GPU_LOST_RETRY_MAX_USEC   16000000
+#define GPU_LOST_GIVE_UP_AFTER     6
+#define GPU_LOST_FRESH_AFTER_USEC 60000000
+
+static void runloop_gpu_device_lost(runloop_state_t *runloop_st)
+{
+   retro_time_t now = cpu_features_get_time_usec();
+   int reinit_flags = DRIVER_VIDEO_MASK | DRIVER_INPUT_MASK
+      | DRIVER_MENU_MASK;
+
+   /* Not yet due: leave the flag set and try again on a later frame */
+   if (now < runloop_st->gpu_lost_retry_at)
+      return;
+
+   video_driver_modify_disp_flags(0, VIDEO_FLAG_GPU_DEVICE_LOST);
+
+   if (     runloop_st->gpu_lost_count
+         && now - runloop_st->gpu_lost_last > GPU_LOST_FRESH_AFTER_USEC)
+      runloop_st->gpu_lost_count = 0;
+   runloop_st->gpu_lost_last = now;
+   runloop_st->gpu_lost_count++;
+
+   if (runloop_st->gpu_lost_count > GPU_LOST_GIVE_UP_AFTER)
+   {
+      const char *msg = "The GPU device keeps being lost; giving up on recovering the video driver.";
+      RARCH_ERR("[Video] %s\n", msg);
+      runloop_msg_queue_push(msg, strlen(msg), 1, 240, true, NULL,
+            MESSAGE_QUEUE_ICON_DEFAULT, MESSAGE_QUEUE_CATEGORY_ERROR);
+      /* Look again only after a fresh incident's worth of time */
+      runloop_st->gpu_lost_retry_at = now + GPU_LOST_FRESH_AFTER_USEC;
+      return;
+   }
+
+   if (runloop_st->gpu_lost_count > 1)
+   {
+      retro_time_t delay = (retro_time_t)GPU_LOST_RETRY_BASE_USEC
+         << (runloop_st->gpu_lost_count - 2);
+      if (delay > GPU_LOST_RETRY_MAX_USEC)
+         delay = GPU_LOST_RETRY_MAX_USEC;
+      runloop_st->gpu_lost_retry_at = now + delay;
+      RARCH_ERR("[Video] The GPU device was lost again (%u in a row); "
+            "next rebuild in %u ms.\n",
+            runloop_st->gpu_lost_count, (unsigned)(delay / 1000));
+   }
+   else
+   {
+      runloop_st->gpu_lost_retry_at = 0;
+      RARCH_ERR("[Video] The GPU device was lost; reinitialising the video driver.\n");
+   }
+
+   command_event(CMD_EVENT_REINIT, &reinit_flags);
+}
+
 int runloop_iterate(void)
 {
    retro_time_t pace_limit_min;
@@ -8273,14 +9042,8 @@ int runloop_iterate(void)
    bool core_paused                       = !!(runloop_st->flags & RUNLOOP_FLAG_PAUSED);
 #endif
    float slowmotion_ratio                 = settings->floats.slowmotion_ratio;
-#ifdef HAVE_CHEEVOS
-   bool cheevos_enable                    = settings->bools.cheevos_enable;
-#endif
    bool audio_sync                        = settings->bools.audio_sync;
    bool savestate_automatic_enable        = settings->uints.savestate_automatic_interval > 0;
-#ifdef HAVE_DISCORD
-   discord_state_t *discord_st            = discord_state_get_ptr();
-#endif
 
    runloop_msg_queue_drain_deferred();
 
@@ -8293,24 +9056,16 @@ int runloop_iterate(void)
     * recovered device, and a hardware core gets context_reset. */
    if ((uint32_t)retro_atomic_load_relaxed_int(&video_st->flags)
          & VIDEO_FLAG_GPU_DEVICE_LOST)
-   {
-      int reinit_flags = DRIVER_VIDEO_MASK | DRIVER_INPUT_MASK
-         | DRIVER_MENU_MASK;
-      video_driver_modify_disp_flags(0, VIDEO_FLAG_GPU_DEVICE_LOST);
-      RARCH_ERR("[Video] The GPU device was lost; reinitialising the video driver.\n");
-      command_event(CMD_EVENT_REINIT, &reinit_flags);
-   }
+      runloop_gpu_device_lost(runloop_st);
 
 #ifdef HAVE_DISCORD
-   if (discord_st->inited)
-   {
-      Discord_RunCallbacks();
-      Discord_UpdateConnection();
-   }
+   if (runloop_st->frame_work & RUNLOOP_WORK_DISCORD)
+      discord_poll(current_time);
 #endif
 
 #ifdef HAVE_BSV_MOVIE
-   bsv_movie_dequeue_next(input_st);
+   if (input_st->bsv_movie_state_next_handle)
+      bsv_movie_dequeue_next(input_st);
 #endif
 
 #ifdef ANDROID
@@ -8322,14 +9077,6 @@ int runloop_iterate(void)
    /* Same poll, same reason: entering Java is only safe on the OS
     * stack, and a libco core reaches the poll on its own. */
    android_input_flush_pending_haptics();
-#endif
-
-#if defined(HAVE_DYNAMIC) && defined(HAVE_MENU)
-   /* Perform the parked remainder of a deferred (prefetched) menu
-    * load.  It runs here, not from the prefetch task's callback,
-    * because content_load() reinitializes the task queue - fatal
-    * from inside the queue's own dispatch. */
-   task_content_deferred_load_check();
 #endif
 
    /* Tick deferred shader compilation (one pass per frame) */
@@ -8416,10 +9163,15 @@ int runloop_iterate(void)
 #endif
    }
 
+#ifdef HAVE_THREADS
+   if (runloop_st->flags & RUNLOOP_FLAG_AUTOSAVE)
+      autosave_check();
+#endif
+
    switch ((enum runloop_state_enum)runloop_check_state(
             input_st, audio_st, video_st,
             uico_st,
-            ((global_get_ptr()->flags & GLOB_FLG_ERR_ON_INIT) > 0),
+            ((retroarch_get_flags() & RARCH_FLAGS_ERR_ON_INIT) > 0),
             settings, current_time, netplay_allow_pause,
             netplay_allow_timeskip))
    {
@@ -8488,66 +9240,93 @@ int runloop_iterate(void)
 #endif
 
 #ifdef HAVE_CHEEVOS
-         if (cheevos_enable)
+         if (runloop_st->frame_work & RUNLOOP_WORK_CHEEVOS)
          {
             if (runloop_is_libretro_running(runloop_st, menu_pause_libretro))
-               rcheevos_test();
+            {
+               if (!runloop_st->menu_core_skipped)
+                  rcheevos_test();
+            }
             else
                rcheevos_idle();
          }
 #endif
 
 #ifdef HAVE_MENU
-         /* Rely on vsync throttling unless VRR is enabled and menu throttle is disabled. */
-         if (vrr_runloop_enable && !settings->bools.menu_throttle_framerate)
          {
-            /* Returns before the pace block: record what holds this
-             * path - vsync if it is blocking, nothing otherwise. */
-            pace_facts       = runloop_pace_gather(settings, true);
-            runloop_st->pace = runloop_pace_decide(pace_facts);
-            AUDIO_FLAGS_CLEAR(audio_st, AUDIO_FLAG_WROTE);
-            return 0;
-         }
-         /* When content is actively running behind the menu (menu_pause_libretro
-          * is off), core_run() -> audio_driver_write() already paces the iterate
-          * loop at the audio buffer's drain rate -- i.e. the core's natural fps.
-          * Layering the refresh-rate timer throttle below on top of that is
-          * redundant double-pacing: two clocks holding one loop drift
-          * against each other and the slower one wins, so the sleep lands
-          * after the audio low-water mark and stutters audio.  Defer
-          * pacing to the audio backpressure path. */
-         else if (   audio_sync
-                  && runloop_is_libretro_running(runloop_st, menu_pause_libretro))
-         {
-            /* Make sure no stale frame_limit_minimum_time from a prior
-             * iteration (e.g. just before menu_pause_libretro was toggled
-             * off) leaks into the sleep block below. */
-            runloop_st->frame_limit_minimum_time    = 0;
-            runloop_st->frame_limit_minimum_time_ns = 0;
-            goto end;
-         }
-         else if ((  (settings->bools.video_vsync)
-                  || (settings->bools.video_scanline_sync))
-               && (runloop_st->flags & RUNLOOP_FLAG_FOCUSED))
-            goto end;
+            unsigned menu_rate = runloop_menu_rate(settings, runloop_st,
+                  menu_pause_libretro);
+            /* Menu Frame Rate 'Content Rate', the core paused behind the
+             * menu: the content's period. The silence the menu feeds holds
+             * the loop there when audio blocks; when it does not, the
+             * timer does (see runloop_pace_sources()). */
+            if (menu_rate & PACE_FACT_MENU_CONTENT_RATE)
+            {
+               runloop_set_frame_limit(&video_st->av_info, 1.0f);
+               goto end;
+            }
+            /* When content is actively running behind the menu (menu_pause_libretro
+             * is off), core_run() -> audio_driver_write() already paces the iterate
+             * loop at the audio buffer's drain rate -- i.e. the core's natural fps.
+             * Layering the refresh-rate timer throttle below on top of that is
+             * redundant double-pacing: two clocks holding one loop drift
+             * against each other and the slower one wins, so the sleep lands
+             * after the audio low-water mark and stutters audio.  Defer
+             * pacing to the audio backpressure path. Not at Menu Frame Rate
+             * 'Display Rate': there the core runs on its own clock, its
+             * audio does not block, and the menu takes the display's pace
+             * below. */
+            else if (   audio_sync
+                     && !(menu_rate & PACE_FACT_MENU_DISPLAY_RATE)
+                     && runloop_is_libretro_running(runloop_st, menu_pause_libretro))
+            {
+               /* Make sure no stale frame_limit_minimum_time from a prior
+                * iteration (e.g. just before menu_pause_libretro was toggled
+                * off) leaks into the sleep block below. */
+               runloop_st->frame_limit_minimum_time    = 0;
+               runloop_st->frame_limit_minimum_time_ns = 0;
+               goto end;
+            }
+            else if ((  (settings->bools.video_vsync)
+                     || (settings->bools.video_scanline_sync))
+                  && (runloop_st->flags & RUNLOOP_FLAG_FOCUSED)
+#ifdef HAVE_THREADS
+                  /* Behind the threaded video wrapper vsync holds the
+                   * video thread, not this one: at 'Display Rate' the
+                   * timer below holds the menu instead */
+                  && !(   (menu_rate & PACE_FACT_MENU_DISPLAY_RATE)
+                       && video_st->thread_wrapper_active)
+#endif
+                  )
+               goto end;
 
-         /* Otherwise run menu in video refresh rate speed. */
-         if (menu_state_get_ptr()->flags & MENU_ST_FLAG_ALIVE)
-         {
-            runloop_st->frame_limit_minimum_time = (retro_time_t)roundf(1000000.0f /
-                     ((video_st->video_refresh_rate_original)
-                     ? video_st->video_refresh_rate_original
-                     : settings->floats.video_refresh_rate));
-            runloop_st->frame_limit_minimum_time_ns = runloop_content_frame_time_ns(
-                     (video_st->video_refresh_rate_original)
-                     ? video_st->video_refresh_rate_original
-                     : settings->floats.video_refresh_rate);
+            /* Otherwise run menu in video refresh rate speed. */
+            if (menu_state_get_ptr()->flags & MENU_ST_FLAG_ALIVE)
+            {
+               /* At 'Display Rate', the rate of the monitor the window
+                * is on */
+               float hz = runloop_display_hz(video_st, settings,
+                     (menu_rate & PACE_FACT_MENU_DISPLAY_RATE) != 0);
+               runloop_st->frame_limit_minimum_time = (retro_time_t)
+                  roundf(1000000.0f / hz);
+               runloop_st->frame_limit_minimum_time_ns =
+                  runloop_content_frame_time_ns(hz);
+            }
+            else
+               runloop_set_frame_limit(&video_st->av_info, settings->floats.fastforward_ratio);
          }
-         else
-            runloop_set_frame_limit(&video_st->av_info, settings->floats.fastforward_ratio);
 #endif
          goto end;
       case RUNLOOP_STATE_ITERATE:
+         /* A staged content load has no core to run between its
+          * stages: poll, present what is on screen, and pace as a
+          * paused frame does. */
+         if (runloop_st->content_switching)
+         {
+            input_driver_poll();
+            video_driver_cached_frame();
+            goto end;
+         }
          runloop_st->flags       |= RUNLOOP_FLAG_CORE_RUNNING;
          break;
    }
@@ -8557,11 +9336,10 @@ int runloop_iterate(void)
       autosave_lock();
 #endif
 
-   if (     settings->bools.camera_allow
-         && camera_st->cb.caps
-         && camera_st->driver
-         && camera_st->driver->poll
-         && camera_st->data)
+   /* driver_camera_start() raised the bit only with a pollable
+    * driver and registered caps; stop, teardown and a camera_allow
+    * change drop it. */
+   if (runloop_st->frame_work & RUNLOOP_WORK_CAMERA)
       camera_st->driver->poll(camera_st->data,
             camera_st->cb.frame_raw_framebuffer,
             camera_st->cb.frame_opengl_texture);
@@ -8602,21 +9380,41 @@ int runloop_iterate(void)
          runloop_st, slowmotion_ratio, current_time);
 
 #ifdef HAVE_CHEEVOS
-   if (cheevos_enable)
+   if (runloop_st->frame_work & RUNLOOP_WORK_CHEEVOS)
       rcheevos_test();
 #endif
 #ifdef HAVE_CHEATS
-   cheat_manager_apply_retro_cheats();
+   if (runloop_st->frame_work & RUNLOOP_WORK_CHEATS)
+      cheat_manager_apply_retro_cheats();
 #endif
+
+   /* The core's rumble and LED calls stored what it asked for; write
+    * the frame's last values now that it is off the stack. After the
+    * cheats, which can rumble too. One load and a compare each when
+    * nothing was set. */
+   input_driver_flush_rumble();
+   led_driver_flush();
+   /* a first press seen by this frame's poll: the user gets its core
+    * port now, with the core off the stack */
+   if (input_st->first_press_pending)
+      input_first_press_apply();
 #ifdef HAVE_PRESENCE
-   presence_update(PRESENCE_GAME);
+   /* "In a game" does not change at the core rate; the sinks
+    * (Discord at 10 Hz, Steam) are written on the same cadence. */
+   if (runloop_st->frame_work & RUNLOOP_WORK_PRESENCE)
+      presence_poll(PRESENCE_GAME, current_time);
 #endif
 #ifdef HAVE_BSV_MOVIE
-   bsv_movie_next_frame(input_st);
-   if (input_st->bsv_movie_state.flags & BSV_FLAG_MOVIE_END)
+   /* The movie handle lives on input_st, which this frame already
+    * has in cache; no bit needed. */
+   if (input_st->bsv_movie_state_handle)
    {
-      movie_stop(input_st);
-      command_event(CMD_EVENT_PAUSE, NULL);
+      bsv_movie_next_frame(input_st);
+      if (input_st->bsv_movie_state.flags & BSV_FLAG_MOVIE_END)
+      {
+         movie_stop(input_st);
+         command_event(CMD_EVENT_PAUSE, NULL);
+      }
    }
 #endif
 
@@ -8627,7 +9425,7 @@ int runloop_iterate(void)
 
    /* Check if we should save state automatically */
    if (savestate_automatic_enable)
-      content_save_state_automatic();
+      content_save_state_automatic(current_time);
 
 end:
    if (vrr_runloop_enable)
@@ -8660,7 +9458,10 @@ end:
          runloop_set_frame_limit(&video_st->av_info,
                runloop_get_fastforward_ratio(settings,
                   &runloop_st->fastmotion_override.current));
-      else
+      /* The menu at Menu Frame Rate 'Display Rate' keeps the display's
+       * period the menu path set; the content's is for the content. */
+      else if (!(runloop_menu_rate(settings, runloop_st, menu_pause_libretro)
+               & PACE_FACT_MENU_DISPLAY_RATE))
          runloop_set_frame_limit(&video_st->av_info, 1.0f);
    }
 
@@ -8715,7 +9516,7 @@ end:
     * runloop_pace_decide() in runloop.h, and the table in
     * samples/runloop/pacing that pins it row by row. The audio write
     * flag is read by the gather and cleared here. */
-   pace_facts       = runloop_pace_gather(settings, false);
+   pace_facts       = runloop_pace_gather(settings, menu_pause_libretro);
    AUDIO_FLAGS_CLEAR(audio_st, AUDIO_FLAG_WROTE);
    runloop_st->pace = runloop_pace_sources(pace_facts);
 
@@ -8941,24 +9742,23 @@ void runloop_task_msg_queue_push(retro_task_t *task, const char *msg,
    dispgfx_widget_t *p_dispwidget = dispwidget_get_ptr();
    bool widgets_active            = p_dispwidget->active;
 
-   /* The task's title and mute flag are what decided this message
-    * existed at all, and task_queue_push_progress() read them under the
-    * lock that guards them before it called here. Re-reading them now
-    * would be reading a title a worker is free to replace, so the test
-    * is the caller's and not repeated. */
+   /* An empty message only completes an existing widget's task link. */
    if (widgets_active)
    {
+      if (*msg)
+      {
          ui_companion_driver_msg_queue_push(msg,
-            prio, task ? duration : duration * 60 / 1000, flush);
+               prio, task ? duration : duration * 60 / 1000, flush);
 #ifdef HAVE_ACCESSIBILITY
-      if (is_accessibility_enabled(
-            accessibility_enable,
-            access_st->enabled))
-         accessibility_speak_priority(
+         if (is_accessibility_enabled(
                accessibility_enable,
-               accessibility_narrator_speech_speed,
-               (char*)msg, 0);
+               access_st->enabled))
+            accessibility_speak_priority(
+                  accessibility_enable,
+                  accessibility_narrator_speech_speed,
+                  (char*)msg, 0);
 #endif
+      }
       gfx_widgets_msg_queue_push(
             task,
             msg,
@@ -8975,9 +9775,10 @@ void runloop_task_msg_queue_push(retro_task_t *task, const char *msg,
             false
 #endif
             );
-      }
+   }
    else
 #endif
+   if (*msg)
       runloop_msg_queue_push(msg, strlen(msg), prio, duration, flush, NULL,
             MESSAGE_QUEUE_ICON_DEFAULT, MESSAGE_QUEUE_CATEGORY_INFO);
 }
@@ -9068,7 +9869,7 @@ void runloop_set_current_core_type(
 bool core_set_default_callbacks(void *data)
 {
    struct retro_callbacks *cbs  = (struct retro_callbacks*)data;
-   retro_input_state_t state_cb = core_input_state_poll_return_cb();
+   retro_input_state_t state_cb = core_input_state_cb;
 
    cbs->frame_cb                = video_driver_frame;
    cbs->sample_cb               = audio_driver_sample;
@@ -9282,6 +10083,11 @@ bool core_load_game(retro_ctx_load_content_info_t *load_info)
    else if (content_get_flags() & CONTENT_ST_FLAG_CORE_DOES_NOT_NEED_CONTENT)
       game_loaded = runloop_st->current_core.retro_load_game(NULL);
 
+   /* Whatever the core set while loading: its first frame may be some
+    * way off, behind the menu or a pause. */
+   input_driver_flush_rumble();
+   led_driver_flush();
+
    if (game_loaded)
    {
       /* If 'game_loaded' is true at this point, then
@@ -9427,23 +10233,20 @@ void core_run(void)
    bool netplay_preframe;
 #endif
 
-   /* The core is being torn down: do not run it.
+   /* The core is being torn down, or replaced: do not run it.
     *
     * retro_run() must not be entered once closing has begun, because
-    * the teardown unloads the library that function lives in.
-    *
-    * Today this cannot be reached - closing is synchronous, so the
-    * main thread sits inside the teardown and no frame runs - and
-    * the guard is placed first, inert, so that the change which does
-    * let frames run during a close is only about where the waiting
-    * happens, not about what the frame loop may touch.
+    * the teardown unloads the library that function lives in.  A
+    * staged content load closes the core and then returns to the
+    * frame loop - while a save state task is still inside the core,
+    * and between its stages - so frames run here with the flags set.
     *
     * Poll and present anyway rather than returning bare, so input
     * keeps being drained and whatever the close has put on screen
     * keeps being drawn.  Same shape as the netplay-paused case
     * below, for the same reason: a frame that stops being produced
     * reads as a hang. */
-   if (runloop_st->content_closing)
+   if (runloop_st->content_closing || runloop_st->content_switching)
    {
       input_driver_poll();
       video_driver_cached_frame();
@@ -9464,9 +10267,15 @@ void core_run(void)
    }
 #endif
 
+   /* The flag says whether this frame's poll has happened. Early
+    * polling polls here; normal and late start the frame without it,
+    * and input_poll or the first input_state sets it. */
    if (early_polling)
+   {
       input_driver_poll();
-   else if (late_polling)
+      current_core->flags |=  RETRO_CORE_FLAG_INPUT_POLLED;
+   }
+   else
       current_core->flags &= ~RETRO_CORE_FLAG_INPUT_POLLED;
 
    /* Content can be marked CORE_RUNNING after a failed/partial load

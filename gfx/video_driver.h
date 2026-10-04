@@ -516,6 +516,8 @@ typedef struct video_frame_info
 #ifdef GEKKO
    unsigned overscan_correction_top;
    unsigned overscan_correction_bottom;
+   /* The A/V encoder's gamma, set by the driver's resize from frame() */
+   unsigned video_gamma;
 #endif
    unsigned monitor_index;
    unsigned crt_switch_resolution;
@@ -584,12 +586,19 @@ typedef struct video_frame_info
    const char *stat_text;
    size_t stat_text_len;
 
+#ifdef GEKKO
+   /* The A/V encoder's trap filter, set beside video_gamma */
+   bool video_soft_filter;
+#endif
    bool widgets_active;
    bool notifications_hidden;
    bool menu_mouse_enable;
    bool input_menu_swap_ok_cancel_buttons;
    bool input_driver_nonblock_state;
    bool input_driver_grab_mouse_state;
+   /* When the input this frame was made from was read; 0 if not
+    * stamped. input_driver_get_poll_time(). */
+   retro_time_t input_poll_time;
    bool hard_sync;
    bool scanline_sync;
    bool runahead;
@@ -632,6 +641,10 @@ typedef struct video_frame_info
     * pacing holds to the content's period while it runs and to the
     * display's while it does not. */
    bool core_running;
+   /* The menu is up at Menu Frame Rate 'Content Rate': the hold keeps
+    * the content's period over the stopped core, as nothing else then
+    * holds the menu to it. */
+   bool menu_content_rate;
    bool xmb_shadows_enable;
    bool battery_level_enable;
    bool timedate_enable;
@@ -655,6 +668,8 @@ typedef struct video_frame_info
     * never reads the recording state the main thread writes. */
    bool gpu_recording;
    bool threaded_present_repeat;
+   /* The threaded presenter is holding each push to the display's
+    * vblank: the setting is on and the wrapper is running. */
    bool threaded_display_pacing;
    bool present_timing_from_display;
 } video_frame_info_t;
@@ -1331,6 +1346,13 @@ typedef struct
     * VIDEO_DRIVER_ASPECT_RATIO() and video_driver_store_aspect_ratio(). */
    retro_atomic_int_t aspect_ratio_bits;
    float video_refresh_rate_original;
+   /* The refresh rate of the output the window is on, as
+    * video_driver_get_window_refresh_rate() last read it, and whether
+    * that reading still stands; main thread only. */
+   float window_refresh_rate;
+   /* The same, as a windowing system that follows the window from
+    * output to output by events reported it (Wayland); 0 = none */
+   float window_refresh_hint;
 
    enum retro_pixel_format pix_fmt;
    enum rarch_display_type display_type;
@@ -1415,6 +1437,7 @@ typedef struct
     * out of order cannot strand or steal it. */
    struct font_data *osd_font;
    void             *osd_font_owner;
+   bool              window_refresh_known;
 } video_driver_state_t;
 
 typedef struct video_frame_delay_auto
@@ -1657,6 +1680,15 @@ const char* config_get_video_driver_options(void);
  *
  * Returns: video driver's userdata.
  **/
+/* For the input code: see video_driver.c. */
+uint64_t video_driver_get_frame_count(void);
+const struct retro_game_geometry *video_driver_get_core_geometry(void);
+void video_driver_show_mouse(bool state);
+#ifdef HAVE_OVERLAY
+bool video_driver_get_overlay_interface(
+      const video_overlay_interface_t **iface, void **iface_data);
+#endif
+
 void *video_driver_get_ptr(void);
 
 video_driver_state_t *video_state_get_ptr(void);
@@ -1670,6 +1702,11 @@ video_driver_state_t *video_state_get_ptr(void);
 void video_driver_shader_deferred_tick(void);
 
 bool video_driver_set_rotation(unsigned rotation);
+
+/* The size, packed with VIDEO_SCALE_PACK, the video driver would ask
+ * its window for in the given state; what a fullscreen toggle on the
+ * existing window resizes it to. */
+unsigned video_driver_window_dims(bool fullscreen);
 
 bool video_driver_set_video_mode(unsigned dims, bool fullscreen);
 
@@ -1750,9 +1787,6 @@ static INLINE void video_driver_aspect_ratio_put(
 
 #define VIDEO_DRIVER_ASPECT_RATIO(video_st) \
    video_driver_aspect_ratio_of(&(video_st)->aspect_ratio_bits)
-
-void video_driver_menu_settings(void **list_data, void *list_info_data,
-      void *group_data, void *subgroup_data, const char *parent_group);
 
 /**
  * video_viewport_get_scaled_aspect2:
@@ -1993,6 +2027,27 @@ void video_shader_driver_set_parameter(struct video_shader *live_shader,
 
 float video_driver_get_refresh_rate(void);
 
+/**
+ * video_driver_get_window_refresh_rate:
+ *
+ * The refresh rate of the output the window is on, or 0 when nothing
+ * can say. Read from the display server once and kept until
+ * video_driver_window_output_changed() says the window may be on
+ * another output, or at another mode. Main thread only.
+ **/
+float video_driver_get_window_refresh_rate(void);
+
+/* The window may have moved to another output, or its output changed
+ * mode: the next video_driver_get_window_refresh_rate() reads again.
+ * Main thread only. */
+void video_driver_window_output_changed(void);
+
+/* For a windowing system that is told which output the window is on
+ * rather than asked (Wayland: surface enter and leave): the refresh rate
+ * of that output, in hertz, or 0 when it is not known. Main thread
+ * only. */
+void video_driver_set_window_refresh_rate(float hz);
+
 bool video_context_driver_get_flags(gfx_ctx_flags_t *flags);
 
 bool video_driver_test_all_flags(enum display_flags testflag);
@@ -2029,6 +2084,18 @@ float video_driver_get_hdr_max_nits(void);
  * driver's own fixed value, unchanged. */
 float video_driver_hdr_metadata_peak(float driver_value);
 
+/* The GPU index to use for 'api' out of the devices in 'list'.
+ *
+ * An index alone is a position in a list that a driver update, a BIOS
+ * change or another GPU reorders, after which it names a different
+ * device. The device the index was chosen as is remembered with it:
+ * where that name has moved, its new position is returned; where it is
+ * gone, 0 with a warning, rather than whatever now sits at the index.
+ * The name is kept up to date with what was resolved.
+ */
+int video_driver_gpu_index_resolve(enum gfx_ctx_api api, int index,
+      struct string_list *list);
+
 struct string_list* video_driver_get_gpu_api_devices(enum gfx_ctx_api api);
 
 const char *hw_render_context_name(
@@ -2059,6 +2126,21 @@ uintptr_t video_driver_get_current_framebuffer(void);
 retro_proc_address_t video_driver_get_proc_address(const char *sym);
 
 void video_driver_free_hw_context(void);
+
+/* A hardware-render request the core made for a context that does not
+ * exist yet - a staged content load takes the request during the new
+ * core's init, while the previous session's drivers are still up.
+ * The pair carries it across the teardown of those drivers: take
+ * moves the request out (the teardown then destroys nothing that was
+ * never reset), restore puts it back for drivers_init to build the
+ * context from, and publishes the type. */
+struct video_hw_request
+{
+   struct retro_hw_render_callback cb;
+   const struct retro_hw_render_context_negotiation_interface *negotiation;
+};
+void video_driver_hw_request_take(struct video_hw_request *req);
+void video_driver_hw_request_restore(const struct video_hw_request *req);
 
 #ifdef HAVE_VIDEO_FILTER
 void video_driver_filter_free(void);

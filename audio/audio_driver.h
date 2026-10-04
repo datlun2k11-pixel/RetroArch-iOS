@@ -31,12 +31,10 @@
  * calls into it - so the type has to exist there even though nothing
  * uses it. */
 #include <rthreads/retro_eventcount.h>
-#ifdef HAVE_THREADS
+/* Declarations only, with or without threads: the state holds lock and
+ * condition pointers either way. Declaring the types here instead would
+ * repeat typedefs a C89 compiler refuses once a file includes both. */
 #include <rthreads/rthreads.h>
-#else
-typedef struct slock slock_t;
-typedef struct scond scond_t;
-#endif
 #include <retro_inline.h>
 #include <libretro.h>
 #include <retro_miscellaneous.h>
@@ -693,6 +691,15 @@ typedef struct
     * pipe's target then, not just a frame. Consumer thread only after
     * init. */
    bool     pipe_priming;
+   /* How the consumer fared against the core after priming, said once
+    * at teardown beside the driver's silence count: the passes that
+    * found the pipe short and had to wait for the core, the longest
+    * such wait, and the least the pipe held at the start of a pass
+    * (kept as frames + 1, so zero is no pass yet).  Consumer writes,
+    * the main thread reads at teardown. */
+   retro_atomic_size_t pipe_source_waits;
+   retro_atomic_size_t pipe_source_wait_max_us;
+   retro_atomic_size_t pipe_held_min1;
    /* The audio thread's own copy of AUDIO_FLAG_PIPELINE_THREADED. Set
     * before the wrapper thread is released and cleared after it is
     * joined, so the thread never reads the flags word - which the main
@@ -761,6 +768,13 @@ typedef struct
     * interval its audio takes at 1.0x */
    retro_time_t avg_flush_delta;
    double avg_expected_delta;
+
+   /* The menu's silence at Menu Frame Rate 'Display Rate' is measured
+    * out by the clock rather than by the content's frame: when it was
+    * last fed (0 = not feeding by the clock), and the fraction of a
+    * frame the last feed left owing. */
+   retro_time_t menu_feed_last;
+   double menu_feed_frac;
 
    /* Rate-limit state for the DRC compute.
     *
@@ -903,7 +917,7 @@ typedef struct
    unsigned      out_channels;
    /* The multi-channel batch entry (RETRO_ENVIRONMENT_GET_AUDIO_
     * SAMPLE_BATCH_MULTI): the layout the core last delivered, and
-    * the stereo fold of a batch, grown to the largest batch seen. The
+    * the stereo fold of a batch slice, a fixed region of arena_float. The
     * pipeline carries stereo; a core's wider frame is folded here at
     * the boundary, and the device's upmix widens the stereo again.
     * core_layout is stereo until the core delivers something else,
@@ -1402,7 +1416,18 @@ size_t audio_driver_sample_batch_rewind(
 #endif
 
 #ifdef HAVE_MENU
-void audio_driver_menu_sample(void);
+/**
+ * audio_driver_menu_sample:
+ * @by_clock : feed the silence the clock says has played since the last
+ *             feed, rather than one content frame of it.
+ *
+ * Feeds the device silence while the core is not running behind the
+ * menu, with the menu sounds, the mixer and thumbnail audio mixed in.
+ * One content frame per call holds a blocking writer to the content's
+ * rate; by the clock, with a non-blocking writer, the device is kept fed
+ * at whatever rate the menu runs.
+ **/
+void audio_driver_menu_sample(bool by_clock);
 #endif
 
 extern audio_driver_t audio_rsound;

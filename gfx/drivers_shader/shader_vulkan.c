@@ -966,22 +966,8 @@ struct vulkan_filter_chain
 
    /* See vulkan_filter_chain_create_info. */
    void *queue_lock_handle;
-   void (*lock_queue)(void *handle);
-   void (*unlock_queue)(void *handle);
    void (*wait_submissions)(void *handle);
 };
-
-static INLINE void slang_chain_lock_queue(struct vulkan_filter_chain *chain)
-{
-   if (chain->lock_queue)
-      chain->lock_queue(chain->queue_lock_handle);
-}
-
-static INLINE void slang_chain_unlock_queue(struct vulkan_filter_chain *chain)
-{
-   if (chain->unlock_queue)
-      chain->unlock_queue(chain->queue_lock_handle);
-}
 
 static struct vulkan_filter_chain *slang_chain_new(
       const vulkan_filter_chain_create_info *info);
@@ -1526,8 +1512,12 @@ static bool vulkan_filter_chain_load_luts(
 static struct vulkan_filter_chain *slang_chain_new(
       const vulkan_filter_chain_create_info *info)
 {
-   struct vulkan_filter_chain *chain = (struct vulkan_filter_chain*)
-      calloc(1, sizeof(*chain));
+   struct vulkan_filter_chain *chain;
+   /* See slang_chain_flush(): there is no way to tear a chain down
+    * without it that does not drain the queue. */
+   if (!info->wait_submissions)
+      return NULL;
+   chain = (struct vulkan_filter_chain*)calloc(1, sizeof(*chain));
    if (!chain)
       return NULL;
    chain->device            = info->device;
@@ -1536,9 +1526,7 @@ static struct vulkan_filter_chain *slang_chain_new(
    chain->cache             = info->pipeline_cache;
    chain->original_format   = info->original_format;
    chain->queue_lock_handle = info->queue_lock_handle;
-   chain->lock_queue        = info->lock_queue;
    chain->wait_submissions  = info->wait_submissions;
-   chain->unlock_queue      = info->unlock_queue;
    common_resources_init(&chain->common, info->device,
          info->memory_properties);
    chain->max_input_size_dims   = info->max_input_dims;
@@ -1626,10 +1614,59 @@ static void slang_chain_notify_sync_index(struct vulkan_filter_chain *chain,
       slang_pass_notify_sync_index(chain->passes[i], index);
 }
 
+/* The chain told of a new swapchain.
+ *
+ * It used to rebuild itself whole each time: every pass's descriptor
+ * pool, set layout, pipeline layout and pipeline destroyed, its
+ * framebuffer made again, its SPIR-V reflected again and its pipeline
+ * compiled again, then the uniform buffer, the history and the
+ * feedback buffers. For a preset of a dozen passes that is a dozen
+ * pipeline compiles on every resize of the window.
+ *
+ * What a pass builds is made from the render pass it draws to and its
+ * format, and from the number of sync indices (its descriptor sets
+ * and its share of the uniform buffer, one of each an index). None of
+ * it is made from the swapchain's size: viewport and scissor are
+ * dynamic state, and a pass whose framebuffer follows the viewport
+ * already brings it to size as it draws, each frame, from the
+ * viewport it is given then (slang_pass_build_commands()).
+ *
+ * So when the render pass, the format and the index count are what
+ * the chain was built for, and every pass is built, there is nothing
+ * to do but note the new viewport. Anything else is the rebuild it
+ * always was. RETROARCH_VULKAN_REBUILD_ALL=1 in the environment
+ * rebuilds every time, as before. */
 static bool slang_chain_update_swapchain_info(struct vulkan_filter_chain *chain,
-      
       const vulkan_filter_chain_swapchain_info info)
 {
+   unsigned i;
+   static int rebuild_all = -1;
+
+   if (rebuild_all < 0)
+   {
+      const char *env = getenv("RETROARCH_VULKAN_REBUILD_ALL");
+      rebuild_all     = (env && env[0] == '1') ? 1 : 0;
+   }
+
+   if (     !rebuild_all
+         && chain->pass_count
+         && chain->alias_initialized
+         && chain->swapchain_info.render_pass == info.render_pass
+         && chain->swapchain_info.format      == info.format
+         && chain->swapchain_info.num_indices == info.num_indices)
+   {
+      for (i = 0; i < chain->pass_count; i++)
+         if (chain->passes[i]->pipeline == VK_NULL_HANDLE)
+            break;
+      if (i == chain->pass_count)
+      {
+         chain->swapchain_info = info;
+         RARCH_DBG("[Vulkan] Shader chain kept: the swapchain changed in"
+               " size only.\n");
+         return true;
+      }
+   }
+
    slang_chain_flush(chain);
    slang_chain_set_swapchain_info(chain, info);
    return slang_chain_init(chain);
@@ -1655,20 +1692,13 @@ static void slang_chain_flush(struct vulkan_filter_chain *chain)
     * outlive is the frames that still reference the chain's images,
     * buffers and descriptor sets: the video driver's own submissions,
     * which it can wait on by fence without touching the queue. That
-    * is what wait_submissions does. Only a driver that gave none
-    * gets the device drained, and that is specified as vkQueueWaitIdle
-    * on every queue, so it takes the lock a submit does - and blocks
-    * vkQueuePresentKHR for the duration, and cannot complete while a
-    * hardware core waiting on that same lock still has work to submit
-    * that the queue is waiting for. */
-   if (chain->wait_submissions)
-      chain->wait_submissions(chain->queue_lock_handle);
-   else
-   {
-      slang_chain_lock_queue(chain);
-      vkDeviceWaitIdle(chain->device);
-      slang_chain_unlock_queue(chain);
-   }
+    * is what wait_submissions does, and a chain cannot be created
+    * without it. The alternative was draining the device, which is
+    * vkQueueWaitIdle on every queue: it takes the lock a submit does,
+    * blocks vkQueuePresentKHR for the duration, and cannot complete
+    * while a hardware core waiting on that same lock still has work
+    * to submit that the queue is waiting for. */
+   chain->wait_submissions(chain->queue_lock_handle);
    slang_chain_execute_deferred(chain);
 }
 
@@ -3446,10 +3476,6 @@ static void common_resources_init(CommonResources *common,
 
                case GLSLANG_FILTER_CHAIN_ADDRESS_CLAMP_TO_BORDER:
                   mode = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;
-                  break;
-
-               case GLSLANG_FILTER_CHAIN_ADDRESS_MIRROR_CLAMP_TO_EDGE:
-                  mode = VK_SAMPLER_ADDRESS_MODE_MIRROR_CLAMP_TO_EDGE;
                   break;
 
                default:

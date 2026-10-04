@@ -915,7 +915,6 @@ static const struct
    char s_136eaaf4[30];
    char s_8d3a8b68[8];
    char s_68d27147[11];
-   char s_f02f73fc[30];
    char s_e5b971a0[5];
    char s_17615fcf[11];
    char s_3a0a3fef[15];
@@ -1695,17 +1694,39 @@ static const struct
    char s_01a73130[24];
    char s_44ebca0d[24];
    char s_608ac5a1[18];
+#if defined(HAVE_SMBCLIENT) || defined(HAVE_NFSCLIENT)
 #ifdef HAVE_SMBCLIENT
    char s_3839f91d[17];
+#endif
+#endif
+#if defined(HAVE_SMBCLIENT) || defined(HAVE_NFSCLIENT)
    char s_86b07599[16];
+#endif
+#if defined(HAVE_SMBCLIENT) || defined(HAVE_NFSCLIENT)
+#ifdef HAVE_SMBCLIENT
    char s_8d5f85ee[22];
    char s_9b023eee[33];
+#endif
+#endif
+#if defined(HAVE_SMBCLIENT) || defined(HAVE_NFSCLIENT)
    char s_ccae82ba[13];
    char s_ad6e88de[13];
+#endif
+#if defined(HAVE_SMBCLIENT) || defined(HAVE_NFSCLIENT)
+#ifdef HAVE_SMBCLIENT
    char s_c7bc8298[20];
+#endif
+#endif
+#if defined(HAVE_SMBCLIENT) || defined(HAVE_NFSCLIENT)
    char s_e63b035a[14];
    char s_d21d875b[9];
+#endif
+#if defined(HAVE_SMBCLIENT) || defined(HAVE_NFSCLIENT)
+#ifdef HAVE_SMBCLIENT
    char s_b12ae22e[17];
+#endif
+#endif
+#if defined(HAVE_SMBCLIENT) || defined(HAVE_NFSCLIENT)
    char s_b2d073c7[22];
    char s_1cbc2657[15];
 #endif
@@ -2453,7 +2474,6 @@ static const struct
    char s_193e1462[50];
    char s_6895dfd6[61];
    char s_788364f5[73];
-   char s_dd9ff22a[51];
    char s_db495a9d[34];
    char s_ddc672a7[46];
    char s_ccea261d[136];
@@ -2589,6 +2609,9 @@ static const struct
    char s_a5ffd3d0[39];
 #ifdef _3DS
    char s_0d834bc5[66];
+#endif
+#ifdef HAVE_NFSCLIENT
+   char s_3487ce71[39];
 #endif
    char s_d2ae640b[85];
    char s_8e5bac99[60];
@@ -2794,11 +2817,19 @@ static const struct
    char s_4b009af3[37];
    char s_46c57dde[41];
    char s_7eb20ecf[60];
+#if defined(HAVE_SMBCLIENT) || defined(HAVE_NFSCLIENT)
 #ifdef HAVE_SMBCLIENT
    char s_a0d1a85c[61];
+#endif
+#endif
+#if defined(HAVE_SMBCLIENT) || defined(HAVE_NFSCLIENT)
    char s_907ef7cc[39];
+#endif
+#if defined(HAVE_SMBCLIENT) || defined(HAVE_NFSCLIENT)
+#ifdef HAVE_SMBCLIENT
    char s_b0a46506[37];
    char s_f6492edc[49];
+#endif
 #endif
    char s_f3bfa8b9[101];
    char s_5fe2cee5[83];
@@ -4402,7 +4433,6 @@ static const struct
    "Poista kioskitila k\303\244yt\303\266st\303\244",
    "Valikko",
    "Kioskitila",
-   "Rajoita valikon kuvataajuutta",
    "Aina",
    "Ei koskaan",
    "Tiedostoselain",
@@ -5190,17 +5220,39 @@ static const struct
    "Asenna tai palauta ydin",
    "Ytimen asennus onnistui",
    "Hidastuksen tahti",
+#if defined(HAVE_SMBCLIENT) || defined(HAVE_NFSCLIENT)
 #ifdef HAVE_SMBCLIENT
    "SMB-todennustila",
+#endif
+#endif
+#if defined(HAVE_SMBCLIENT) || defined(HAVE_NFSCLIENT)
    "Selaa SMB-jakoa",
+#endif
+#if defined(HAVE_SMBCLIENT) || defined(HAVE_NFSCLIENT)
+#ifdef HAVE_SMBCLIENT
    "K\303\244yt\303\244 SMB-asiakasta",
    "SMB-yhteyksien enimm\303\244ism\303\244\303\244r\303\244",
+#endif
+#endif
+#if defined(HAVE_SMBCLIENT) || defined(HAVE_NFSCLIENT)
    "SMB-salasana",
    "SMB-palvelin",
+#endif
+#if defined(HAVE_SMBCLIENT) || defined(HAVE_NFSCLIENT)
+#ifdef HAVE_SMBCLIENT
    "SMB-verkkoasetukset",
+#endif
+#endif
+#if defined(HAVE_SMBCLIENT) || defined(HAVE_NFSCLIENT)
    "SMB-jaon nimi",
    "SMB-jako",
+#endif
+#if defined(HAVE_SMBCLIENT) || defined(HAVE_NFSCLIENT)
+#ifdef HAVE_SMBCLIENT
    "SMB-aikakatkaisu",
+#endif
+#endif
+#if defined(HAVE_SMBCLIENT) || defined(HAVE_NFSCLIENT)
    "SMB-k\303\244ytt\303\244j\303\244tunnus",
    "SMB-ty\303\266ryhm\303\244",
 #endif
@@ -6126,7 +6178,6 @@ static const struct
    "N\303\244yt\303\244 kaikki kokoonpanoon liittyv\303\244t asetukset.",
    "K\303\244ytett\303\244v\303\244 valikkoajuri. (Vaatii uudelleenk\303\244ynnistyksen)",
    "Suojaa asennusta piilottamalla kaikki kokoonpanoon liittyv\303\244t asetukset.",
-   "Varmistaa ett\303\244 valikon kuvataajuus on rajoitettu.",
    "Muuta tiedostoselaimen asetuksia.",
    "Muokkaa valikon oletustaustan peitt\303\244vyytt\303\244.",
    "Valikon kirkkaus, yksikk\303\266 cd/m2 (niti\303\244), k\303\244ytett\303\244ess\303\244 HDR-n"
@@ -6353,6 +6404,9 @@ static const struct
    "Vaihda palvelimen ja verkon asetuksia.",
 #ifdef _3DS
    "Ota k\303\244ytt\303\266\303\266n New3DS:n kellotaajuus (804 MHz) / L2-v\303\244limuisti.",
+#endif
+#ifdef HAVE_NFSCLIENT
+   "Palvelimen IP-osoite tai is\303\244nt\303\244nimi.",
 #endif
    "N\303\244yt\303\244 n\303\244yt\303\266ll\303\244 ilmoitus viesti, kun sy\303\266tt\303\266laitt"
    "eita yhdistet\303\244\303\244n/irrotetaan.",
@@ -6668,11 +6722,19 @@ static const struct
    "Avaa perinteinen ty\303\266p\303\266yt\303\244valikko.",
    "Asenna tai palauta ydin latauskansiosta.",
    "Nopeus jolla sis\303\244lt\303\266 py\303\266rii kun k\303\244ytet\303\244\303\244n hidastusta.",
+#if defined(HAVE_SMBCLIENT) || defined(HAVE_NFSCLIENT)
 #ifdef HAVE_SMBCLIENT
    "Valitse suurin mahdollinen yhteysm\303\244\303\244r\303\244 ymp\303\244rist\303\266ss\303\244si.",
+#endif
+#endif
+#if defined(HAVE_SMBCLIENT) || defined(HAVE_NFSCLIENT)
    "Palvelimen IP-osoite tai is\303\244nt\303\244nimi.",
+#endif
+#if defined(HAVE_SMBCLIENT) || defined(HAVE_NFSCLIENT)
+#ifdef HAVE_SMBCLIENT
    "M\303\244\303\244rit\303\244 SMB-verkkojaon asetukset.",
    "Valitse oletusarvoinen aikakatkaisu sekunneissa.",
+#endif
 #endif
    "Lajittele tallennustiedostot kansioihin, jotka on nimetty kansion mukaan, jossa sis\303\244lt"
    "\303\266 sijaitsee.",
@@ -7457,7 +7519,7 @@ static const struct
  * compiler that pads this struct fails here instead of
  * misindexing at runtime. */
 typedef char msg_hash_fi_blob_check[
-      (sizeof(msg_hash_fi_blob) == (123772u
+      (sizeof(msg_hash_fi_blob) == (123691u
 #ifdef HAVE_LAKKA
        + 257u
 #endif
@@ -7548,17 +7610,39 @@ typedef char msg_hash_fi_blob_check[
        + 77u
 #endif
 #endif
+#if defined(HAVE_SMBCLIENT) || defined(HAVE_NFSCLIENT)
 #ifdef HAVE_SMBCLIENT
        + 17u
+#endif
+#endif
+#if defined(HAVE_SMBCLIENT) || defined(HAVE_NFSCLIENT)
        + 16u
+#endif
+#if defined(HAVE_SMBCLIENT) || defined(HAVE_NFSCLIENT)
+#ifdef HAVE_SMBCLIENT
        + 22u
        + 33u
+#endif
+#endif
+#if defined(HAVE_SMBCLIENT) || defined(HAVE_NFSCLIENT)
        + 13u
        + 13u
+#endif
+#if defined(HAVE_SMBCLIENT) || defined(HAVE_NFSCLIENT)
+#ifdef HAVE_SMBCLIENT
        + 20u
+#endif
+#endif
+#if defined(HAVE_SMBCLIENT) || defined(HAVE_NFSCLIENT)
        + 14u
        + 9u
+#endif
+#if defined(HAVE_SMBCLIENT) || defined(HAVE_NFSCLIENT)
+#ifdef HAVE_SMBCLIENT
        + 17u
+#endif
+#endif
+#if defined(HAVE_SMBCLIENT) || defined(HAVE_NFSCLIENT)
        + 22u
        + 15u
 #endif
@@ -7677,6 +7761,9 @@ typedef char msg_hash_fi_blob_check[
 #ifdef _3DS
        + 66u
 #endif
+#ifdef HAVE_NFSCLIENT
+       + 39u
+#endif
 #ifdef HAVE_LAKKA
 #ifdef HAVE_RETROFLAG
        + 125u
@@ -7686,11 +7773,19 @@ typedef char msg_hash_fi_blob_check[
        + 42u
        + 51u
 #endif
+#if defined(HAVE_SMBCLIENT) || defined(HAVE_NFSCLIENT)
 #ifdef HAVE_SMBCLIENT
        + 61u
+#endif
+#endif
+#if defined(HAVE_SMBCLIENT) || defined(HAVE_NFSCLIENT)
        + 39u
+#endif
+#if defined(HAVE_SMBCLIENT) || defined(HAVE_NFSCLIENT)
+#ifdef HAVE_SMBCLIENT
        + 37u
        + 49u
+#endif
 #endif
 #ifdef HAVE_LAKKA
        + 45u
@@ -8663,7 +8758,6 @@ static const uint32_t msg_hash_fi_ids[] =
    (uint32_t)MENU_ENUM_LABEL_VALUE_MENU_DISABLE_KIOSK_MODE,
    (uint32_t)MENU_ENUM_LABEL_VALUE_MENU_DRIVER,
    (uint32_t)MENU_ENUM_LABEL_VALUE_MENU_ENABLE_KIOSK_MODE,
-   (uint32_t)MENU_ENUM_LABEL_VALUE_MENU_ENUM_THROTTLE_FRAMERATE,
    (uint32_t)MENU_ENUM_LABEL_VALUE_MENU_FILE_BROWSER_EXTENSION_DISPLAY_ALWAYS,
    (uint32_t)MENU_ENUM_LABEL_VALUE_MENU_FILE_BROWSER_EXTENSION_DISPLAY_NEVER,
    (uint32_t)MENU_ENUM_LABEL_VALUE_MENU_FILE_BROWSER_SETTINGS,
@@ -9442,17 +9536,39 @@ static const uint32_t msg_hash_fi_ids[] =
    (uint32_t)MENU_ENUM_LABEL_VALUE_SIDELOAD_CORE_LIST,
    (uint32_t)MENU_ENUM_LABEL_VALUE_SIDELOAD_CORE_SUCCESS,
    (uint32_t)MENU_ENUM_LABEL_VALUE_SLOWMOTION_RATIO,
+#if defined(HAVE_SMBCLIENT) || defined(HAVE_NFSCLIENT)
 #ifdef HAVE_SMBCLIENT
    (uint32_t)MENU_ENUM_LABEL_VALUE_SMB_CLIENT_AUTH_MODE,
+#endif
+#endif
+#if defined(HAVE_SMBCLIENT) || defined(HAVE_NFSCLIENT)
    (uint32_t)MENU_ENUM_LABEL_VALUE_SMB_CLIENT_BROWSE,
+#endif
+#if defined(HAVE_SMBCLIENT) || defined(HAVE_NFSCLIENT)
+#ifdef HAVE_SMBCLIENT
    (uint32_t)MENU_ENUM_LABEL_VALUE_SMB_CLIENT_ENABLE,
    (uint32_t)MENU_ENUM_LABEL_VALUE_SMB_CLIENT_NUM_CONTEXTS,
+#endif
+#endif
+#if defined(HAVE_SMBCLIENT) || defined(HAVE_NFSCLIENT)
    (uint32_t)MENU_ENUM_LABEL_VALUE_SMB_CLIENT_PASSWORD,
    (uint32_t)MENU_ENUM_LABEL_VALUE_SMB_CLIENT_SERVER,
+#endif
+#if defined(HAVE_SMBCLIENT) || defined(HAVE_NFSCLIENT)
+#ifdef HAVE_SMBCLIENT
    (uint32_t)MENU_ENUM_LABEL_VALUE_SMB_CLIENT_SETTINGS,
+#endif
+#endif
+#if defined(HAVE_SMBCLIENT) || defined(HAVE_NFSCLIENT)
    (uint32_t)MENU_ENUM_LABEL_VALUE_SMB_CLIENT_SHARE,
    (uint32_t)MENU_ENUM_LABEL_VALUE_SMB_CLIENT_SMB_SHARE,
+#endif
+#if defined(HAVE_SMBCLIENT) || defined(HAVE_NFSCLIENT)
+#ifdef HAVE_SMBCLIENT
    (uint32_t)MENU_ENUM_LABEL_VALUE_SMB_CLIENT_TIMEOUT,
+#endif
+#endif
+#if defined(HAVE_SMBCLIENT) || defined(HAVE_NFSCLIENT)
    (uint32_t)MENU_ENUM_LABEL_VALUE_SMB_CLIENT_USERNAME,
    (uint32_t)MENU_ENUM_LABEL_VALUE_SMB_CLIENT_WORKGROUP,
 #endif
@@ -10200,7 +10316,6 @@ static const uint32_t msg_hash_fi_ids[] =
    (uint32_t)MENU_ENUM_SUBLABEL_MENU_DISABLE_KIOSK_MODE,
    (uint32_t)MENU_ENUM_SUBLABEL_MENU_DRIVER,
    (uint32_t)MENU_ENUM_SUBLABEL_MENU_ENABLE_KIOSK_MODE,
-   (uint32_t)MENU_ENUM_SUBLABEL_MENU_ENUM_THROTTLE_FRAMERATE,
    (uint32_t)MENU_ENUM_SUBLABEL_MENU_FILE_BROWSER_SETTINGS,
    (uint32_t)MENU_ENUM_SUBLABEL_MENU_FRAMEBUFFER_OPACITY,
    (uint32_t)MENU_ENUM_SUBLABEL_MENU_HDR_BRIGHTNESS_NITS,
@@ -10336,6 +10451,9 @@ static const uint32_t msg_hash_fi_ids[] =
    (uint32_t)MENU_ENUM_SUBLABEL_NETWORK_SETTINGS,
 #ifdef _3DS
    (uint32_t)MENU_ENUM_SUBLABEL_NEW3DS_SPEEDUP_ENABLE,
+#endif
+#ifdef HAVE_NFSCLIENT
+   (uint32_t)MENU_ENUM_SUBLABEL_NFS_CLIENT_SERVER,
 #endif
    (uint32_t)MENU_ENUM_SUBLABEL_NOTIFICATION_SHOW_AUTOCONFIG,
    (uint32_t)MENU_ENUM_SUBLABEL_NOTIFICATION_SHOW_AUTOCONFIG_FAILS,
@@ -10541,11 +10659,19 @@ static const uint32_t msg_hash_fi_ids[] =
    (uint32_t)MENU_ENUM_SUBLABEL_SHOW_WIMP,
    (uint32_t)MENU_ENUM_SUBLABEL_SIDELOAD_CORE_LIST,
    (uint32_t)MENU_ENUM_SUBLABEL_SLOWMOTION_RATIO,
+#if defined(HAVE_SMBCLIENT) || defined(HAVE_NFSCLIENT)
 #ifdef HAVE_SMBCLIENT
    (uint32_t)MENU_ENUM_SUBLABEL_SMB_CLIENT_NUM_CONTEXTS,
+#endif
+#endif
+#if defined(HAVE_SMBCLIENT) || defined(HAVE_NFSCLIENT)
    (uint32_t)MENU_ENUM_SUBLABEL_SMB_CLIENT_SERVER,
+#endif
+#if defined(HAVE_SMBCLIENT) || defined(HAVE_NFSCLIENT)
+#ifdef HAVE_SMBCLIENT
    (uint32_t)MENU_ENUM_SUBLABEL_SMB_CLIENT_SETTINGS,
    (uint32_t)MENU_ENUM_SUBLABEL_SMB_CLIENT_TIMEOUT,
+#endif
 #endif
    (uint32_t)MENU_ENUM_SUBLABEL_SORT_SAVEFILES_BY_CONTENT_ENABLE,
    (uint32_t)MENU_ENUM_SUBLABEL_SORT_SAVEFILES_ENABLE,

@@ -45,12 +45,66 @@ const struct rarch_key_map rarch_key_map_winraw[] = { { 0, RETROK_UNKNOWN } };
 static settings_t stub_settings;
 static struct menu_state stub_menu;
 settings_t *config_get_ptr(void) { return &stub_settings; }
+
+/* A port's keyboard, as the frontend works it out from the port's pin
+ * and number: the rule itself (input/common/input_device_pins.h), fed
+ * from the stub settings each time it is asked. */
+#include "input/common/input_device_pins.h"
+static char     stub_pin_ident[MAX_INPUT_DEVICES][INPUT_PIN_LEN];
+static unsigned stub_pin_listed;
+void input_keyboard_pins_set_devices(const char (*base)[64], unsigned n)
+{
+   memset(stub_pin_ident, 0, sizeof(stub_pin_ident));
+   if (n)
+      input_pins_identities(stub_pin_ident, base, n);
+   stub_pin_listed = n;
+}
+int input_keyboard_port_choice(unsigned port)
+{
+   int8_t choice[MAX_USERS];
+   input_pins_resolve(choice,
+         (const char (*)[INPUT_PIN_LEN])stub_settings.arrays.input_keyboard_device,
+         stub_settings.uints.input_keyboard_index, MAX_USERS,
+         (const char (*)[INPUT_PIN_LEN])stub_pin_ident, stub_pin_listed);
+   return choice[port];
+}
+
+/* and its mouse, the same way */
+static char     stub_mouse_ident[MAX_INPUT_DEVICES][INPUT_PIN_LEN];
+static unsigned stub_mouse_listed;
+void input_mouse_pins_set_devices(const char (*base)[64], unsigned n)
+{
+   memset(stub_mouse_ident, 0, sizeof(stub_mouse_ident));
+   if (n > MAX_INPUT_DEVICES)
+      n = MAX_INPUT_DEVICES;
+   if (n)
+      input_pins_identities(stub_mouse_ident, base, n);
+   stub_mouse_listed = n;
+}
+unsigned input_mouse_port_index(unsigned port)
+{
+   int16_t choice[MAX_USERS];
+   input_pins_resolve_mice(choice,
+         (const char (*)[INPUT_PIN_LEN])stub_settings.arrays.input_mouse_device,
+         stub_settings.uints.input_mouse_index, MAX_USERS,
+         (const char (*)[INPUT_PIN_LEN])stub_mouse_ident, stub_mouse_listed);
+   return choice[port] < 0 ? MAX_INPUT_DEVICES : (unsigned)choice[port];
+}
 struct menu_state *menu_state_get_ptr(void) { return &stub_menu; }
 void RARCH_LOG(const char *fmt, ...) { (void)fmt; }
 void RARCH_DBG(const char *fmt, ...) { (void)fmt; }
 void RARCH_ERR(const char *fmt, ...) { (void)fmt; }
 void input_config_set_mouse_display_name(unsigned port, const char *name)
 { (void)port; (void)name; }
+void input_config_set_keyboard_display_name(unsigned idx, const char *name)
+{ (void)idx; (void)name; }
+void input_config_clear_keyboard_display_names(void) { }
+void input_config_clear_mouse_info(void) { }
+void input_config_set_mouse_device(unsigned idx, const char *device,
+      uint16_t vid, uint16_t pid, bool hidden)
+{ (void)idx; (void)device; (void)vid; (void)pid; (void)hidden; }
+void input_config_set_keyboard_ids(unsigned idx, uint16_t vid, uint16_t pid)
+{ (void)idx; (void)vid; (void)pid; }
 unsigned input_driver_lightgun_id_convert(unsigned id) { return id; }
 bool input_driver_pointer_is_offscreen(int16_t x, int16_t y)
 { (void)x; (void)y; return false; }
@@ -80,6 +134,10 @@ bool video_driver_translate_coord_viewport(struct video_viewport *vp,
 uintptr_t video_driver_window_get(void) { return 0; }
 void win32_clip_window(bool grab) { (void)grab; }
 uint16_t win32_get_keyboard_mods(void) { return 0; }
+void winraw_joypad_take_hid(HANDLE device, const BYTE *data,
+      DWORD report_size, DWORD count)
+{ (void)device; (void)data; (void)report_size; (void)count; }
+bool winraw_joypad_survives_video(void) { return true; }
 void win32_hotplug_arm(void) { }
 bool win32_hotplug_due(void) { return false; }
 
