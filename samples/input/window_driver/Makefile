@@ -19,20 +19,26 @@ endif
 
 MINGW_CC ?= x86_64-w64-mingw32-gcc
 
-all: $(TARGET)
+all: $(TARGET) $(TARGET)_sdl1
 
-# host: the X11 window and the no-window-system choices
+# host: the X11, SDL 3 and Wayland windows and the no-window-system choices
 $(TARGET): $(SOURCES)
-	$(CC) $(CFLAGS) -DHAVE_X11 -DHAVE_UDEV -o $@ $(SOURCES) $(LDFLAGS)
+	$(CC) $(CFLAGS) -DHAVE_X11 -DHAVE_UDEV -DHAVE_SDL3 -DHAVE_WAYLAND -o $@ $(SOURCES) $(LDFLAGS)
 
-# Windows, run under Wine: the Windows window choice
+# the same with SDL 1.2 in SDL 3's place: a build has one or the other,
+# and the SDL 1.2 window's choice is only compiled with it
+$(TARGET)_sdl1: $(SOURCES)
+	$(CC) $(CFLAGS) -DHAVE_X11 -DHAVE_UDEV -DHAVE_SDL -DHAVE_WAYLAND -o $@ $(SOURCES) $(LDFLAGS)
+
+# Windows, run under Wine: the Windows and SDL 3 window choices
 $(TARGET).exe: $(SOURCES)
 	$(MINGW_CC) -Wall -std=gnu99 -O1 $(INCLUDES) $(DEFINES) \
-	   -D_WIN32_WINNT=0x0601 -DHAVE_WINRAWINPUT -DHAVE_DINPUT \
+	   -D_WIN32_WINNT=0x0601 -DHAVE_WINRAWINPUT -DHAVE_DINPUT -DHAVE_SDL3 \
 	   -o $@ $(SOURCES)
 
 check: all
 	./$(TARGET)
+	./$(TARGET)_sdl1
 
 # wine goes by several names; the first one found is used
 WINE ?= $(shell for w in wine wine64 /usr/lib/wine/wine64; do \
@@ -43,6 +49,6 @@ check-windows: $(TARGET).exe
 	WINEDEBUG=-all $(WINE) ./$(TARGET).exe
 
 clean:
-	rm -f $(TARGET) $(TARGET).exe
+	rm -f $(TARGET) $(TARGET)_sdl1 $(TARGET).exe
 
 .PHONY: all check check-windows clean

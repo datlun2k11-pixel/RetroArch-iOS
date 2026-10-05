@@ -175,6 +175,104 @@ jobs:
           timeout 60 ./cloudsync_path_safety_test
           echo "[pass] cloudsync_path_safety_test"
 
+      - name: Build and run cloudsync_manifest_adds_test (ASan + UBSan, TSan)
+        shell: bash
+        working-directory: samples/tasks/cloudsync
+        run: |
+          set -eu
+          # tasks/task_cloudsync.c's updated manifests, added to from
+          # four threads and the task's own at once with no lock: each
+          # entry is pushed on a list the task thread folds in. Every
+          # entry must be there once, with its own hash; TSan is what
+          # sees the threads share anything without ordering, ASan an
+          # entry freed twice or not at all.
+          make clean cloudsync_manifest_adds_test
+          timeout 60 ./cloudsync_manifest_adds_test
+          make clean cloudsync_manifest_adds_test SANITIZER=address,undefined
+          ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 \
+            timeout 120 ./cloudsync_manifest_adds_test
+          make clean cloudsync_manifest_adds_test SANITIZER=thread
+          TSAN_OPTIONS=halt_on_error=1 timeout 120 ./cloudsync_manifest_adds_test
+          make clean >/dev/null
+          echo "[pass] cloudsync_manifest_adds_test"
+
+      - name: Build and run cloudsync_pacing_test (ASan + UBSan + LSan, TSan)
+        shell: bash
+        working-directory: samples/tasks/cloudsync
+        run: |
+          set -eu
+          # tasks/task_cloudsync.c's diff runs as many steps as the shared
+          # per-frame I/O window grants and hashes the current file 256 KiB
+          # at a time, carrying a large file over to the next run instead
+          # of reading it whole in one (the frame loop, with Threaded Tasks
+          # off). Against a stub window: a 9 MiB file spread over runs with
+          # its MD5 unchanged, small files several to a run, the floor
+          # alone finishing the diff, and a 9 MiB download reported from
+          # another thread hashed by the task over many runs instead of
+          # by the callback. The directory walk listing the local files
+          # runs within the grant too and lists what dir_list_new() did,
+          # an unreadable root still stopping the sync. Pushed on the real
+          # task queue and run to its
+          # end, the sync must release everything (LeakSanitizer).
+          make clean cloudsync_pacing_test
+          timeout 120 ./cloudsync_pacing_test
+          make clean cloudsync_pacing_test SANITIZER=address,undefined
+          ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 \
+            timeout 300 ./cloudsync_pacing_test
+          make clean cloudsync_pacing_test SANITIZER=thread
+          TSAN_OPTIONS=halt_on_error=1 timeout 300 ./cloudsync_pacing_test
+          make clean >/dev/null
+          echo "[pass] cloudsync_pacing_test"
+
+      - name: Build and run the cloudsync hand-over tests, locked path (ASan + UBSan, TSan)
+        shell: bash
+        working-directory: samples/tasks/cloudsync
+        run: |
+          set -eu
+          # Completion callbacks hand manifest entries and downloads to
+          # the task thread on lock-free lists where the atomics backend
+          # has pointer operations, and under tcs_manifest_lock where it
+          # does not. Every backend this runner has, has them, so
+          # FORCE_LOCK=1 builds tasks/task_cloudsync.c with
+          # TASK_CLOUDSYNC_FORCE_LOCK: the locked path on the host's own
+          # backend, where TSan sees an append or hand-over the lock
+          # does not cover. Same tests, same checks, other path.
+          for t in cloudsync_manifest_adds_test cloudsync_pacing_test; do
+             make clean $t FORCE_LOCK=1
+             timeout 120 ./$t
+             make clean $t FORCE_LOCK=1 SANITIZER=address,undefined
+             ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 \
+               timeout 300 ./$t
+             make clean $t FORCE_LOCK=1 SANITIZER=thread
+             TSAN_OPTIONS=halt_on_error=1 timeout 300 ./$t
+          done
+          make clean >/dev/null
+          echo "[pass] cloudsync hand-over, locked path"
+
+      - name: Build and run cloudsync_async_test (ASan + UBSan, TSan)
+        shell: bash
+        working-directory: samples/tasks/cloudsync
+        run: |
+          set -eu
+          # network/cloud_sync_driver.c runs a blocking driver's calls
+          # (SMB, NFS) on a worker and hands results back through
+          # cloud_sync_poll(), so a slow server never stalls the thread
+          # driving the sync - the frame loop with Threaded Tasks off.
+          # Against a driver that blocks until released: every call
+          # returns at once, handlers run on the polling thread in call
+          # order, one driver call at a time, names copied, refused calls
+          # failing, and a new worker for the sync after one that ended
+          # or failed to begin. On the old direct calls the test hangs.
+          make clean cloudsync_async_test
+          timeout 60 ./cloudsync_async_test
+          make clean cloudsync_async_test SANITIZER=address,undefined
+          ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 \
+            timeout 120 ./cloudsync_async_test
+          make clean cloudsync_async_test SANITIZER=thread
+          TSAN_OPTIONS=halt_on_error=1 timeout 120 ./cloudsync_async_test
+          make clean >/dev/null
+          echo "[pass] cloudsync_async_test"
+
       - name: Build and run natt_desc_parse_test
         shell: bash
         working-directory: samples/tasks/natt_desc

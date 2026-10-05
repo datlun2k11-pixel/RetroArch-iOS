@@ -318,9 +318,8 @@ static bool gx2_set_shader(void *data,
       for (i = 0; i < wiiu->shader_preset->luts; i++)
       {
          struct texture_image image;
-         image.pixels               = NULL;
-         image.width                = 0;
-         image.height               = 0;
+         /* pix10 is a request the load reads: cleared with the rest */
+         memset(&image, 0, sizeof(image));
          image.supports_rgba        = false;
 
          if (image_texture_load(&image, wiiu->shader_preset->lut[i].path))
@@ -1037,10 +1036,8 @@ static void *gx2_init(const video_info_t *video,
    float refresh_rate              = 60.0f / 1.001f;
    u32 size                        = 0;
    u32 tmp                         = 0;
-   void *wiiuinput                 = NULL;
    wiiu_video_t *wiiu              = (wiiu_video_t*)calloc(1, sizeof(*wiiu));
    settings_t *settings            = config_get_ptr();
-   const char *input_joypad_driver = settings->arrays.input_joypad_driver;
    bool prefer_drc                 = settings->bools.video_wiiu_prefer_drc;
 
    if (!wiiu)
@@ -1049,12 +1046,9 @@ static void *gx2_init(const video_info_t *video,
    *input                          = NULL;
    *input_data                     = NULL;
 
-   if (input && input_data)
-   {
-      wiiuinput                    = input_driver_init_wrap(&input_wiiu, input_joypad_driver);
-      *input                       = wiiuinput ? &input_wiiu : NULL;
-      *input_data                  = wiiuinput;
-   }
+   /* no input driver of this driver's own: the frontend starts the
+    * platform's */
+   input_driver_left_to_frontend(INPUT_WINDOW_PLATFORM, input, input_data);
 
    /* video initialize */
    wiiu->cmd_buffer                = MEM2_alloc(0x400000, 0x40);

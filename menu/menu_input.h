@@ -166,6 +166,11 @@ struct menu_bind_axis_state
    /* Locked axis state. If we configured an axis,
     * avoid having the same axis state trigger something again right away. */
    int16_t locked_axes[MENU_MAX_AXES];
+   /* Axes bound as a trigger at the start of their pull (see
+    * menu_bind_trigger.h), one bit each: the rest of the pull is not
+    * a second press, so they are passed over until they are back at
+    * rest. */
+   uint32_t trigger_pulled;
 };
 
 struct menu_bind_state
@@ -274,6 +279,13 @@ void menu_input_get_pointer_state(menu_input_pointer_t *copy_target);
 bool menu_input_dialog_start(menu_input_ctx_line_t *line);
 
 const char *menu_input_dialog_get_buffer(void);
+
+/* The label of the text entry that is open. */
+const char *menu_input_dialog_get_kb_label(void);
+
+/* Whether the menu is up, for code that has no other business with
+ * the menu's state. */
+bool menu_driver_alive(void);
 
 bool menu_input_dialog_start_search(void);
 

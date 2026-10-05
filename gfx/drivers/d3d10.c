@@ -1872,9 +1872,8 @@ static bool d3d10_shader_load_begin(void *data,
       for (i = 0; i < ds->shader_preset->luts; i++)
       {
          struct texture_image image;
-         image.pixels        = NULL;
-         image.width         = 0;
-         image.height        = 0;
+         /* pix10 is a request the load reads: cleared with the rest */
+         memset(&image, 0, sizeof(image));
          image.supports_rgba = true;
 
          if (!image_texture_load(&image,
@@ -2313,9 +2312,7 @@ static bool d3d10_gfx_set_shader(void* data,
    for (i = 0; i < d3d10->shader_preset->luts; i++)
    {
       struct texture_image image;
-      image.pixels               = NULL;
-      image.width                = 0;
-      image.height               = 0;
+      memset(&image, 0, sizeof(image));
       image.supports_rgba        = true;
 
       if (!image_texture_load(&image, d3d10->shader_preset->lut[i].path))
@@ -2543,6 +2540,9 @@ static void *d3d10_gfx_init(const video_info_t* video,
       RARCH_ERR("[D3D10] win32_set_video_mode failed.\n");
       goto error;
    }
+
+   /* the swap chain is made the size the window really is */
+   d3d10->vp.full_dims = win32_window_client_dims(d3d10->vp.full_dims);
 
    /* no input driver of this driver's own: the frontend starts the
     * one that goes with a Windows window */
@@ -3912,6 +3912,84 @@ static uintptr_t d3d10_texture_unload_wrap(void *data)
 }
 #endif
 
+/* Same-size contents into a texture d3d10_gfx_load_texture made,
+ * through the staging texture it was given: the texture stays, so a
+ * streaming surface costs a copy a frame rather than a texture
+ * created and released. The staging texture the last update copied
+ * from may still be the GPU's; mapping it would wait, so the frame is
+ * dropped instead and the texture keeps what it shows. */
+static bool d3d10_gfx_update_texture_internal(d3d10_video_t *d3d10,
+      uintptr_t handle, const struct texture_image *image)
+{
+   D3D10_MAPPED_TEXTURE2D mapped;
+   D3D10_BOX box;
+   d3d10_texture_t *texture = (d3d10_texture_t*)handle;
+   HRESULT hr;
+
+   if (     !d3d10 || !texture || !texture->staging || image->pix10
+         || texture->desc.Width  != image->width
+         || texture->desc.Height != image->height)
+      return false;
+
+   hr = texture->staging->lpVtbl->Map(texture->staging, 0,
+         D3D10_MAP_WRITE, D3D10_MAP_FLAG_DO_NOT_WAIT, &mapped);
+   if (hr == DXGI_ERROR_WAS_STILL_DRAWING)
+      return true;
+   if (FAILED(hr))
+      return false;
+
+   dxgi_copy(image->width, image->height, texture->desc.Format, 0,
+         image->pixels, texture->desc.Format, mapped.RowPitch,
+         mapped.pData);
+   texture->staging->lpVtbl->Unmap(texture->staging, 0);
+
+   box.left   = 0;
+   box.top    = 0;
+   box.front  = 0;
+   box.right  = image->width;
+   box.bottom = image->height;
+   box.back   = 1;
+   d3d10->device->lpVtbl->CopySubresourceRegion(d3d10->device,
+         (D3D10Resource)texture->handle, 0, 0, 0, 0,
+         (D3D10Resource)texture->staging, 0, &box);
+   if (texture->desc.MiscFlags & D3D10_RESOURCE_MISC_GENERATE_MIPS)
+      d3d10->device->lpVtbl->GenerateMips(d3d10->device, texture->view);
+   return true;
+}
+
+#ifdef HAVE_THREADS
+static uintptr_t d3d10_texture_update_wrap(void *data)
+{
+   d3d10_texture_cmd_t *cmd = (d3d10_texture_cmd_t*)data;
+   cmd->handle = d3d10_gfx_update_texture_internal(cmd->d3d10,
+         cmd->handle, cmd->image) ? cmd->handle : 0;
+   return 0;
+}
+#endif
+
+static bool d3d10_gfx_update_texture(void *video_data, uintptr_t id,
+      const struct texture_image *ti, bool threaded)
+{
+   d3d10_video_t *d3d10 = (d3d10_video_t*)video_data;
+   if (!id || !ti || !ti->pixels)
+      return false;
+
+#ifdef HAVE_THREADS
+   if (threaded)
+   {
+      d3d10_texture_cmd_t cmd;
+      cmd.d3d10       = d3d10;
+      cmd.image       = (struct texture_image*)ti;
+      cmd.filter_type = TEXTURE_FILTER_LINEAR;
+      cmd.handle      = id;
+      video_thread_texture_handle(&cmd, d3d10_texture_update_wrap);
+      return cmd.handle != 0;
+   }
+#endif
+
+   return d3d10_gfx_update_texture_internal(d3d10, id, ti);
+}
+
 static uintptr_t d3d10_gfx_load_texture(
       void* video_data, void* data, bool threaded,
       enum texture_filter_type filter_type)
@@ -4211,7 +4289,7 @@ static const video_poke_interface_t d3d10_poke_interface = {
    NULL, /* hw_ring_context_new */
    NULL, /* hw_ring_context_free */
    NULL, /* hw_ring_framebuffer */
-   NULL, /* update_texture */
+   d3d10_gfx_update_texture,
    d3d10_get_swap_interval_cap
 };
 

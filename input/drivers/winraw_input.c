@@ -1317,7 +1317,7 @@ static const uint8_t *winraw_port_keys(const winraw_input_t *wr,
    if (!idx)
       return NULL;
 #ifdef HAVE_MENU
-   if (menu_state_get_ptr()->flags & MENU_ST_FLAG_ALIVE)
+   if (menu_driver_alive())
       return NULL;
 #endif
    if (idx < 0 || (unsigned)idx > wr->kg_cnt)
@@ -1469,15 +1469,13 @@ static void winraw_update_mouse_state(winraw_input_t *wr,
        * break multiple mice positions */
       bool getcursorpos = (mouse->device == RETRO_DEVICE_POINTER) ? true : false;
 #ifdef HAVE_MENU
-      if (menu_state_get_ptr()->flags & MENU_ST_FLAG_ALIVE)
+      if (menu_driver_alive())
          getcursorpos = true;
 #endif
       /* Input overlay with mouse cursor must also use GetCursorPos() */
       if (!getcursorpos)
       {
-         settings_t *settings = config_get_ptr();
-         if (     settings->bools.input_overlay_enable
-               && *settings->paths.path_overlay)
+         if (input_config_overlay_configured())
             getcursorpos = true;
       }
 
@@ -1723,7 +1721,7 @@ static void winraw_kev_deliver(winraw_input_t *wr)
 #ifdef HAVE_MENU
    /* keys typed elsewhere are not typed into the menu */
    if (     !winraw_focus
-         && (menu_state_get_ptr()->flags & MENU_ST_FLAG_ALIVE))
+         && menu_driver_alive())
    {
       wr->kev_n = 0;
       return;
@@ -2101,12 +2099,12 @@ static bool winraw_poll_window_up(winraw_input_t *wr)
    rid[0].hwndTarget  = wr->window;
    rid[0].usUsagePage = 0x01; /* Generic desktop */
    rid[0].usUsage     = 0x06; /* Keyboard */
-   wr->nowinkey       = config_get_ptr()->bools.input_nowinkey_enable;
+   wr->nowinkey       = input_config_get_nowinkey_enable();
    if (wr->nowinkey)
       rid[0].dwFlags |= RIDEV_NOHOTKEYS; /* Disable win keys while focused */
    /* Background Keyboard Input: Windows sends the keys while another
     * application is active only to a sink */
-   wr->kb_background  = config_get_ptr()->bools.input_keyboard_background;
+   wr->kb_background  = input_config_get_keyboard_background();
    if (wr->kb_background)
       rid[0].dwFlags |= RIDEV_INPUTSINK;
 
@@ -2228,7 +2226,7 @@ static void winraw_nowinkey_apply(winraw_input_t *wr, bool enable,
 static void *winraw_init(const char *joypad_driver)
 {
    RAWINPUTDEVICE rid;
-   bool input_nowinkey_enable = config_get_ptr()->bools.input_nowinkey_enable;
+   bool input_nowinkey_enable = input_config_get_nowinkey_enable();
    winraw_input_t *wr   = (winraw_input_t *)
       calloc(1, sizeof(winraw_input_t));
 
@@ -2543,9 +2541,8 @@ static void winraw_poll(void *data)
          winraw_keyboards_refresh(wr);
       if (wr->window)
       {
-         settings_t *settings = config_get_ptr();
-         bool nowinkey   = settings->bools.input_nowinkey_enable;
-         bool background = settings->bools.input_keyboard_background;
+         bool nowinkey   = input_config_get_nowinkey_enable();
+         bool background = input_config_get_keyboard_background();
          if (nowinkey != wr->nowinkey || background != wr->kb_background)
             winraw_nowinkey_apply(wr, nowinkey, background);
       }
@@ -2603,7 +2600,7 @@ static int16_t winraw_input_state(
 
 #ifdef HAVE_MENU
       if (!keys_ok && wr->kb_background)
-         keys_ok = !(menu_state_get_ptr()->flags & MENU_ST_FLAG_ALIVE);
+         keys_ok = !menu_driver_alive();
 #else
       if (wr->kb_background)
          keys_ok = true;
@@ -2898,7 +2895,6 @@ bool winraw_handle_message(UINT msg,
             break;
          if (win32_hotplug_due())
          {
-            settings_t *settings = config_get_ptr();
             /* and the input driver's own list of keyboards, at its
              * next poll */
             retro_atomic_store_release_int(&winraw_devices_changed, 1);
@@ -2911,7 +2907,7 @@ bool winraw_handle_message(UINT msg,
              * driver is never tried, so a device change silently
              * swaps it for one earlier in that list. */
             joypad_driver_reinit(NULL,
-                  settings ? settings->arrays.input_joypad_driver : NULL);
+                  input_config_get_joypad_driver());
          }
          return true;
    }
@@ -2923,7 +2919,7 @@ static void winraw_free(void *data)
 {
    RAWINPUTDEVICE rid;
    winraw_input_t *wr         = (winraw_input_t*)data;
-   bool input_nowinkey_enable = config_get_ptr()->bools.input_nowinkey_enable;
+   bool input_nowinkey_enable = input_config_get_nowinkey_enable();
 
    if (wr->poll_drain)
    {

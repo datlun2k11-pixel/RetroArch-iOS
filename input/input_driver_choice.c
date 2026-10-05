@@ -122,6 +122,149 @@ void input_driver_init_x11(const char *joypad_name,
 }
 #endif
 
+#ifdef HAVE_WAYLAND
+bool input_wl_init(void *data, const char *joypad_name);
+
+/* A Wayland surface. The seat's state - its keyboard, pointer and
+ * touch - lives with the surface, in the video context, which hands
+ * it over as @window_data; the Wayland input driver runs on that. */
+void input_driver_init_wayland(const char *joypad_name, void *window_data,
+      input_driver_t **input, void **input_data)
+{
+   *input      = NULL;
+   *input_data = NULL;
+
+   if (!window_data || !input_wl_init(window_data, joypad_name))
+      return;
+
+   *input      = &input_wayland;
+   *input_data = window_data;
+   input_driver_init_joypads();
+}
+#endif
+
+#if defined(HAVE_SDL) && !defined(HAVE_SDL2) && !defined(HAVE_SDL3)
+/* An SDL 1.2 window: the SDL 1.2 input driver, whatever the setting
+ * says. The window's keyboard and mouse come through SDL's event
+ * queue and nowhere else. */
+void input_driver_init_sdl1(const char *joypad_name,
+      input_driver_t **input, void **input_data)
+{
+   *input_data = input_driver_init_wrap(&input_sdl1, joypad_name);
+   *input      = *input_data ? &input_sdl1 : NULL;
+}
+#endif
+
+#ifdef HAVE_SDL3
+/* The configured input driver, if it works alongside an SDL 3 window:
+ * udev, linuxraw, raw and dinput read input devices themselves, so
+ * they do. One tied to a window system - x, wayland, cocoa - does not,
+ * and NULL is returned for it. */
+static input_driver_t *input_driver_beside_sdl3(const char *ident)
+{
+#ifdef HAVE_UDEV
+   if (string_is_equal(ident, "udev"))
+      return &input_udev;
+#endif
+#if defined(__linux__) && !defined(ANDROID)
+   if (string_is_equal(ident, "linuxraw"))
+      return &input_linuxraw;
+#endif
+#if defined(_WIN32) && !defined(_XBOX) && _WIN32_WINNT >= 0x0501 && !defined(__WINRT__)
+#ifdef HAVE_WINRAWINPUT
+   if (string_is_equal(ident, "raw"))
+      return &input_winraw;
+#endif
+#endif
+#ifdef HAVE_DINPUT
+   if (string_is_equal(ident, "dinput"))
+      return &input_dinput;
+#endif
+   return NULL;
+}
+
+/* An SDL 3 window: the configured driver if it is one that reads
+ * devices itself and it starts; the SDL 3 input driver, which reads
+ * the window's event queue, otherwise. */
+void input_driver_init_sdl3(const char *joypad_name,
+      input_driver_t **input, void **input_data)
+{
+   input_driver_t *beside = input_driver_beside_sdl3(
+         config_get_ptr()->arrays.input_driver);
+
+   *input      = NULL;
+   *input_data = NULL;
+
+   if (beside)
+   {
+      *input_data = input_driver_init_wrap(beside, joypad_name);
+      if (*input_data)
+      {
+         *input = beside;
+         return;
+      }
+      /* it did not start: the SDL 3 one, then */
+   }
+
+   *input_data = input_driver_init_wrap(&input_sdl3, joypad_name);
+   *input      = *input_data ? &input_sdl3 : NULL;
+}
+#endif
+
+/* The one input driver a platform has, where it has one of its own:
+ * a console's, Android's, QNX's, the web's, UWP's. The conditions are
+ * those input_drivers[] lists each driver under. */
+static input_driver_t *input_driver_of_platform(void)
+{
+#if defined(__PSL1GHT__) || defined(__PS3__)
+   return &input_ps3;
+#elif defined(SN_TARGET_PSP2) || defined(PSP) || defined(VITA)
+   return &input_psp;
+#elif defined(PS2)
+   return &input_ps2;
+#elif defined(_3DS)
+   return &input_ctr;
+#elif defined(SWITCH)
+   return &input_switch;
+#elif defined(GEKKO)
+   return &input_gx;
+#elif defined(WIIU)
+   return &input_wiiu;
+#elif defined(ANDROID)
+   return &input_android;
+#elif defined(__QNX__)
+   return &input_qnx;
+#elif defined(__EMSCRIPTEN__)
+   return &input_rwebinput;
+#elif defined(__WINRT__)
+   /* Plain xinput is supported on UWP, but it supports joypads only
+    * (the uwp driver was added later): it is started when it is what
+    * the setting says, and the uwp driver otherwise. */
+   if (string_is_equal(config_get_ptr()->arrays.input_driver, "xinput"))
+      return &input_xinput;
+   return &input_uwp;
+#else
+   return NULL;
+#endif
+}
+
+/* A platform with one input driver of its own: that driver, whatever
+ * the setting says (UWP's two aside, see above). */
+void input_driver_init_platform(const char *joypad_name,
+      input_driver_t **input, void **input_data)
+{
+   input_driver_t *own = input_driver_of_platform();
+
+   *input      = NULL;
+   *input_data = NULL;
+   if (!own)
+      return;
+
+   *input_data = input_driver_init_wrap(own, joypad_name);
+   if (*input_data)
+      *input   = own;
+}
+
 /* A display with no window system - KMS/DRM, a Vulkan display. The
  * X11 driver cannot work there and udev may not be allowed, so when
  * the setting is either of those: udev if it starts, linuxraw if that

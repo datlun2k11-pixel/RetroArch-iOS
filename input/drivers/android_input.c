@@ -424,7 +424,7 @@ bool android_keyboard_start(char **buffer_ptr, size_t *size_ptr,
 
    /* Suppress the built-in OSK for as long as the IME owns the line;
     * without this both are drawn at once and both consume input. */
-   input_state_get_ptr()->flags |= INP_FLAG_NATIVE_KB_SHOWN;
+   input_driver_set_native_keyboard_shown(true);
 
    if ((env = jni_thread_getenv()))
    {
@@ -454,7 +454,7 @@ void android_keyboard_end(void)
    if (!retro_atomic_load_relaxed_int(&android_kbd_open))
       return;
 
-   input_state_get_ptr()->flags &= ~INP_FLAG_NATIVE_KB_SHOWN;
+   input_driver_set_native_keyboard_shown(false);
 
    /* Close the gate first, then clear the session: the UI thread
     * checks the gate before producing, and anything that races past
@@ -512,8 +512,6 @@ void android_keyboard_poll(void)
 
    if (finished)
    {
-      input_driver_state_t *input_st = input_state_get_ptr();
-
       /* Mirror the iOS completion block: fire the callback (NULL line
        * on cancel), then release the keyboard line and unblock hotkeys.
        * The callback closes the dialog, which hides the soft keyboard
@@ -521,11 +519,7 @@ void android_keyboard_poll(void)
       if (cb)
          cb(userdata, cancel ? NULL : buffer);
 
-      if (input_st)
-      {
-         input_keyboard_line_free(input_st);
-         input_st->flags &= ~INP_FLAG_KB_MAPPING_BLOCKED;
-      }
+      input_driver_keyboard_line_end();
 
       /* The callback normally closes the dialog (-> android_keyboard_end),
        * which clears our state. If it did not, drop the now-freed buffer
@@ -536,7 +530,7 @@ void android_keyboard_poll(void)
          android_kbd_buffer = NULL;
          retro_atomic_store_release_int(&android_kbd_open, 0);
          android_kbd_drain_pending();
-         input_state_get_ptr()->flags &= ~INP_FLAG_NATIVE_KB_SHOWN;
+         input_driver_set_native_keyboard_shown(false);
       }
    }
 }
@@ -714,53 +708,6 @@ bool android_input_can_be_keyboard(void *data, int port)
     return android_input_can_be_keyboard_jni(device->id);
 }
 
-#ifdef HAVE_THREADS
-/* EGL bindings are per-thread. Under threaded video the context is made
- * current on the video thread, so an eglMakeCurrent() issued from here
- * releases this thread's (empty) binding and leaves the surface current
- * on the worker - and a later create_surface() would bind the same
- * context a second time, on a second thread. Both entry points therefore
- * run where the context lives. */
-static uintptr_t android_ctx_create_surface_cb(void *data)
-{
-   video_driver_state_t *state = video_state_get_ptr();
-
-   if (!state->current_video_context.create_surface)
-      return 0;
-
-   return state->current_video_context.create_surface(data) ? 1 : 0;
-}
-
-static uintptr_t android_ctx_destroy_surface_cb(void *data)
-{
-   video_driver_state_t *state = video_state_get_ptr();
-
-   if (state->current_video_context.destroy_surface)
-      state->current_video_context.destroy_surface(data);
-
-   return 0;
-}
-#endif
-
-static void android_input_destroy_surface(video_driver_state_t *state)
-{
-   if (!state || !state->current_video_context.destroy_surface)
-      return;
-
-#ifdef HAVE_THREADS
-   /* The video worker may still be recording a frame that references the
-    * surface. Drain it before the context driver frees the surface. */
-   video_thread_wait_idle();
-
-   /* Dispatches to the video thread, or calls straight through when the
-    * wrapper is inactive or this already is the video thread. */
-   video_thread_texture_handle(state->context_data,
-         android_ctx_destroy_surface_cb);
-#else
-   state->current_video_context.destroy_surface(state->context_data);
-#endif
-}
-
 /* Set once the background flush has been performed, cleared again on
  * start or resume. A pause -> resume -> pause cycle therefore flushes
  * twice, but a duplicate APP_CMD_PAUSE, or the APP_CMD_STOP that follows
@@ -795,74 +742,6 @@ static void android_input_release_state_ack(struct android_app *android_app)
    android_state_ack_cmd = -1;
 }
 
-/* Everything that would otherwise only be written by retroarch_main_quit():
- * SRAM, core options and the main config. */
-static void android_input_flush_state(void)
-{
-   settings_t *settings        = config_get_ptr();
-   runloop_state_t *runloop_st = runloop_state_get_ptr();
-
-   /* Config subsystem is not up yet - nothing to persist. */
-   if (!settings)
-      return;
-
-   /* SRAM first: it is the more expensive of the two, and the more
-    * painful to lose. Non-SRAM cores make this a no-op.
-    *
-    * Only flush while content is actually loaded. APP_CMD_PAUSE can be
-    * delivered while frontend_unix_init() is still pumping events
-    * waiting for the window (activity created, then immediately
-    * backgrounded / screen locked), long before any core exists - and,
-    * worse, while a previous activity instance in the same process may
-    * still be mid-teardown, leaving runloop_state.current_core in a
-    * transient state. There is nothing to save in either case:
-    * CMD_EVENT_SAVE_FILES exists to persist SRAM and game-specific
-    * cheats, both of which require loaded content. */
-   if (runloop_st->current_core.flags & RETRO_CORE_FLAG_GAME_LOADED)
-      command_event(CMD_EVENT_SAVE_FILES, NULL);
-
-   /* Core options: written unconditionally on core unload, so not
-    * gated on config_save_on_exit here either. Without this, option
-    * changes are lost whenever the process is killed in the
-    * background, e.g. swiped away from Recents. No-op when no core
-    * with options is loaded. */
-   runloop_core_options_save();
-
-   if (settings->bools.config_save_on_exit)
-   {
-      video_driver_state_t *video_st = video_state_get_ptr();
-      char live_driver[32];
-
-      live_driver[0] = '\0';
-
-      /* A core that forces its own renderer overwrites video_driver
-       * with the forced name and parks the configured one in
-       * cached_driver_id. Writing the config in that state persists the
-       * core's choice as the user's, so a driver picked from the menu
-       * is silently replaced by whatever the last loaded core wanted.
-       * main_exit() restores the cached name before it saves; do the
-       * same here.
-       *
-       * Unlike main_exit(), swap the live value back afterwards: the
-       * activity may be resumed, and the renderer actually in use does
-       * not change just because the app went to the background. */
-      if (video_st->cached_driver_id[0])
-      {
-         strlcpy(live_driver, settings->arrays.video_driver,
-               sizeof(live_driver));
-         configuration_set_string(settings,
-               settings->arrays.video_driver,
-               video_st->cached_driver_id);
-      }
-
-      command_event(CMD_EVENT_MENU_SAVE_CURRENT_CONFIG, NULL);
-
-      if (live_driver[0])
-         configuration_set_string(settings,
-               settings->arrays.video_driver, live_driver);
-   }
-}
-
 /* Swiping the task away from Recents and the low-memory killer end the
  * process with SIGKILL, and a QUITFOCUS launch exits from the Java side's
  * onStop(); onDestroy() is not delivered first in any of them, so
@@ -890,7 +769,7 @@ void android_input_flush_pending_state(void)
    if (!android_state_flushed)
    {
       android_state_flushed = true;
-      android_input_flush_state();
+      retroarch_save_for_suspend();
    }
 
    android_input_release_state_ack(g_android);
@@ -958,7 +837,6 @@ static void android_input_poll_main_cmd(void)
       case APP_CMD_START:
       case APP_CMD_PAUSE:
       {
-         video_driver_state_t *state = video_state_get_ptr();
          /* Acknowledged by the flush, see
           * android_input_flush_pending_state(). */
          bool hold_ack               = (cmd == APP_CMD_PAUSE)
@@ -970,11 +848,9 @@ static void android_input_poll_main_cmd(void)
           * wait for INIT_WINDOW rather than falling back to a full
           * video-driver reinitialization without a native window. */
          if (  (cmd == APP_CMD_RESUME || cmd == APP_CMD_START)
-             && state->current_video_context.ident
-             && string_is_equal(state->current_video_context.ident,
-                   "vk_android")
+             && video_context_driver_is("vk_android")
              && android_app_window(android_app)
-             && state->current_video_context.create_surface)
+             && video_context_surface_can_create())
             android_app->reinitRequested = 1;
 
          if (cmd == APP_CMD_PAUSE)
@@ -1004,8 +880,6 @@ static void android_input_poll_main_cmd(void)
 
       case APP_CMD_STOP:
       {
-         video_driver_state_t *state = video_state_get_ptr();
-
          android_keypress_vibrate_pending = false;
 
          /* Normally flushed on the preceding APP_CMD_PAUSE already. When
@@ -1024,10 +898,8 @@ static void android_input_poll_main_cmd(void)
          /* Android may retain the same ANativeWindow while the app is
           * backgrounded. Release Vulkan's acquired buffers anyway so BLAST
           * cannot wedge before APP_CMD_TERM_WINDOW is delivered. */
-         if (     state->current_video_context.ident
-               && string_is_equal(state->current_video_context.ident,
-                     "vk_android"))
-            android_input_destroy_surface(state);
+         if (video_context_driver_is("vk_android"))
+            video_context_surface_destroy();
          break;
       }
 
@@ -1037,11 +909,9 @@ static void android_input_poll_main_cmd(void)
          break;
       case APP_CMD_TERM_WINDOW:
       {
-         video_driver_state_t *state = video_state_get_ptr();
-
          android_keypress_vibrate_pending = false;
 
-         android_input_destroy_surface(state);
+         video_context_surface_destroy();
 
          /* The window is being hidden or closed: nobody may hold it by
           * the time the UI thread hands it back. */
@@ -1052,9 +922,7 @@ static void android_input_poll_main_cmd(void)
 
       case APP_CMD_GAINED_FOCUS:
          {
-            runloop_state_t *runloop_st = runloop_state_get_ptr();
-            settings_t *settings         = config_get_ptr();
-            bool sensors_allowed         = !settings || settings->bools.input_sensors_enable;
+            bool sensors_allowed         = input_config_get_sensors_enable();
             /* Re-enable sensors that were disabled on focus loss */
             bool enable_accelerometer   = (android_app->sensor_state_mask &
                   (UINT64_C(1) << RETRO_SENSOR_ACCELEROMETER_DISABLE));
@@ -1083,8 +951,7 @@ static void android_input_poll_main_cmd(void)
                enable_gyroscope     = false;
             }
 
-            runloop_st->flags &= ~(RUNLOOP_FLAG_PAUSED
-                                 | RUNLOOP_FLAG_IDLE);
+            runloop_set_platform_paused(false);
             video_driver_unset_stub_frame();
 
             /* Try to enable sensors via input driver. If that fails before the
@@ -1154,7 +1021,6 @@ static void android_input_poll_main_cmd(void)
       case APP_CMD_LOST_FOCUS:
          android_keypress_vibrate_pending = false;
          {
-            runloop_state_t *runloop_st = runloop_state_get_ptr();
             bool disable_accelerometer  = (android_app->sensor_state_mask &
                   (UINT64_C(1) << RETRO_SENSOR_ACCELEROMETER_ENABLE)) &&
                         android_app->accelerometerSensor;
@@ -1162,8 +1028,7 @@ static void android_input_poll_main_cmd(void)
                   (UINT64_C(1) << RETRO_SENSOR_GYROSCOPE_ENABLE)) &&
                         android_app->gyroscopeSensor;
 
-            runloop_st->flags |=  (RUNLOOP_FLAG_PAUSED
-                                 | RUNLOOP_FLAG_IDLE);
+            runloop_set_platform_paused(true);
             video_driver_set_stub_frame();
 
             /* Avoid draining battery while app is not being used. */
@@ -1296,9 +1161,9 @@ static void *android_input_init(const char *joypad_driver)
 
    /* The IME is only reachable if the Java side resolved showKeyboard. */
    if (android_app && android_app->showKeyboard)
-      input_state_get_ptr()->flags |=  INP_FLAG_NATIVE_KB_AVAIL;
+      input_driver_set_native_keyboard_available(true);
    else
-      input_state_get_ptr()->flags &= ~INP_FLAG_NATIVE_KB_AVAIL;
+      input_driver_set_native_keyboard_available(false);
 
    frontend_android_get_version_sdk(&sdk);
 
@@ -1329,8 +1194,7 @@ static void *android_input_init(const char *joypad_driver)
     * Check sensor_state_mask to avoid double-enabling, since
     * ASensorEventQueue_enableSensor is reference-counted. */
    {
-      settings_t *settings = config_get_ptr();
-      bool enable_sensors = !settings || settings->bools.input_sensors_enable;
+      bool enable_sensors = input_config_get_sensors_enable();
 
       if (enable_sensors && !android_app->sensor_state_mask)
       {
@@ -1525,7 +1389,6 @@ static INLINE void android_input_poll_event_type_motion(
    float x, y;
    int32_t tool_type;
    bool is_stylus, is_finger, is_hover_action;
-   settings_t *settings;
    android_stylus_cfg_t stylus_cfg;
    bool side_pressed;
    float pressure, distance;
@@ -1566,14 +1429,10 @@ static INLINE void android_input_poll_event_type_motion(
 
    if (is_stylus)
    {
-      settings = config_get_ptr();
-      if (!settings)
-         return;
-
       if (motion_ptr >= MAX_TOUCH)
          return;
 
-      if (!settings->bools.input_stylus_enable)
+      if (!input_config_get_stylus_enable())
       {
 #ifdef DEBUG_ANDROID_INPUT
          RARCH_LOG("[RA Input] Stylus support disabled - ignoring stylus event\n");
@@ -1587,11 +1446,11 @@ static INLINE void android_input_poll_event_type_motion(
       g_android_stylus_last_event_ns = (int64_t)cpu_features_get_time_usec() * 1000;
 
       stylus_cfg.require_contact      =
-         settings->bools.input_stylus_require_contact_for_click;
+         input_config_get_stylus_require_contact_for_click();
       stylus_cfg.hover_moves_pointer  =
-         settings->bools.input_stylus_hover_moves_pointer;
+         input_config_get_stylus_hover_moves_pointer();
       stylus_cfg.pressure_sensitivity =
-         settings->uints.input_stylus_pressure_sensitivity;
+         input_config_get_stylus_pressure_sensitivity();
 
       buttons         = p_AMotionEvent_getButtonState ?
          AMotionEvent_getButtonState(event) : 0;
@@ -1746,8 +1605,7 @@ static INLINE void android_input_poll_event_type_motion(
          if ((AMotionEvent_getEventTime(event)-AMotionEvent_getDownTime(event))/1000000 < 200)
          {
             /* Prevent the quick tap if a button on the overlay is down */
-            input_driver_state_t *input_st = input_state_get_ptr();
-            if (!(input_st->flags & INP_FLAG_BLOCK_POINTER_INPUT))
+            if (!input_driver_pointer_input_blocked())
                android->quick_tap_time = AMotionEvent_getEventTime(event);
          }
          android->mouse_l = 0;
@@ -2114,7 +1972,6 @@ static int android_input_recover_port(android_input_t *android, int id)
    int vendorId          = 0;
    int productId         = 0;
    int ret               = -1;
-   settings_t *settings  = config_get_ptr();
 
    if (!engine_lookup_name(device_name, &vendorId,
 			   &productId, sizeof(device_name), id))
@@ -2145,7 +2002,7 @@ static int android_input_recover_port(android_input_t *android, int id)
    if (ret < 0)
        return -1;
 
-   if (!settings->bools.android_input_disconnect_workaround)
+   if (!input_config_get_android_disconnect_workaround())
    {
       char stale_name[256];
 
@@ -2177,10 +2034,9 @@ static bool is_configured_as_physical_keyboard(int vendor_id, int product_id, co
     int keyboard_vendor_id;
     int keyboard_product_id;
     char keyboard_name[256];
-    settings_t *settings = config_get_ptr();
 
     {
-        const char *str = settings->arrays.input_android_physical_keyboard;
+        const char *str = input_config_get_android_physical_keyboard();
         char *end       = NULL;
         long vid, pid;
 
@@ -2966,20 +2822,10 @@ static void android_input_reinit(void)
        * destroy the presentation surface while retaining the OpenGL context or
        * Vulkan device. Recreate only the surface when supported before falling
        * back to a full video driver reinitialization. */
-      video_driver_state_t *state = video_state_get_ptr();
-      bool recreated              = false;
-
-#ifdef HAVE_THREADS
-      /* The callback null-checks the hook and reports failure, and the
-       * dispatch reports failure when the worker is gone, so either one
-       * falls through to the full reinitialization below. */
-      recreated = (video_thread_texture_handle(state->context_data,
-               android_ctx_create_surface_cb) != 0);
-#else
-      if (state->current_video_context.create_surface)
-         recreated = state->current_video_context.create_surface(
-               state->context_data);
-#endif
+      /* false when the context cannot be given a surface, when giving
+       * it one failed, or when the video thread is gone: each falls
+       * through to the full reinitialization below. */
+      bool recreated = video_context_surface_create();
 
       if (!recreated)
          command_event(CMD_EVENT_REINIT, NULL);
@@ -3048,7 +2894,6 @@ static void android_input_poll(void *data)
    int timeout;
    struct android_app *android_app = (struct android_app*)g_android;
    android_input_t *android        = (android_input_t*)data;
-   settings_t            *settings = config_get_ptr();
 
    /* Apply any text staged by the native (IME) keyboard. */
    android_keyboard_poll();
@@ -3068,8 +2913,8 @@ static void android_input_poll(void *data)
     * First iteration blocks; once an event has woken us, drain the rest
     * without blocking so a burst (RESUME then INPUT_CHANGED) is handled
     * in one call. */
-   timeout = settings->uints.input_block_timeout;
-   if (runloop_state_get_ptr()->flags & RUNLOOP_FLAG_IDLE)
+   timeout = input_config_get_block_timeout();
+   if (runloop_get_flags() & RUNLOOP_FLAG_IDLE)
       timeout = -1;
 
    while ((ident =
@@ -3433,8 +3278,8 @@ static void android_input_free_input(void *data)
 
    android_keyboard_free();
 
-   input_state_get_ptr()->flags &=
-      ~(INP_FLAG_NATIVE_KB_SHOWN | INP_FLAG_NATIVE_KB_AVAIL);
+   input_driver_set_native_keyboard_shown(false);
+   input_driver_set_native_keyboard_available(false);
 
    free(data);
 }

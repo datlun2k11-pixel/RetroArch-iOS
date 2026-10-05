@@ -1004,6 +1004,46 @@ gfx_ctx_wayland_data_t *gfx_ctx_wl_take_kept(
    return wl;
 }
 
+#ifdef HAVE_LIBDECOR_H
+/* The icon and the tag of a window libdecor decorates. Returns whether
+ * they could be set yet.
+ *
+ * libdecor makes the window's xdg_toplevel only once the compositor
+ * has answered its own start-up. A decoration plugin's start-up waits
+ * for that as a side effect, so with a plugin loaded the toplevel is
+ * there straight after libdecor_decorate(). With none it is not - and
+ * none is what there is when the only plugin installed is the GTK one
+ * and the context starts off the main thread, as it does with
+ * threaded video: that plugin refuses to start there ("Failed to load
+ * plugin 'libdecor-gtk.so'", "No plugins found, falling back on no
+ * decorations"). The toplevel then arrives with the first dispatch.
+ *
+ * Handing a request the NULL is an error libwayland does not recover
+ * from ("null value passed for arg 0"): the connection is dead and
+ * RetroArch exits. So this is called again once the window has been
+ * configured. */
+static bool gfx_ctx_wl_libdecor_identify(gfx_ctx_wayland_data_t *wl)
+{
+   struct xdg_toplevel *xdg_toplevel =
+      wl->libdecor_frame_get_xdg_toplevel(wl->libdecor_frame);
+
+   if (!xdg_toplevel)
+      return false;
+
+   if (wl->xdg_toplevel_icon_manager)
+      wl_create_toplevel_icon(wl, xdg_toplevel);
+
+   if (wl->xdg_toplevel_tag_manager)
+   {
+      xdg_toplevel_tag_manager_v1_set_toplevel_tag(
+         wl->xdg_toplevel_tag_manager, xdg_toplevel, MAIN_WINDOW_TAG);
+      xdg_toplevel_tag_manager_v1_set_toplevel_description(
+         wl->xdg_toplevel_tag_manager, xdg_toplevel, DEFAULT_WINDOW_TITLE " " MAIN_WINDOW_TAG);
+   }
+   return true;
+}
+#endif
+
 bool gfx_ctx_wl_init_common(
       driver_configure_handler_t driver_configure_handler,
       gfx_ctx_wayland_data_t **wwl)
@@ -1236,7 +1276,7 @@ bool gfx_ctx_wl_init_common(
 
    if (wl->libdecor)
    {
-      struct xdg_toplevel *xdg_toplevel;
+      bool identified;
 
       wl->libdecor_frame = wl->libdecor_decorate(wl->libdecor_context, wl->surface, &wl_libdecor_frame_interface, wl);
       if (!wl->libdecor_frame)
@@ -1245,20 +1285,9 @@ bool gfx_ctx_wl_init_common(
          return false;
       }
 
-      xdg_toplevel = wl->libdecor_frame_get_xdg_toplevel(wl->libdecor_frame);
-
-      if (wl->xdg_toplevel_icon_manager)
-      {
-         wl_create_toplevel_icon(wl, xdg_toplevel);
-      }
-
-      if (wl->xdg_toplevel_tag_manager)
-      {
-         xdg_toplevel_tag_manager_v1_set_toplevel_tag(
-            wl->xdg_toplevel_tag_manager, xdg_toplevel, MAIN_WINDOW_TAG);
-         xdg_toplevel_tag_manager_v1_set_toplevel_description(
-            wl->xdg_toplevel_tag_manager, xdg_toplevel, DEFAULT_WINDOW_TITLE " " MAIN_WINDOW_TAG);
-      }
+      /* The window's icon and tag, if libdecor has made the toplevel
+       * already; see gfx_ctx_wl_libdecor_identify(). */
+      identified = gfx_ctx_wl_libdecor_identify(wl);
 
       wl->libdecor_frame_set_app_id(wl->libdecor_frame, WAYLAND_APP_ID);
       wl->libdecor_frame_set_title(wl->libdecor_frame, DEFAULT_WINDOW_TITLE);
@@ -1276,6 +1305,11 @@ bool gfx_ctx_wl_init_common(
             return false;
          }
       }
+
+      /* Configured, so the toplevel is there now if it was not
+       * before; nothing has been drawn to it yet. */
+      if (!identified)
+         gfx_ctx_wl_libdecor_identify(wl);
    }
    else
 #endif
@@ -1358,6 +1392,30 @@ bool gfx_ctx_wl_init_common(
    return true;
 }
 
+static void gfx_ctx_wl_wait_for_fullscreen(gfx_ctx_wayland_data_t *wl,
+      bool fullscreen);
+
+/* A window kept across a reinit is still fullscreen when a windowed
+ * mode is asked for. Leaving fullscreen has to come before the
+ * windowed size is put on the surface: while the compositor still
+ * holds the window fullscreen, a size larger than the screen in either
+ * direction is a protocol error (xdg_wm_base's invalid_surface_state),
+ * and the compositor closes the connection - RetroArch quit when
+ * fullscreen was turned off with a window taller or wider than the
+ * screen. Waits for the compositor to say the window has left. */
+static void gfx_ctx_wl_leave_fullscreen(gfx_ctx_wayland_data_t *wl)
+{
+   if (!wl->fullscreen)
+      return;
+#ifdef HAVE_LIBDECOR_H
+   if (wl->libdecor)
+      wl->libdecor_frame_unset_fullscreen(wl->libdecor_frame);
+   else
+#endif
+      xdg_toplevel_unset_fullscreen(wl->xdg_toplevel);
+   gfx_ctx_wl_wait_for_fullscreen(wl, false);
+}
+
 bool gfx_ctx_wl_set_video_mode_common_size(gfx_ctx_wayland_data_t *wl,
       unsigned width, unsigned height, bool fullscreen)
 {
@@ -1384,6 +1442,9 @@ bool gfx_ctx_wl_set_video_mode_common_size(gfx_ctx_wayland_data_t *wl,
          wl->fractional_scale
             ? FRACTIONAL_SCALE_MULT(bh, wl->fractional_scale_num)
             : bh * wl->buffer_scale);
+
+      /* out of fullscreen first, then the windowed size below */
+      gfx_ctx_wl_leave_fullscreen(wl);
    }
    if (wl->viewport)
    {
@@ -1520,17 +1581,12 @@ bool gfx_ctx_wl_set_video_mode_common_fullscreen(gfx_ctx_wayland_data_t *wl,
        * scripts place the window as a normal one first. */
       gfx_ctx_wl_wait_for_fullscreen(wl, true);
    }
-   else if (wl->fullscreen)
-   {
-      /* A window kept across the reinit is still fullscreen */
-#ifdef HAVE_LIBDECOR_H
-      if (wl->libdecor)
-         wl->libdecor_frame_unset_fullscreen(wl->libdecor_frame);
-      else
-#endif
-         xdg_toplevel_unset_fullscreen(wl->xdg_toplevel);
-      gfx_ctx_wl_wait_for_fullscreen(wl, false);
-   }
+   else
+      /* A window kept across the reinit that is still fullscreen:
+       * gfx_ctx_wl_set_video_mode_common_size() took it out already,
+       * before sizing it; this is for a caller that did not go
+       * through there. */
+      gfx_ctx_wl_leave_fullscreen(wl);
 
    flush_wayland_fd(&wl->input);
 

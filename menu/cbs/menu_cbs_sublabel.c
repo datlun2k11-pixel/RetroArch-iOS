@@ -370,6 +370,7 @@ DEFAULT_SUBLABEL_MACRO(action_bind_sublabel_input_device_type,                ME
 DEFAULT_SUBLABEL_MACRO(action_bind_sublabel_input_device_index,               MENU_ENUM_SUBLABEL_INPUT_DEVICE_INDEX)
 DEFAULT_SUBLABEL_MACRO(action_bind_sublabel_input_mouse_index,                MENU_ENUM_SUBLABEL_INPUT_MOUSE_INDEX)
 DEFAULT_SUBLABEL_MACRO(action_bind_sublabel_input_keyboard_index,             MENU_ENUM_SUBLABEL_INPUT_KEYBOARD_INDEX)
+DEFAULT_SUBLABEL_MACRO(action_bind_sublabel_input_aim_stick,                  MENU_ENUM_SUBLABEL_INPUT_AIM_STICK)
 DEFAULT_SUBLABEL_MACRO(action_bind_sublabel_input_adc_type,                   MENU_ENUM_SUBLABEL_INPUT_ADC_TYPE)
 DEFAULT_SUBLABEL_MACRO(action_bind_sublabel_input_device_reservation_type,    MENU_ENUM_SUBLABEL_INPUT_DEVICE_RESERVATION_TYPE)
 DEFAULT_SUBLABEL_MACRO(action_bind_sublabel_input_device_reserved_device_name, MENU_ENUM_SUBLABEL_INPUT_DEVICE_RESERVED_DEVICE_NAME)
@@ -508,6 +509,7 @@ DEFAULT_SUBLABEL_MACRO(action_bind_sublabel_input_nowinkey_enable,         MENU_
 #endif
 #if defined(_WIN32) && defined(HAVE_WINRAWINPUT)
 DEFAULT_SUBLABEL_MACRO(action_bind_sublabel_input_winraw_xinput_enable,    MENU_ENUM_SUBLABEL_INPUT_WINRAW_XINPUT_ENABLE)
+DEFAULT_SUBLABEL_MACRO(action_bind_sublabel_input_winraw_player_lights,    MENU_ENUM_SUBLABEL_INPUT_WINRAW_PLAYER_LIGHTS)
 #endif
 #ifdef ANDROID
 DEFAULT_SUBLABEL_MACRO(action_bind_sublabel_input_select_physical_keyboard,   MENU_ENUM_SUBLABEL_INPUT_SELECT_PHYSICAL_KEYBOARD)
@@ -2104,6 +2106,7 @@ int menu_cbs_init_bind_sublabel(menu_file_list_cbs_t *cbs,
       { MENU_ENUM_LABEL_REMAP_FILE_REMOVE_CONTENT_DIR, MENU_ENUM_SUBLABEL_REMAP_FILE_REMOVE_CONTENT_DIR },
       { MENU_ENUM_LABEL_REMAP_FILE_REMOVE_CORE, MENU_ENUM_SUBLABEL_REMAP_FILE_REMOVE_CORE },
       { MENU_ENUM_LABEL_REMAP_FILE_RESET, MENU_ENUM_SUBLABEL_REMAP_FILE_RESET },
+      { MENU_ENUM_LABEL_INPUT_REMAP_FIND, MENU_ENUM_SUBLABEL_INPUT_REMAP_FIND },
       { MENU_ENUM_LABEL_REMAP_FILE_FLUSH, MENU_ENUM_SUBLABEL_REMAP_FILE_FLUSH },
       { MENU_ENUM_LABEL_OVERRIDE_FILE_INFO, MENU_ENUM_SUBLABEL_OVERRIDE_FILE_INFO },
       { MENU_ENUM_LABEL_OVERRIDE_FILE_LOAD, MENU_ENUM_SUBLABEL_OVERRIDE_FILE_LOAD },
@@ -3228,6 +3231,9 @@ int menu_cbs_init_bind_sublabel(menu_file_list_cbs_t *cbs,
          case MENU_ENUM_LABEL_INPUT_WINRAW_XINPUT_ENABLE:
             BIND_ACTION_SUBLABEL(cbs, action_bind_sublabel_input_winraw_xinput_enable);
             break;
+         case MENU_ENUM_LABEL_INPUT_WINRAW_PLAYER_LIGHTS:
+            BIND_ACTION_SUBLABEL(cbs, action_bind_sublabel_input_winraw_player_lights);
+            break;
 #endif
 #ifdef ANDROID
          case MENU_ENUM_LABEL_INPUT_SELECT_PHYSICAL_KEYBOARD:
@@ -3905,6 +3911,10 @@ int menu_cbs_init_bind_sublabel(menu_file_list_cbs_t *cbs,
          {
             MENU_ENUM_LABEL_INPUT_KEYBOARD_INDEX,
             action_bind_sublabel_input_keyboard_index
+         },
+         {
+            MENU_ENUM_LABEL_INPUT_AIM_STICK,
+            action_bind_sublabel_input_aim_stick
          },
          {
             MENU_ENUM_LABEL_INPUT_JOYPAD_INDEX,

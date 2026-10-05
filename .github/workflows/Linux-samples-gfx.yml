@@ -75,6 +75,18 @@ jobs:
           # are migrated one at a time; a new one may not join them.
           python3 tools/surface_requirements_check.py
 
+      - name: texture_image request check
+        shell: bash
+        run: |
+          set -eu
+          # image_texture_load reads pix10 as the caller's request for a
+          # 10-bit decode, so a stack image filled field by field asks for
+          # whatever the stack held and a 16-bit PNG comes back as packed
+          # 10-bit words now and then. Every loaded image has its request
+          # set first; the self-test proves an unset one is caught.
+          python3 tools/texture_image_init_check.py --selftest
+          python3 tools/texture_image_init_check.py
+
   samples-gfx:
     name: Build and run samples/gfx
     runs-on: ubuntu-latest
@@ -857,7 +869,7 @@ jobs:
           pkill openbox || true
           sudo kill "$XORG_PID" || true
 
-      - name: Screen Resolution through Mutter's DisplayConfig (ASan + UBSan)
+      - name: Screen Resolution through Mutter's DisplayConfig (ASan + UBSan, TSan)
         shell: bash
         run: |
           set -eu
@@ -885,6 +897,16 @@ jobs:
              && ASAN_OPTIONS=detect_leaks=1 \
                 UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 \
                 XORG="sudo Xorg" timeout 300 ./run.sh)
+          # The worker publishes its state by swapping a pointer and
+          # frees the one it replaced once no reader is inside it, with
+          # no lock.  The threads case reads the list from four threads
+          # while the rate is switched back and forth; freeing the old
+          # state without waiting for the readers is a TSan data race.
+          # The bus cases alone: they need no display server.
+          (cd samples/gfx/mutter_displayconfig \
+             && make clean all SANITIZER=thread \
+             && TSAN_OPTIONS=halt_on_error=1 BUS_ONLY=1 \
+                setarch "$(uname -m)" -R timeout 120 ./run.sh)
           echo "[pass] mutter_displayconfig_test"
 
       - name: Build and run dbus_screensaver_test (ASan + UBSan, TSan)
@@ -1468,6 +1490,22 @@ jobs:
           AUDIO_BYTES_PER_TICK=65536 FRAMES=120 timeout 300 \
              ./gfx_thumbnail_preview_test fixtures/*.mp4 fixtures/anim_lossless.webp
           echo "[pass] gfx_thumbnail_preview_test (ASan)"
+          # HDR previews: with HDR_OUTPUT the stub driver keeps half
+          # floats and shows them as linear scRGB, and the PQ-tagged
+          # fixture must animate as them on the PQ EOTF of its grey; its
+          # SDR twin, and the HDR one without HDR output, must not upload
+          # a single half-float frame. Both decode paths: the poll's own
+          # here, the worker's jobs in the threaded build below.
+          HDRFX=../../formats/video_hdr_fp16/fixtures
+          for bin in gfx_thumbnail_preview_test gfx_thumbnail_preview_test_threaded; do
+             ASAN_OPTIONS=detect_leaks=1 NOAUDIO=1 THREADS=4 FRAMES=60 \
+             HDR_OUTPUT=1 HDR_EXPECT=1 timeout 120 ./$bin $HDRFX/hdr_hevc.mp4
+             ASAN_OPTIONS=detect_leaks=1 NOAUDIO=1 THREADS=4 FRAMES=60 \
+             HDR_OUTPUT=1 timeout 120 ./$bin $HDRFX/sdr_hevc.mp4
+             ASAN_OPTIONS=detect_leaks=1 NOAUDIO=1 THREADS=4 FRAMES=60 \
+             timeout 120 ./$bin $HDRFX/hdr_hevc.mp4
+          done
+          echo "[pass] gfx_thumbnail_preview HDR lanes"
           # The same session with HAVE_THREADS: the thumbnail decodes on
           # its worker and the pool, the app's own path, paced at a
           # display's rate with a bound on the longest stall.

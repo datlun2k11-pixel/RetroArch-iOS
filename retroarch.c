@@ -4180,7 +4180,6 @@ bool command_event(enum event_command cmd, void *data)
          {
             bool load_dummy_core            = data ? *(bool*)data : true;
             content_ctx_info_t content_info = {0};
-            video_driver_state_t *video_st  = video_state_get_ptr();
             rarch_system_info_t *sys_info   = &runloop_st->system;
             uint8_t flags                   = content_get_flags();
 
@@ -4228,15 +4227,10 @@ bool command_event(enum event_command cmd, void *data)
                /* Reload the original config */
                config_unload_override();
 
+               /* an override that had asked for fullscreen is gone */
                if (!settings->bools.video_fullscreen)
-               {
-                  input_driver_state_t *input_st = input_state_get_ptr();
-                  if (     video_st->poke
-                        && video_st->poke->show_mouse)
-                     video_st->poke->show_mouse(video_st->data, true);
-                  if (input_driver_ungrab_mouse())
-                     input_st->flags &= ~INP_FLAG_GRAB_MOUSE_STATE;
-               }
+                  input_pointer_capture_release(INPUT_CAPTURE_FULLSCREEN
+                        | INPUT_CAPTURE_FULLSCREEN_CURSOR);
             }
 #endif
 
@@ -4276,7 +4270,17 @@ bool command_event(enum event_command cmd, void *data)
 #endif
 #ifdef HAVE_DYNAMIC
             path_clear(RARCH_PATH_CORE);
-            runloop_system_info_free();
+            /* A staged load closes the old core a frame from now, and
+             * that core's deinit may still save its remap file - it
+             * does when unloading an override above loaded the file
+             * again. The save keeps a disabled button only if the
+             * core described it, and those descriptions are system
+             * information: freed here, they were gone by then and
+             * every disabled button was dropped from the file. The
+             * core's deinit frees the system information itself,
+             * after it has saved. */
+            if (!runloop_st->content_switching)
+               runloop_system_info_free();
 #endif
             {
                audio_driver_state_t
@@ -5692,8 +5696,6 @@ bool command_event(enum event_command cmd, void *data)
          {
             audio_driver_state_t
                *audio_st              = audio_state_get_ptr();
-            input_driver_state_t
-               *input_st              = input_state_get_ptr();
             bool *userdata            = (bool*)data;
             bool video_fullscreen     = settings->bools.video_fullscreen;
             bool ra_is_forced_fs      = ((uint32_t)retro_atomic_load_relaxed_int(&video_st->flags) &
@@ -5732,24 +5734,11 @@ bool command_event(enum event_command cmd, void *data)
                         video_driver_window_dims(new_fullscreen_state),
                         new_fullscreen_state))
                command_event(CMD_EVENT_REINIT, NULL);
-            if (video_fullscreen)
-            {
-               if (     video_st->poke
-                     && video_st->poke->show_mouse)
-                  video_st->poke->show_mouse(video_st->data, false);
-               if (!settings->bools.video_windowed_fullscreen)
-                  if (input_driver_grab_mouse())
-                     input_st->flags |= INP_FLAG_GRAB_MOUSE_STATE;
-            }
-            else
-            {
-               if (     video_st->poke
-                     && video_st->poke->show_mouse)
-                  video_st->poke->show_mouse(video_st->data, true);
-               if (!settings->bools.video_windowed_fullscreen)
-                  if (input_driver_ungrab_mouse())
-                     input_st->flags &= ~INP_FLAG_GRAB_MOUSE_STATE;
-            }
+            /* fullscreen hides the cursor, and exclusive fullscreen
+             * grabs; leaving it lets go of that and of nothing else */
+            input_pointer_capture_set_fullscreen(video_fullscreen,
+                  !settings->bools.video_windowed_fullscreen);
+            input_pointer_capture_apply(false);
 #ifdef HAVE_OVERLAY
             input_overlay_check_mouse_cursor();
 #endif
@@ -5901,44 +5890,8 @@ bool command_event(enum event_command cmd, void *data)
                settings->bools.input_turbo_enable, !settings->bools.input_turbo_enable);
          break;
       case CMD_EVENT_GRAB_MOUSE_TOGGLE:
-         {
-            bool ret              = false;
-            input_driver_state_t
-               *input_st          = input_state_get_ptr();
-            bool grab_mouse_state = !(input_st->flags &
-                  INP_FLAG_GRAB_MOUSE_STATE);
-
-            if (grab_mouse_state)
-            {
-               if ((ret = input_driver_grab_mouse()))
-                  input_st->flags |= INP_FLAG_GRAB_MOUSE_STATE;
-            }
-            else
-            {
-               if ((ret = input_driver_ungrab_mouse()))
-                  input_st->flags &= ~INP_FLAG_GRAB_MOUSE_STATE;
-            }
-
-            if (!ret)
-               return false;
-
-            RARCH_DBG("[Input] %s => %s\n",
-                  msg_hash_to_str(MSG_GRAB_MOUSE_STATE),
-                  grab_mouse_state ? "ON" : "OFF");
-
-            if (grab_mouse_state)
-            {
-               if (     video_st->poke
-                     && video_st->poke->show_mouse)
-                  video_st->poke->show_mouse(video_st->data, false);
-            }
-            else
-            {
-               if (     video_st->poke
-                     && video_st->poke->show_mouse)
-                  video_st->poke->show_mouse(video_st->data, true);
-            }
-         }
+         if (!input_pointer_capture_toggle())
+            return false;
          break;
       case CMD_EVENT_UI_COMPANION_TOGGLE:
          {
@@ -5955,9 +5908,6 @@ bool command_event(enum event_command cmd, void *data)
          break;
       case CMD_EVENT_GAME_FOCUS_TOGGLE:
          {
-            bool video_fullscreen                         =
-                  settings->bools.video_fullscreen
-               || ((uint32_t)retro_atomic_load_relaxed_int(&video_st->flags) & VIDEO_FLAG_FORCE_FULLSCREEN);
             enum input_game_focus_cmd_type game_focus_cmd = GAME_FOCUS_CMD_TOGGLE;
             input_driver_state_t
                *input_st                                  = input_state_get_ptr();
@@ -6017,24 +5967,12 @@ bool command_event(enum event_command cmd, void *data)
                input_driver_state_t
                   *input_st          = input_state_get_ptr();
 
+               /* game focus holds the pointer while it is on; off, the
+                * pointer stays captured for whatever else wants it */
                if (input_st->game_focus_state.enabled)
-               {
-                  if (input_driver_grab_mouse())
-                     input_st->flags |= INP_FLAG_GRAB_MOUSE_STATE;
-                  if (     video_st->poke
-                        && video_st->poke->show_mouse)
-                     video_st->poke->show_mouse(video_st->data, false);
-               }
-               /* Ungrab only if windowed and auto mouse grab is disabled */
-               else if (!video_fullscreen
-                     && !settings->bools.input_auto_mouse_grab)
-               {
-                  if (input_driver_ungrab_mouse())
-                     input_st->flags &= ~INP_FLAG_GRAB_MOUSE_STATE;
-                  if (     video_st->poke
-                        && video_st->poke->show_mouse)
-                     video_st->poke->show_mouse(video_st->data, true);
-               }
+                  input_pointer_capture_hold(INPUT_CAPTURE_GAME_FOCUS);
+               else
+                  input_pointer_capture_release(INPUT_CAPTURE_GAME_FOCUS);
 
                if (input_st->game_focus_state.enabled)
                   input_st->flags |=  INP_FLAG_BLOCK_HOTKEY
@@ -6483,6 +6421,75 @@ static void sdl_exit(void)
 }
 #endif
 
+/* The platform is taking the application away and may not give it
+ * back - Android, when the activity is paused. Everything that would
+ * otherwise only be written by retroarch_main_quit() is written now:
+ * SRAM, core options and the main config. */
+void retroarch_save_for_suspend(void)
+{
+   settings_t *settings        = config_get_ptr();
+
+   /* Config subsystem is not up yet - nothing to persist. */
+   if (!settings)
+      return;
+
+   /* SRAM first: it is the more expensive of the two, and the more
+    * painful to lose. Non-SRAM cores make this a no-op.
+    *
+    * Only flush while content is actually loaded. APP_CMD_PAUSE can be
+    * delivered while frontend_unix_init() is still pumping events
+    * waiting for the window (activity created, then immediately
+    * backgrounded / screen locked), long before any core exists - and,
+    * worse, while a previous activity instance in the same process may
+    * still be mid-teardown, leaving runloop_state.current_core in a
+    * transient state. There is nothing to save in either case:
+    * CMD_EVENT_SAVE_FILES exists to persist SRAM and game-specific
+    * cheats, both of which require loaded content. */
+   if (runloop_content_loaded())
+      command_event(CMD_EVENT_SAVE_FILES, NULL);
+
+   /* Core options: written unconditionally on core unload, so not
+    * gated on config_save_on_exit here either. Without this, option
+    * changes are lost whenever the process is killed in the
+    * background, e.g. swiped away from Recents. No-op when no core
+    * with options is loaded. */
+   runloop_core_options_save();
+
+   if (settings->bools.config_save_on_exit)
+   {
+      const char *configured_driver = video_driver_get_configured_ident();
+      char live_driver[32];
+
+      live_driver[0] = '\0';
+
+      /* A core that forces its own renderer overwrites video_driver
+       * with the forced name and parks the configured one in
+       * cached_driver_id. Writing the config in that state persists the
+       * core's choice as the user's, so a driver picked from the menu
+       * is silently replaced by whatever the last loaded core wanted.
+       * main_exit() restores the cached name before it saves; do the
+       * same here.
+       *
+       * Unlike main_exit(), swap the live value back afterwards: the
+       * activity may be resumed, and the renderer actually in use does
+       * not change just because the app went to the background. */
+      if (configured_driver)
+      {
+         strlcpy(live_driver, settings->arrays.video_driver,
+               sizeof(live_driver));
+         configuration_set_string(settings,
+               settings->arrays.video_driver,
+               configured_driver);
+      }
+
+      command_event(CMD_EVENT_MENU_SAVE_CURRENT_CONFIG, NULL);
+
+      if (live_driver[0])
+         configuration_set_string(settings,
+               settings->arrays.video_driver, live_driver);
+   }
+}
+
 /**
  * main_exit:
  *
@@ -6515,6 +6522,11 @@ void main_exit(void *args)
    settings_t     *settings     = config_get_ptr();
 
    retroarch_drain_tasks_for_exit();
+#ifdef HAVE_CLOUDSYNC
+   /* A blocking cloud sync driver's worker: one bounded wait on the
+    * way out, so no driver call runs into the teardown below. */
+   cloud_sync_deinit(1000);
+#endif
 
    video_driver_restore_cached(settings);
 
@@ -7882,6 +7894,14 @@ static bool retroarch_parse_input_and_config(
       runloop_set_current_core_type(CORE_TYPE_DUMMY, false);
 
    path_clear(RARCH_PATH_SUBSYSTEM);
+   /* A load names its saves after its own content, or after the core
+    * when it has none: the content argument parsed below sets them
+    * again, and -s / -S override them after that. */
+   path_clear(RARCH_PATH_BASENAME);
+   *runloop_st->name.savefile      = '\0';
+   *runloop_st->name.savestate     = '\0';
+   *runloop_st->name.replay        = '\0';
+   *runloop_st->name.cheatfile     = '\0';
 
    retroarch_override_setting_free_state();
 
@@ -8733,7 +8753,9 @@ bool retroarch_main_init_core(int argc, char *argv[],
 
    core_info_set_savestate_probe(retroarch_core_info_savestate_probe);
 
-   input_st->osk_idx             = OSK_LOWERCASE_LATIN;
+#ifdef HAVE_MENU
+   menu_st->osk_idx              = OSK_LOWERCASE_LATIN;
+#endif
    /* The active bits answer the core's GET_AV_ENABLE during its init.
     * Staged, the previous session's drivers are still up and present
     * between stages, so the bits keep saying what those drivers can
@@ -9138,7 +9160,9 @@ bool retroarch_main_init_drivers(bool staged,
    command_event(CMD_EVENT_CONTROLLER_INIT, NULL);
 
 #ifdef HAVE_REWIND
-   command_event(CMD_EVENT_REWIND_INIT, NULL);
+   /* Set up on the frame after the load, before the core runs: the
+    * buffer is one full serialize of the core */
+   runloop_st->rewind_st.flags |= STATE_MGR_REWIND_ST_FLAG_INIT_PENDING;
 #endif
 
    if (*rec_st->path)

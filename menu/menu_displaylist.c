@@ -2471,12 +2471,19 @@ static unsigned menu_displaylist_parse_display_edid(file_list_t *list)
    {
       /* Nothing to show, and two quite different reasons for it: the
        * display server has no way to read one, or it has and the
-       * display in use carries none. Say what would. */
+       * display in use carries none. Say what would. On Android the
+       * usual case is a phone or tablet panel, whose EDID the system
+       * keeps from apps; laptops and DDC do not come into it. */
+#if defined(ANDROID)
+      enum msg_hash_enums why = MENU_ENUM_LABEL_VALUE_DISPLAY_EDID_UNAVAILABLE_ANDROID;
+#else
+      enum msg_hash_enums why = MENU_ENUM_LABEL_VALUE_DISPLAY_EDID_UNAVAILABLE;
+#endif
       if (menu_displaylist_edid_line(list, MENU_ENUM_LABEL_VALUE_DISPLAY_EDID_SOURCE,
             msg_hash_to_str(MENU_ENUM_LABEL_VALUE_NOT_AVAILABLE)))
          count++;
       if (menu_entries_append(list,
-            msg_hash_to_str(MENU_ENUM_LABEL_VALUE_DISPLAY_EDID_UNAVAILABLE), "",
+            msg_hash_to_str(why), "",
             MENU_ENUM_LABEL_DISPLAY_EDID_ENTRY, MENU_SETTINGS_CORE_INFO_NONE,
             0, 0, NULL))
          count++;
@@ -7169,9 +7176,7 @@ static int menu_displaylist_parse_input_select_physical_keyboard_list(
     int i                         = 0;
     char keyboard[sizeof(settings->arrays.input_android_physical_keyboard)];
     bool keyboard_added           = false;
-    input_driver_state_t *st      = input_state_get_ptr();
-    input_driver_t *current_input = st->current_driver;
-    bool is_android_driver        = !strcmp(current_input->ident, "android");
+    bool is_android_driver        = string_is_equal(input_driver_get_ident(), "android");
 
     device_lbl[0]                 = '\0';
 
@@ -7215,7 +7220,7 @@ static int menu_displaylist_parse_input_select_physical_keyboard_list(
             /*
              * Skip devices that do not look like keyboards
              */
-            if (!android_input_can_be_keyboard(st->current_data, i))
+            if (!android_input_can_be_keyboard(input_driver_current_data(), i))
                 continue;
 
             const char *device_name =   input_config_get_device_display_name(i)
@@ -9062,23 +9067,22 @@ unsigned menu_displaylist_build_list(
          {
             char os_ver[64];
             int major, minor;
-            input_driver_t *current_input =
-                  input_state_get_ptr()->current_driver;
+            const char *input_ident     = input_driver_get_ident();
             const frontend_ctx_driver_t *frontend =
                   frontend_get_ptr();
 
             if (frontend && frontend->get_os)
                frontend->get_os(os_ver, sizeof(os_ver), &major, &minor);
 
-            if (current_input->keypress_vibrate)
+            if (input_driver_has_keypress_vibrate())
                if (MENU_DISPLAYLIST_PARSE_SETTINGS_ENUM(list,
                         MENU_ENUM_LABEL_VIBRATE_ON_KEYPRESS,
                         PARSE_ONLY_BOOL, false) == 0)
                   count++;
 
             /* TODO/FIXME - should we dehardcode this? */
-            if (         !strcmp(current_input->ident, "android")
-                  ||    (!strcmp(current_input->ident, "cocoa")
+            if (         !strcmp(input_ident, "android")
+                  ||    (!strcmp(input_ident, "cocoa")
                      &&  !strcmp(os_ver, "iOS")))
                if (MENU_DISPLAYLIST_PARSE_SETTINGS_ENUM(list,
                         MENU_ENUM_LABEL_ENABLE_DEVICE_VIBRATION,
@@ -10028,6 +10032,7 @@ unsigned menu_displaylist_build_list(
 #endif
 #if defined(_WIN32) && defined(HAVE_WINRAWINPUT)
                {MENU_ENUM_LABEL_INPUT_WINRAW_XINPUT_ENABLE,            PARSE_ONLY_BOOL,  true},
+               {MENU_ENUM_LABEL_INPUT_WINRAW_PLAYER_LIGHTS,            PARSE_ONLY_BOOL,  true},
 #endif
 #ifdef ANDROID
                {MENU_ENUM_LABEL_ANDROID_INPUT_DISCONNECT_WORKAROUND,   PARSE_ONLY_BOOL,  true},
@@ -13095,6 +13100,14 @@ unsigned menu_displaylist_build_list(
                {MENU_ENUM_LABEL_CLOUD_SYNC_ACCESS_KEY_ID,      PARSE_ONLY_STRING,         false},
                {MENU_ENUM_LABEL_CLOUD_SYNC_SECRET_ACCESS_KEY,  PARSE_ONLY_STRING,         false},
 #endif
+               /* The SMB and NFS drivers use the network share settings:
+                * the entry that opens them, under the driver using them. */
+#ifdef HAVE_SMBCLIENT
+               {MENU_ENUM_LABEL_SMB_CLIENT_SETTINGS,           PARSE_ACTION,              false},
+#endif
+#ifdef HAVE_NFSCLIENT
+               {MENU_ENUM_LABEL_NFS_CLIENT_SETTINGS,           PARSE_ACTION,              false},
+#endif
             };
 
             for (i = 0; i < ARRAY_SIZE(build_list); i++)
@@ -13112,6 +13125,18 @@ unsigned menu_displaylist_build_list(
                      build_list[i].checked =
                            string_is_equal(settings->arrays.cloud_sync_driver, "s3");
                      break;
+#ifdef HAVE_SMBCLIENT
+                  case MENU_ENUM_LABEL_SMB_CLIENT_SETTINGS:
+                     build_list[i].checked =
+                           string_is_equal(settings->arrays.cloud_sync_driver, "smb");
+                     break;
+#endif
+#ifdef HAVE_NFSCLIENT
+                  case MENU_ENUM_LABEL_NFS_CLIENT_SETTINGS:
+                     build_list[i].checked =
+                           string_is_equal(settings->arrays.cloud_sync_driver, "nfs");
+                     break;
+#endif
                   default:
                      break;
                   }
@@ -14618,6 +14643,14 @@ static bool menu_displaylist_ctl_internal(
                         || device == RETRO_DEVICE_KEYBOARD)
                   {
                      const char *val_port = msg_hash_to_str(MENU_ENUM_LABEL_VALUE_PORT);
+
+                     /* press a button, land on its entry below */
+                     if (menu_entries_append(list,
+                           msg_hash_to_str(MENU_ENUM_LABEL_VALUE_INPUT_REMAP_FIND),
+                           MENU_ENUM_LABEL_INPUT_REMAP_FIND_STR,
+                           MENU_ENUM_LABEL_INPUT_REMAP_FIND,
+                           MENU_SETTING_ACTION, 0, port, NULL))
+                        count++;
                      for (j = 0; j < RARCH_ANALOG_BIND_LIST_END; j++)
                      {
                         char descriptor[300];

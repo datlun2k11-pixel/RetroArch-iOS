@@ -3078,6 +3078,12 @@ static bool rgui_load_image(
       return false;
    }
 
+   /* The load asks for 10-bit wherever the driver samples it, and RGUI
+    * draws in software from 8-bit ARGB words: a 16-bit PNG comes here
+    * as packed XRGB2101010, narrowed back to the words it reads. */
+   if (((struct texture_image*)data)->pix10)
+      image_texture_narrow_10bit((struct texture_image*)data);
+
    switch (type)
    {
       case MENU_IMAGE_WALLPAPER:
@@ -5318,11 +5324,13 @@ RGUI_NOINLINE static void rgui_render_osk(
    unsigned osk_width, osk_height;
    unsigned osk_x, osk_y;
 
-   input_driver_state_t *input_st = input_state_get_ptr();
-   int osk_ptr                    = input_st->osk_ptr;
-   char **osk_grid                = input_st->osk_grid;
-   const char *input_str          = menu_input_dialog_get_buffer();
+   size_t line_cursor             = 0;
+   const char *line_text          = input_driver_keyboard_line_view(&line_cursor);
+   bool textbox_focus             = input_driver_keyboard_textbox_focus();
    struct menu_state *menu_st     = menu_state_get_ptr();
+   int osk_ptr                    = menu_st->osk_ptr;
+   char **osk_grid                = menu_st->osk_grid;
+   const char *input_str          = menu_input_dialog_get_buffer();
    const char *input_label        = menu_st->input_dialog_kb_label;
    /* A system keyboard panel is up and owns text entry: draw the
     * label and the entry field, but not a second set of keys on top
@@ -5477,16 +5485,14 @@ RGUI_NOINLINE static void rgui_render_osk(
       size_t cursor_ptr                     = input_str_cursor;
       const char *input_str_visible         = NULL;
 
-      if (input_str && input_st->keyboard_line.buffer)
+      if (input_str && line_text)
       {
-         size_t ptr         = input_st->keyboard_line.ptr;
-         const char *cursor = input_st->keyboard_line.buffer;
+         size_t ptr         = line_cursor;
+         const char *cursor = line_text;
          const char *end;
 
          input_str_cursor   = 0;
 
-         if (ptr > input_st->keyboard_line.size)
-            ptr = input_st->keyboard_line.size;
          cursor_ptr = ptr;
          end = cursor + ptr;
 
@@ -5517,14 +5523,14 @@ RGUI_NOINLINE static void rgui_render_osk(
                                        + ((input_str_cursor - input_str_char_offset)
                                              * rgui->font_width_stride);
 
-      if ((last_cursor_buffer != input_st->keyboard_line.buffer) || (last_cursor_ptr != cursor_ptr))
+      if ((last_cursor_buffer != line_text) || (last_cursor_ptr != cursor_ptr))
       {
-         last_cursor_buffer = input_st->keyboard_line.buffer;
+         last_cursor_buffer = line_text;
          last_cursor_ptr    = cursor_ptr;
          last_cursor_time   = current_time;
       }
 
-      if (input_st->osk_textbox_focus)
+      if (textbox_focus)
       {
          unsigned input_ptr_x      = osk_x + 5;
          unsigned input_ptr_y      = osk_y + 5;
@@ -5621,7 +5627,7 @@ RGUI_NOINLINE static void rgui_render_osk(
                rgui->colors.normal_color, rgui->colors.shadow_color);
 
       /* Draw selection pointer */
-      if (!input_st->osk_textbox_focus && (key_index == osk_ptr))
+      if (!textbox_focus && (key_index == osk_ptr))
       {
          unsigned osk_ptr_x = osk_x + keyboard_offset_x + ptr_offset_x + (key_column * key_width);
          unsigned osk_ptr_y = osk_y + keyboard_offset_y + ptr_offset_y + (key_row    * key_height);

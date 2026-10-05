@@ -76,6 +76,7 @@
  *
  * Nothing is stubbed. */
 #include <stdio.h>
+#include <sys/stat.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -98,11 +99,14 @@
 #include "../../../retroarch.h"
 #include "../../../configuration.h"
 #include "../../../command.h"
+#include "../../../content.h"
+#include "../../../tasks/task_content.h"
 #include "../../../verbosity.h"
 #include "../../../frontend/frontend_driver.h"
 #include "../../../gfx/video_driver.h"
 #include "../../../input/input_driver.h"
 #include "../../../input/input_registry.h"
+#include "../../../input/input_remapping.h"
 #include "../../../tasks/tasks_internal.h"
 #include "../../../menu/menu_driver.h"
 
@@ -1710,6 +1714,109 @@ static void lane_socd(void)
 #endif
 }
 
+/* A user whose controls are all mapped to themselves costs the poll
+ * no remap work, and the core sees exactly what it did: a control
+ * mapped to another still arrives as the other, one switched off does
+ * not arrive, and taking the mapping away again leaves nothing of it
+ * behind. */
+#if defined(HAVE_TEST_DRIVERS) && !defined(_WIN32)
+static unsigned remap_frame(unsigned id, void (*trace_last)(unsigned*, int*))
+{
+   unsigned seen;
+   int axes[4];
+   syn_buttons = 1u << (input_autoconf_binds[0][id].joykey & 31);
+   run_loop_frames(1);
+   trace_last(&seen, axes);
+   syn_buttons = 0;
+   return seen;
+}
+#endif
+
+static void lane_remap_idle(void)
+{
+#if defined(HAVE_TEST_DRIVERS) && !defined(_WIN32)
+   const unsigned B = RETRO_DEVICE_ID_JOYPAD_B;
+   const unsigned A = RETRO_DEVICE_ID_JOYPAD_A;
+   input_driver_state_t *input_st = input_state_get_ptr();
+   settings_t *settings           = config_get_ptr();
+   const input_device_driver_t *joypad_real;
+   void (*trace)(int, int);
+   void (*trace_last)(unsigned*, int*);
+   void    *core;
+   unsigned had = failures;
+   unsigned reading, was;
+
+   if (   !(core = dlopen(core_path_g, RTLD_NOW))
+       || !(trace = (void (*)(int, int))dlsym(core, "harness_core_trace"))
+       || !(trace_last = (void (*)(unsigned*, int*))dlsym(core, "harness_core_trace_last"))
+       || !input_st->primary_joypad)
+   {
+      CHECK(false, "remap idle: the harness core's trace entry points or the joypad driver");
+      return;
+   }
+   joypad_real              = input_st->primary_joypad;
+   syn_joypad               = *joypad_real;
+   syn_joypad.button        = syn_button;
+   syn_joypad.axis          = syn_axis;
+   syn_joypad.state         = syn_state;
+   syn_joypad.get_buttons   = syn_get_buttons;
+   input_st->primary_joypad = &syn_joypad;
+   syn_hat = 0;
+   memset(syn_axes, 0, sizeof(syn_axes));
+   fast_forward(true);
+   was = settings->uints.input_remap_ids[0][B];
+
+   for (reading = 2; reading >= 1; reading--)
+   {
+      trace((int)reading, 0);
+
+      /* nothing mapped: B is B, and the poll did no remap work */
+      settings->uints.input_remap_ids[0][B] = B;
+      run_loop_frames(2);
+      CHECK(remap_frame(B, trace_last) == (1u << B),
+            "remap idle: with nothing mapped, B does not reach the core as B");
+      CHECK(!(input_st->remap_worked & 1u),
+            "remap idle: with nothing mapped the poll still did the first user's remap work");
+
+      /* B given to A */
+      settings->uints.input_remap_ids[0][B] = A;
+      CHECK(remap_frame(B, trace_last) == (1u << A),
+            "remap idle: B mapped to A does not reach the core as A alone");
+      CHECK(input_st->remap_worked & 1u,
+            "remap idle: with B mapped to A the poll did no remap work");
+
+      /* B switched off */
+      settings->uints.input_remap_ids[0][B] = RARCH_UNMAPPED;
+      CHECK(remap_frame(B, trace_last) == 0,
+            "remap idle: B switched off still reaches the core");
+
+      /* and back: nothing of the mapping is left */
+      settings->uints.input_remap_ids[0][B] = A;
+      syn_buttons = 1u << (input_autoconf_binds[0][B].joykey & 31);
+      run_loop_frames(1);
+      settings->uints.input_remap_ids[0][B] = B;
+      CHECK(remap_frame(B, trace_last) == (1u << B),
+            "remap idle: after the mapping was taken away, B is not B again, or A is still held");
+      CHECK(!(input_st->remap_worked & 1u),
+            "remap idle: after the mapping was taken away the poll kept doing remap work");
+   }
+
+   settings->uints.input_remap_ids[0][B] = was;
+   syn_buttons = 0;
+   trace(0, 0);
+   fast_forward(false);
+   run_loop_frames(5);
+   input_st->primary_joypad = joypad_real;
+   dlclose(core);
+   if (failures == had)
+      printf("[pass] remap idle: a user with nothing mapped costs the poll no"
+            " remap work; mapped, switched off and mapped back, the core sees"
+            " what it should, whichever way it reads\n");
+#else
+   printf("[skip] remap idle: needs the test drivers\n");
+#endif
+}
+
 /* Input rotation: the D-Pad and the sticks a core sees, turned by
  * quarter turns. */
 static void lane_input_rotation(void)
@@ -1985,6 +2092,173 @@ static void lane_triggers(void)
 #endif
 }
 
+#if defined(HAVE_TEST_DRIVERS) && !defined(_WIN32)
+/* Remapped pressure lane: the scripted pad's @buttons held and axes 2
+ * and 3 at @a2 and @a3 for a frame; what the core saw of A and B as
+ * buttons, and A's and B's analog values. */
+static unsigned pressure_frame(uint32_t buttons, int a2, int a3,
+      void (*trace_last)(unsigned*, int*), int *a, int *b)
+{
+   unsigned seen;
+   int axes[4];
+   syn_buttons = buttons;
+   syn_axes[2] = (int16_t)a2;
+   syn_axes[3] = (int16_t)a3;
+   run_loop_frames(1);
+   trace_last(&seen, axes);
+   *a = input_driver_state_wrapper(0, RETRO_DEVICE_ANALOG,
+         RETRO_DEVICE_INDEX_ANALOG_BUTTON, RETRO_DEVICE_ID_JOYPAD_A);
+   *b = input_driver_state_wrapper(0, RETRO_DEVICE_ANALOG,
+         RETRO_DEVICE_INDEX_ANALOG_BUTTON, RETRO_DEVICE_ID_JOYPAD_B);
+   return seen & (  (1u << RETRO_DEVICE_ID_JOYPAD_A)
+                  | (1u << RETRO_DEVICE_ID_JOYPAD_B));
+}
+#endif
+
+/* A button remapped onto another carries its pressure with it. */
+static void lane_remap_pressure(void)
+{
+#if defined(HAVE_TEST_DRIVERS) && !defined(_WIN32)
+   const unsigned A = 1u << RETRO_DEVICE_ID_JOYPAD_A;
+   const unsigned B = 1u << RETRO_DEVICE_ID_JOYPAD_B;
+   input_driver_state_t *input_st = input_state_get_ptr();
+   settings_t *settings           = config_get_ptr();
+   unsigned *remap                = settings->uints.input_remap_ids[0];
+   struct retro_keybind *a_bind   = &input_autoconf_binds[0][RETRO_DEVICE_ID_JOYPAD_A];
+   struct retro_keybind *b_bind   = &input_autoconf_binds[0][RETRO_DEVICE_ID_JOYPAD_B];
+   struct retro_keybind saved_a   = *a_bind;
+   struct retro_keybind saved_b   = *b_bind;
+   bool analog_requested          = input_st->analog_requested[0];
+   const input_device_driver_t *joypad_real;
+   void (*trace)(int, int);
+   void (*trace_last)(unsigned*, int*);
+   void    *core;
+   unsigned had = failures;
+   unsigned seen;
+   uint32_t a_btn, b_btn;
+   int16_t  stick;
+   int      a, b, x;
+
+   if (   !(core = dlopen(core_path_g, RTLD_NOW))
+       || !(trace = (void (*)(int, int))dlsym(core, "harness_core_trace"))
+       || !(trace_last = (void (*)(unsigned*, int*))dlsym(core, "harness_core_trace_last"))
+       || !input_st->primary_joypad
+       || a_bind->joykey >= 32 || b_bind->joykey >= 32)
+   {
+      CHECK(false, "remapped pressure: the harness core's trace entry points,"
+            " the joypad driver or A's and B's buttons");
+      return;
+   }
+   joypad_real              = input_st->primary_joypad;
+   syn_joypad               = *joypad_real;
+   syn_joypad.button        = syn_button;
+   syn_joypad.axis          = syn_axis;
+   syn_joypad.state         = syn_state;
+   syn_joypad.get_buttons   = syn_get_buttons;
+   input_st->primary_joypad = &syn_joypad;
+   input_driver_set_snapshot_bridge(true);
+   syn_hat     = 0;
+   syn_buttons = 0;
+   memset(syn_axes, 0, sizeof(syn_axes));
+   fast_forward(true);
+   trace(2, 0);
+
+   a_btn           = 1u << a_bind->joykey;
+   b_btn           = 1u << b_bind->joykey;
+   a_bind->joyaxis = AXIS_POS(2);
+   b_bind->joyaxis = AXIS_POS(3);
+
+   /* not remapped: as before */
+   pressure_frame(0, 0, 0, trace_last, &a, &b);
+   seen = pressure_frame(a_btn, 20000, 0, trace_last, &a, &b);
+   CHECK(seen == A && a == 20000 && !b,
+         "remapped pressure: not remapped, A's pressure is not A's");
+   seen = pressure_frame(a_btn, 0, 0, trace_last, &a, &b);
+   CHECK(seen == A && a == 0x7fff,
+         "remapped pressure: not remapped, a press without pressure is not a full press");
+
+   /* A onto B */
+   remap[RETRO_DEVICE_ID_JOYPAD_A] = RETRO_DEVICE_ID_JOYPAD_B;
+   pressure_frame(0, 0, 0, trace_last, &a, &b);
+   seen = pressure_frame(a_btn, 20000, 0, trace_last, &a, &b);
+   CHECK(seen == B && b == 20000 && !a,
+         "remapped pressure: A onto B, B's pressure is not A's");
+   seen = pressure_frame(0, 0, 0, trace_last, &a, &b);
+   CHECK(!seen && !a && !b,
+         "remapped pressure: A onto B, released, a press is left behind");
+
+   /* A and B both onto B: the harder press */
+   seen = pressure_frame(a_btn | b_btn, 20000, 10000, trace_last, &a, &b);
+   CHECK(seen == B && b == 20000 && !a,
+         "remapped pressure: A and B onto B, A pressed harder, B is not A's");
+   seen = pressure_frame(a_btn | b_btn, 5000, 10000, trace_last, &a, &b);
+   CHECK(seen == B && b == 10000 && !a,
+         "remapped pressure: A and B onto B, B pressed harder, B is not B's");
+
+   /* swapped */
+   remap[RETRO_DEVICE_ID_JOYPAD_B] = RETRO_DEVICE_ID_JOYPAD_A;
+   seen = pressure_frame(a_btn | b_btn, 20000, 10000, trace_last, &a, &b);
+   CHECK(seen == (A | B) && b == 20000 && a == 10000,
+         "remapped pressure: A and B swapped, the pressures are not swapped");
+
+   /* a button without a pressure axis gives a full press */
+   a_bind->joyaxis = AXIS_NONE;
+   seen = pressure_frame(a_btn, 0, 0, trace_last, &a, &b);
+   CHECK(seen == B && b == 0x7fff && !a,
+         "remapped pressure: A onto B without an axis, not a full press");
+   a_bind->joyaxis = AXIS_POS(2);
+
+   /* A and B both onto X: the harder press */
+   remap[RETRO_DEVICE_ID_JOYPAD_A] = RETRO_DEVICE_ID_JOYPAD_X;
+   remap[RETRO_DEVICE_ID_JOYPAD_B] = RETRO_DEVICE_ID_JOYPAD_X;
+   seen = pressure_frame(a_btn | b_btn, 20000, 10000, trace_last, &a, &b);
+   x    = input_driver_state_wrapper(0, RETRO_DEVICE_ANALOG,
+         RETRO_DEVICE_INDEX_ANALOG_BUTTON, RETRO_DEVICE_ID_JOYPAD_X);
+   CHECK(!seen && !a && !b && x == 20000,
+         "remapped pressure: A and B onto X, A pressed harder, X is not A's");
+   seen = pressure_frame(a_btn | b_btn, 5000, 10000, trace_last, &a, &b);
+   x    = input_driver_state_wrapper(0, RETRO_DEVICE_ANALOG,
+         RETRO_DEVICE_INDEX_ANALOG_BUTTON, RETRO_DEVICE_ID_JOYPAD_X);
+   CHECK(!seen && !a && !b && x == 10000,
+         "remapped pressure: A and B onto X, B pressed harder, X is not B's");
+
+   /* unmapped: nothing */
+   remap[RETRO_DEVICE_ID_JOYPAD_A] = RARCH_UNMAPPED;
+   remap[RETRO_DEVICE_ID_JOYPAD_B] = RETRO_DEVICE_ID_JOYPAD_B;
+   seen = pressure_frame(a_btn, 20000, 0, trace_last, &a, &b);
+   CHECK(!seen && !a && !b,
+         "remapped pressure: A unmapped, it still reaches the core");
+
+   /* onto a stick, as before */
+   remap[RETRO_DEVICE_ID_JOYPAD_A] = RARCH_ANALOG_LEFT_X_PLUS;
+   pressure_frame(a_btn, 20000, 0, trace_last, &a, &b);
+   stick = input_driver_state_wrapper(0, RETRO_DEVICE_ANALOG,
+         RETRO_DEVICE_INDEX_ANALOG_LEFT, RETRO_DEVICE_ID_ANALOG_X);
+   CHECK(stick == 20000 && !a,
+         "remapped pressure: A onto the left stick, the stick is not A's pressure");
+
+   remap[RETRO_DEVICE_ID_JOYPAD_A] = RETRO_DEVICE_ID_JOYPAD_A;
+   remap[RETRO_DEVICE_ID_JOYPAD_B] = RETRO_DEVICE_ID_JOYPAD_B;
+   *a_bind = saved_a;
+   *b_bind = saved_b;
+   syn_buttons = 0;
+   memset(syn_axes, 0, sizeof(syn_axes));
+   trace(0, 0);
+   fast_forward(false);
+   run_loop_frames(5);
+   input_driver_set_snapshot_bridge(false);
+   input_st->primary_joypad      = joypad_real;
+   input_st->analog_requested[0] = analog_requested;
+   dlclose(core);
+   if (failures == had)
+      printf("[pass] remapped pressure: a button remapped onto another"
+            " takes its pressure along, the harder of two presses wins,"
+            " and a button without pressure is a full press\n");
+#else
+   printf("[skip] remapped pressure: needs the test drivers\n");
+#endif
+}
+
 #if defined(HAVE_TEST_DRIVERS) && !defined(_WIN32) \
    && defined(HAVE_NETWORKING) && defined(HAVE_NETWORKGAMEPAD)
 #include <sys/socket.h>
@@ -2167,6 +2441,715 @@ done:
             " first device; a button of it counts as a first press\n");
 #else
    printf("[skip] network pad: needs the test drivers and the network gamepad\n");
+#endif
+}
+
+#if defined(HAVE_TEST_DRIVERS) && !defined(_WIN32)
+/* Pointer capture lane: an input driver that notes what it is told. */
+static bool     cap_grabbed;
+static unsigned cap_calls;
+
+static void cap_grab_mouse(void *data, bool state)
+{
+   (void)data;
+   cap_grabbed = state;
+   cap_calls++;
+}
+#endif
+
+/* Pointer capture: held for named reasons, by whoever wants it. */
+static void lane_pointer_capture(void)
+{
+#if defined(HAVE_TEST_DRIVERS) && !defined(_WIN32)
+   input_driver_state_t *input_st = input_state_get_ptr();
+   settings_t *settings           = config_get_ptr();
+   runloop_state_t *runloop_st    = runloop_state_get_ptr();
+   input_driver_t *real           = input_st->current_driver;
+   input_driver_t fake;
+   unsigned had         = failures;
+   unsigned calls;
+   uint8_t  saved       = input_st->capture_reasons;
+   bool     saved_auto  = settings->bools.input_auto_mouse_grab;
+#define CAPTURED() ((input_st->flags & INP_FLAG_GRAB_MOUSE_STATE) != 0)
+
+   if (!real)
+   {
+      CHECK(false, "pointer capture: no input driver");
+      return;
+   }
+   fake                     = *real;
+   fake.grab_mouse          = cap_grab_mouse;
+   input_st->current_driver = &fake;
+   input_st->capture_reasons = 0;
+   input_pointer_capture_apply(false);
+   cap_grabbed = false;
+
+   /* the user's toggle, on and off */
+   command_event(CMD_EVENT_GRAB_MOUSE_TOGGLE, NULL);
+   CHECK(CAPTURED() && cap_grabbed
+         && input_pointer_capture_reasons() == INPUT_CAPTURE_USER,
+         "pointer capture: the toggle did not capture for the user");
+   command_event(CMD_EVENT_GRAB_MOUSE_TOGGLE, NULL);
+   CHECK(!CAPTURED() && !cap_grabbed && !input_pointer_capture_reasons(),
+         "pointer capture: the toggle did not let go");
+
+   /* game focus holds it; into exclusive fullscreen and out again
+    * lets go of fullscreen's reason only (the grab used to be dropped
+    * with game focus still on) */
+   command_event(CMD_EVENT_GAME_FOCUS_TOGGLE, NULL);
+   CHECK(CAPTURED() && cap_grabbed, "pointer capture: game focus did not capture");
+   input_pointer_capture_set_fullscreen(true, true);
+   input_pointer_capture_apply(false);
+   input_pointer_capture_set_fullscreen(false, false);
+   input_pointer_capture_apply(false);
+   CHECK(CAPTURED() && cap_grabbed,
+         "pointer capture: leaving fullscreen let go of game focus's capture");
+   command_event(CMD_EVENT_GAME_FOCUS_TOGGLE, NULL);
+   CHECK(!CAPTURED() && !cap_grabbed, "pointer capture: game focus off did not let go");
+
+   /* the user's capture outlasts game focus going on and off (it
+    * used to be dropped in a window) */
+   command_event(CMD_EVENT_GRAB_MOUSE_TOGGLE, NULL);
+   command_event(CMD_EVENT_GAME_FOCUS_TOGGLE, NULL);
+   command_event(CMD_EVENT_GAME_FOCUS_TOGGLE, NULL);
+   CHECK(CAPTURED() && cap_grabbed,
+         "pointer capture: game focus going off let go of the user's capture");
+
+   /* a driver that has just started is told again, and one nothing
+    * is wanted of is told nothing */
+   calls = cap_calls;
+   cap_grabbed = false;
+   input_pointer_capture_apply(true);
+   CHECK(cap_calls == calls + 1 && cap_grabbed && CAPTURED(),
+         "pointer capture: a restarted driver was not given the capture again");
+   command_event(CMD_EVENT_GRAB_MOUSE_TOGGLE, NULL);
+   calls = cap_calls;
+   input_pointer_capture_apply(true);
+   CHECK(cap_calls == calls && !CAPTURED(),
+         "pointer capture: a restarted driver was told to grab or let go with nothing held");
+
+   /* borderless fullscreen hides the cursor and grabs nothing; the
+    * toggle then captures, and its second press lets go of all */
+   input_pointer_capture_set_fullscreen(true, false);
+   input_pointer_capture_apply(false);
+   CHECK(!CAPTURED() && input_st->capture_cursor_hidden,
+         "pointer capture: borderless fullscreen grabbed, or left the cursor shown");
+   command_event(CMD_EVENT_GRAB_MOUSE_TOGGLE, NULL);
+   CHECK(CAPTURED(), "pointer capture: the toggle did not capture in borderless fullscreen");
+   command_event(CMD_EVENT_GRAB_MOUSE_TOGGLE, NULL);
+   CHECK(!CAPTURED() && !input_st->capture_cursor_hidden,
+         "pointer capture: the toggle's second press did not let go of everything");
+
+   /* "Automatic Mouse Grab": taken when the window gains focus */
+   settings->bools.input_auto_mouse_grab = true;
+   runloop_st->flags &= ~RUNLOOP_FLAG_FOCUSED;
+   run_loop_frames(2);
+   if (runloop_st->flags & RUNLOOP_FLAG_FOCUSED)
+   {
+      CHECK(CAPTURED() && (input_pointer_capture_reasons() & INPUT_CAPTURE_AUTO_FOCUS),
+            "pointer capture: gaining focus did not capture with Automatic Mouse Grab on");
+      command_event(CMD_EVENT_GRAB_MOUSE_TOGGLE, NULL);
+      CHECK(!CAPTURED(), "pointer capture: the toggle did not let go of the automatic capture");
+   }
+   else
+      printf("[info] pointer capture: the window has no focus here, automatic grab not run\n");
+   settings->bools.input_auto_mouse_grab = saved_auto;
+
+   /* a driver that cannot grab: the toggle says so and holds nothing */
+   input_st->capture_reasons = 0;
+   input_pointer_capture_apply(false);
+   fake.grab_mouse           = NULL;
+   CHECK(!command_event(CMD_EVENT_GRAB_MOUSE_TOGGLE, NULL)
+         && !input_pointer_capture_reasons(),
+         "pointer capture: the toggle held a reason with a driver that cannot grab");
+
+   input_st->current_driver  = real;
+   input_st->capture_reasons = saved;
+   input_st->flags          &= ~INP_FLAG_GRAB_MOUSE_STATE;
+   input_pointer_capture_apply(false);
+#undef CAPTURED
+   if (failures == had)
+      printf("[pass] pointer capture: held for named reasons; leaving"
+            " fullscreen or game focus lets go of its own only; a"
+            " restarted driver is told again; the toggle lets go of all\n");
+#else
+   printf("[skip] pointer capture: needs the test drivers\n");
+#endif
+}
+
+#if defined(HAVE_TEST_DRIVERS) && !defined(_WIN32) && defined(HAVE_OVERLAY)
+/* Menu combination lane: whether L3 + R3 opens the menu, with the
+ * scripted pad holding @pad and the overlay holding @overlay. */
+static bool combo_opens(unsigned pad, unsigned overlay)
+{
+   input_driver_state_t *input_st = input_state_get_ptr();
+   input_bits_t bits;
+   unsigned i;
+
+   syn_buttons = 0;
+   for (i = 0; i < 16; i++)
+      if (pad & (1u << i))
+         syn_buttons |= 1u << (input_autoconf_binds[0][i].joykey & 31);
+   BIT256_CLEAR_ALL(input_st->overlay_ptr->overlay_state.buttons);
+   for (i = 0; i < 16; i++)
+      if (overlay & (1u << i))
+         BIT256_SET(input_st->overlay_ptr->overlay_state.buttons, i);
+   /* a poll for the pad, then the system's input as the run loop
+    * collects it, and the gate as the run loop applies it */
+   input_driver_poll();
+   BIT256_CLEAR_ALL(bits);
+   input_driver_collect_system_input(input_st, config_get_ptr(), &bits);
+   input_driver_menu_combo_source_gate(&bits);
+   return input_driver_button_combo(INPUT_COMBO_L3_R3, 0, &bits);
+}
+#endif
+
+/* The menu combination and the overlay: buttons held on the overlay
+ * alone do not add up to it when the overlay has a menu button. */
+static void lane_menu_combo_gate(void)
+{
+#if defined(HAVE_TEST_DRIVERS) && !defined(_WIN32) && defined(HAVE_OVERLAY)
+   const unsigned L3 = 1u << RETRO_DEVICE_ID_JOYPAD_L3;
+   const unsigned R3 = 1u << RETRO_DEVICE_ID_JOYPAD_R3;
+   input_driver_state_t *input_st = input_state_get_ptr();
+   const input_device_driver_t *joypad_real = input_st->primary_joypad;
+   input_overlay_t *saved = input_st->overlay_ptr;
+   input_overlay_t  ol;
+   struct overlay   layout;
+   struct overlay_desc descs[2];
+   unsigned had = failures;
+
+   if (!joypad_real)
+   {
+      CHECK(false, "menu combination: no joypad driver");
+      return;
+   }
+   syn_joypad               = *joypad_real;
+   syn_joypad.button        = syn_button;
+   syn_joypad.axis          = syn_axis;
+   syn_joypad.state         = syn_state;
+   syn_joypad.get_buttons   = syn_get_buttons;
+   input_st->primary_joypad = &syn_joypad;
+   syn_hat = 0;
+   memset(syn_axes, 0, sizeof(syn_axes));
+
+   /* an overlay of two buttons, shown but not drawn: a stick click,
+    * and a menu button */
+   memset(&ol, 0, sizeof(ol));
+   memset(&layout, 0, sizeof(layout));
+   memset(descs, 0, sizeof(descs));
+   BIT256_SET(descs[0].button_mask, RETRO_DEVICE_ID_JOYPAD_L3);
+   BIT256_SET(descs[1].button_mask, RARCH_MENU_TOGGLE);
+   layout.descs = descs;
+   layout.size  = 2;
+   ol.active    = &layout;
+   input_st->overlay_ptr = &ol;
+
+   CHECK(!combo_opens(0, L3 | R3),
+         "menu combination: two overlay buttons opened the menu on an overlay with a menu button");
+   CHECK(combo_opens(L3 | R3, 0),
+         "menu combination: the controller's own L3 + R3 no longer opens the menu");
+   CHECK(combo_opens(L3 | R3, L3 | R3),
+         "menu combination: buttons held on both the controller and the overlay did not count");
+   CHECK(!combo_opens(L3, R3),
+         "menu combination: one overlay button completed the controller's combination");
+
+   /* and in the run loop itself: frames with the two overlay buttons
+    * held and the combination set leave the menu shut */
+   {
+      settings_t *settings = config_get_ptr();
+      unsigned saved_combo = settings->uints.input_menu_toggle_gamepad_combo;
+      settings->uints.input_menu_toggle_gamepad_combo = INPUT_COMBO_L3_R3;
+      syn_buttons = 0;
+      BIT256_SET(ol.overlay_state.buttons, RETRO_DEVICE_ID_JOYPAD_L3);
+      BIT256_SET(ol.overlay_state.buttons, RETRO_DEVICE_ID_JOYPAD_R3);
+      run_loop_frames(3);
+      CHECK(!(menu_state_get_ptr()->flags & MENU_ST_FLAG_ALIVE),
+            "menu combination: the run loop opened the menu for two overlay buttons");
+      BIT256_CLEAR_ALL(ol.overlay_state.buttons);
+      run_loop_frames(2);
+      settings->uints.input_menu_toggle_gamepad_combo = saved_combo;
+   }
+
+   /* an overlay with no menu button: the combination is its way in */
+   layout.size = 1;
+   CHECK(combo_opens(0, L3 | R3),
+         "menu combination: an overlay with no menu button can no longer open the menu");
+
+   syn_buttons              = 0;
+   input_st->overlay_ptr    = saved;
+   input_st->primary_joypad = joypad_real;
+   input_driver_poll();
+   if (failures == had)
+      printf("[pass] menu combination: overlay buttons alone do not add up"
+            " to it on an overlay with a menu button; the controller's"
+            " do, and so do an overlay's with no menu button\n");
+#else
+   printf("[skip] menu combination: needs the test drivers and overlays\n");
+#endif
+}
+
+/* The menu, pause and the press that closes the menu. A user opens the
+ * menu, closes it with B still held, lets B go and presses it again;
+ * pauses with the pause hotkey and goes in and out of the menu - with
+ * "Pause Content When Menu Is Active" on and off. What the core sees
+ * and whether it runs are held to what they should be:
+ *
+ * - the menu pauses the core when the setting is on and not otherwise;
+ * - leaving the menu lets the core run again, unless the pause hotkey
+ *   paused it first;
+ * - the B that closed the menu does not reach the core while it is
+ *   held; let go and pressed again, it does. */
+static void (*pm_trace)(int, int);
+static void (*pm_trace_last)(unsigned*, int*);
+static long (*pm_runs)(void);
+
+/* frames run one at a time; whether the core saw B in any of them */
+static bool pm_frames_saw_b(unsigned n)
+{
+   bool saw = false;
+   unsigned i, buttons;
+   int axes[4];
+   for (i = 0; i < n; i++)
+   {
+      long before = pm_runs();
+      run_loop_frames(1);
+      if (pm_runs() != before)
+      {
+         pm_trace_last(&buttons, axes);
+         if (buttons & (1u << RETRO_DEVICE_ID_JOYPAD_B))
+            saw = true;
+      }
+   }
+   return saw;
+}
+
+static void pm_set_menu(bool up)
+{
+   if (menu_is_up() != up)
+      command_event(CMD_EVENT_MENU_TOGGLE, NULL);
+}
+
+static void lane_menu_pause(void)
+{
+#if defined(HAVE_TEST_DRIVERS) && !defined(_WIN32)
+   input_driver_state_t *input_st = input_state_get_ptr();
+   settings_t *settings           = config_get_ptr();
+   const input_device_driver_t *joypad_real = input_st->primary_joypad;
+   struct retro_keybind saved_pause = input_config_binds[0][RARCH_PAUSE_TOGGLE];
+   bool saved_setting             = settings->bools.menu_pause_libretro;
+   uint32_t b_bit, pause_bit      = 1u << 20;
+   void *core;
+   unsigned had = failures;
+   unsigned s;
+
+   if (   !(core = dlopen(core_path_g, RTLD_NOW))
+       || !(pm_trace = (void (*)(int, int))dlsym(core, "harness_core_trace"))
+       || !(pm_trace_last = (void (*)(unsigned*, int*))dlsym(core, "harness_core_trace_last"))
+       || !(pm_runs = (long (*)(void))dlsym(core, "harness_core_runs"))
+       || !joypad_real)
+   {
+      CHECK(false, "menu pause: the harness core's entry points or the joypad driver");
+      return;
+   }
+
+   syn_joypad               = *joypad_real;
+   syn_joypad.button        = syn_button;
+   syn_joypad.axis          = syn_axis;
+   syn_joypad.state         = syn_state;
+   syn_joypad.get_buttons   = syn_get_buttons;
+   input_st->primary_joypad = &syn_joypad;
+   syn_hat                  = 0;
+   syn_buttons              = 0;
+   memset(syn_axes, 0, sizeof(syn_axes));
+   b_bit = 1u << (input_autoconf_binds[0][RETRO_DEVICE_ID_JOYPAD_B].joykey & 31);
+   /* the pause hotkey on a button of its own */
+   input_config_binds[0][RARCH_PAUSE_TOGGLE].joykey = 20;
+   pm_trace(2, 0);
+
+   for (s = 0; s < 2; s++)
+   {
+      bool pause_in_menu = (s == 0);
+      const char *with   = pause_in_menu ? "with Pause Content in the menu on"
+                                         : "with Pause Content in the menu off";
+      char msg[256];
+      long r0, r1;
+
+      settings->bools.menu_pause_libretro = pause_in_menu;
+      pm_set_menu(false);
+      syn_buttons = 0;
+      run_loop_frames(10);
+
+      /* in the menu: paused or not, as the setting says */
+      pm_set_menu(true);
+      run_loop_frames(2);
+      r0 = pm_runs();
+      run_loop_frames(10);
+      r1 = pm_runs();
+      snprintf(msg, sizeof(msg), "menu pause, %s: the core %s in the menu",
+            with, pause_in_menu ? "ran" : "did not run");
+      CHECK(pause_in_menu ? (r1 == r0) : (r1 > r0), msg);
+
+      /* closed with B held: the core runs, and does not see that B */
+      syn_buttons = b_bit;
+      run_loop_frames(3);
+      pm_set_menu(false);
+      r0 = pm_runs();
+      snprintf(msg, sizeof(msg), "menu pause, %s: the core saw the B that closed the menu, while it was held", with);
+      CHECK(!pm_frames_saw_b(15), msg);
+      snprintf(msg, sizeof(msg), "menu pause, %s: the core did not run again after the menu closed", with);
+      CHECK(pm_runs() > r0, msg);
+      syn_buttons = 0;
+      snprintf(msg, sizeof(msg), "menu pause, %s: the core saw B after it was let go", with);
+      CHECK(!pm_frames_saw_b(5), msg);
+      syn_buttons = b_bit;
+      snprintf(msg, sizeof(msg), "menu pause, %s: the core did not see B pressed again after the menu", with);
+      CHECK(pm_frames_saw_b(5), msg);
+      syn_buttons = 0;
+      run_loop_frames(3);
+
+      /* paused with the hotkey, then into the menu and out: still
+       * paused, until the hotkey again */
+      syn_buttons = pause_bit;
+      run_loop_frames(2);
+      syn_buttons = 0;
+      run_loop_frames(3);
+      r0 = pm_runs();
+      run_loop_frames(5);
+      snprintf(msg, sizeof(msg), "menu pause, %s: the pause hotkey did not pause the core", with);
+      CHECK(pm_runs() == r0, msg);
+      pm_set_menu(true);
+      run_loop_frames(5);
+      pm_set_menu(false);
+      run_loop_frames(5);
+      r0 = pm_runs();
+      run_loop_frames(10);
+      snprintf(msg, sizeof(msg), "menu pause, %s: leaving the menu ran a core the pause hotkey had paused", with);
+      CHECK(pm_runs() == r0, msg);
+      syn_buttons = pause_bit;
+      run_loop_frames(2);
+      syn_buttons = 0;
+      run_loop_frames(3);
+      r0 = pm_runs();
+      run_loop_frames(5);
+      snprintf(msg, sizeof(msg), "menu pause, %s: the pause hotkey did not unpause the core after the menu", with);
+      CHECK(pm_runs() > r0, msg);
+   }
+
+   pm_trace(0, 0);
+   pm_set_menu(false);
+   syn_buttons                                = 0;
+   settings->bools.menu_pause_libretro        = saved_setting;
+   input_config_binds[0][RARCH_PAUSE_TOGGLE]  = saved_pause;
+   input_st->primary_joypad                   = joypad_real;
+   run_loop_frames(3);
+   if (failures == had)
+      printf("[pass] menu pause: the menu pauses the core when set to and"
+            " not otherwise; leaving it runs the core unless the pause hotkey"
+            " paused it; the B that closed the menu does not reach the core"
+            " until let go and pressed again - with the setting on and off\n");
+#else
+   printf("[skip] menu pause: needs the test drivers\n");
+#endif
+}
+
+/* Aim From Analog Stick: a port's stick is where its lightgun or
+ * pointer points. */
+static void lane_aim_stick(void)
+{
+#if defined(HAVE_TEST_DRIVERS) && !defined(_WIN32)
+   input_driver_state_t *input_st = input_state_get_ptr();
+   settings_t *settings           = config_get_ptr();
+   const input_device_driver_t *joypad_real = input_st->primary_joypad;
+   struct retro_keybind saved_auto[8];
+   unsigned had = failures;
+   unsigned i;
+   int gx, gy, off, px, py, lx;
+#define AIM_READ() do { \
+      run_loop_frames(1); \
+      gx  = input_driver_state_wrapper(0, RETRO_DEVICE_LIGHTGUN, 0, RETRO_DEVICE_ID_LIGHTGUN_SCREEN_X); \
+      gy  = input_driver_state_wrapper(0, RETRO_DEVICE_LIGHTGUN, 0, RETRO_DEVICE_ID_LIGHTGUN_SCREEN_Y); \
+      off = input_driver_state_wrapper(0, RETRO_DEVICE_LIGHTGUN, 0, RETRO_DEVICE_ID_LIGHTGUN_IS_OFFSCREEN); \
+      px  = input_driver_state_wrapper(0, RETRO_DEVICE_POINTER, 0, RETRO_DEVICE_ID_POINTER_X); \
+      py  = input_driver_state_wrapper(0, RETRO_DEVICE_POINTER, 0, RETRO_DEVICE_ID_POINTER_Y); \
+      lx  = input_driver_state_wrapper(0, RETRO_DEVICE_ANALOG, RETRO_DEVICE_INDEX_ANALOG_RIGHT, RETRO_DEVICE_ID_ANALOG_X); \
+   } while (0)
+
+   if (!joypad_real)
+   {
+      CHECK(false, "aim stick: no joypad driver");
+      return;
+   }
+   syn_joypad               = *joypad_real;
+   syn_joypad.button        = syn_button;
+   syn_joypad.axis          = syn_axis;
+   syn_joypad.state         = syn_state;
+   syn_joypad.get_buttons   = syn_get_buttons;
+   input_st->primary_joypad = &syn_joypad;
+   syn_hat     = 0;
+   syn_buttons = 0;
+   memset(syn_axes, 0, sizeof(syn_axes));
+   /* the sticks on axes 0-3 */
+   memcpy(saved_auto, &input_autoconf_binds[0][RARCH_ANALOG_LEFT_X_PLUS],
+         sizeof(saved_auto));
+   for (i = 0; i < 4; i++)
+   {
+      input_autoconf_binds[0][RARCH_ANALOG_LEFT_X_PLUS + 2 * i].joyaxis     = AXIS_POS(i);
+      input_autoconf_binds[0][RARCH_ANALOG_LEFT_X_PLUS + 2 * i + 1].joyaxis = AXIS_NEG(i);
+   }
+   fast_forward(true);
+   /* the left stick up and left, the right stick right and down */
+   syn_axes[0] = -30000;
+   syn_axes[1] = -12000;
+   syn_axes[2] = 10000;
+   syn_axes[3] = 20000;
+
+   /* off, as before: the stick is not the gun */
+   settings->uints.input_aim_stick[0] = INPUT_AIM_STICK_NONE;
+   AIM_READ();
+   CHECK(gx != 10000 && px != 10000 && lx == 10000,
+         "aim stick: off, the stick shows up as the lightgun or the pointer");
+
+   /* the right stick aims */
+   settings->uints.input_aim_stick[0] = INPUT_AIM_STICK_RIGHT;
+   AIM_READ();
+   if (gx != 10000 || gy != 20000 || off || px != 10000 || py != 20000)
+      printf("[info] aim stick: gun %d %d offscreen %d, pointer %d %d\n",
+            gx, gy, off, px, py);
+   CHECK(gx == 10000 && gy == 20000 && !off,
+         "aim stick: the lightgun is not where the right stick is held");
+   CHECK(px == 10000 && py == 20000,
+         "aim stick: the pointer is not where the right stick is held");
+   CHECK(lx == 10000, "aim stick: the stick itself is no longer read as a stick");
+
+   /* the left stick aims */
+   settings->uints.input_aim_stick[0] = INPUT_AIM_STICK_LEFT;
+   AIM_READ();
+   CHECK(gx == -30000 && gy == -12000 && px == -30000 && py == -12000,
+         "aim stick: the lightgun or pointer is not where the left stick is held");
+
+   /* another port's setting is its own */
+   settings->uints.input_aim_stick[0] = INPUT_AIM_STICK_NONE;
+   settings->uints.input_aim_stick[1] = INPUT_AIM_STICK_RIGHT;
+   AIM_READ();
+   CHECK(gx != 10000, "aim stick: the second port's setting aimed the first port's gun");
+   settings->uints.input_aim_stick[1] = INPUT_AIM_STICK_NONE;
+
+   memset(syn_axes, 0, sizeof(syn_axes));
+   fast_forward(false);
+   run_loop_frames(3);
+   memcpy(&input_autoconf_binds[0][RARCH_ANALOG_LEFT_X_PLUS], saved_auto,
+         sizeof(saved_auto));
+   input_st->primary_joypad = joypad_real;
+#undef AIM_READ
+   if (failures == had)
+      printf("[pass] aim stick: off, the stick is only a stick; on, the"
+            " chosen stick is where the port's lightgun and pointer"
+            " point, and is still read as a stick\n");
+#else
+   printf("[skip] aim stick: needs the test drivers\n");
+#endif
+}
+
+/* The sensor snapshot is made for a shader that reads sensors, and
+ * for nobody else: with no such shader the poll publishes nothing. */
+static void lane_sensor_snapshot_idle(void)
+{
+   input_driver_state_t *input_st = input_state_get_ptr();
+   unsigned had                   = failures;
+   float gyro[3], accel[3], rest[3];
+   int seq0, seq1, seq2, seq3, seq4;
+
+   input_driver_set_shader_uses_sensors(false);
+   run_loop_frames(3);
+   seq0 = retro_atomic_load_acquire_int(&input_st->sensor_snap_seq);
+   run_loop_frames(20);
+   seq1 = retro_atomic_load_acquire_int(&input_st->sensor_snap_seq);
+   CHECK(seq1 == seq0,
+         "sensor snapshot: with no shader reading sensors the poll still publishes one");
+
+   input_driver_set_shader_uses_sensors(true);
+   run_loop_frames(10);
+   seq2 = retro_atomic_load_acquire_int(&input_st->sensor_snap_seq);
+   CHECK(seq2 >= seq1 + 2 * 10,
+         "sensor snapshot: with a shader reading sensors it is not published every poll");
+
+   input_driver_set_shader_uses_sensors(false);
+   run_loop_frames(3);
+   seq3 = retro_atomic_load_acquire_int(&input_st->sensor_snap_seq);
+   run_loop_frames(20);
+   seq4 = retro_atomic_load_acquire_int(&input_st->sensor_snap_seq);
+   CHECK(seq3 == seq2 + 2 && seq4 == seq3,
+         "sensor snapshot: after the shader went, noughts were not published once and then nothing");
+   gyro[0] = accel[0] = 1.0f;
+   input_driver_read_sensor_snapshot(gyro, accel, rest);
+   CHECK(   gyro[0]  == 0.0f && gyro[1]  == 0.0f && gyro[2]  == 0.0f
+         && accel[0] == 0.0f && accel[1] == 0.0f && accel[2] == 0.0f,
+         "sensor snapshot: what is left published is not noughts");
+
+   if (failures == had)
+      printf("[pass] sensor snapshot: published every poll while a shader"
+            " reads sensors, once with noughts when it stops, and not at"
+            " all otherwise\n");
+}
+
+/* A driver restart under a core that renders with the GPU (the report
+ * was a core option that changes the internal resolution). The core's
+ * request is put back after the drivers are torn down, and the
+ * frontend has to still know it has one. */
+static unsigned hw_lane_resets, hw_lane_destroys;
+static void hw_lane_context_reset(void)   { hw_lane_resets++; }
+static void hw_lane_context_destroy(void) { hw_lane_destroys++; }
+
+static void lane_hw_context_restart(void)
+{
+   video_driver_state_t *video_st = video_state_get_ptr();
+   unsigned had                   = failures;
+   bool before, after;
+
+   /* what RETRO_ENVIRONMENT_SET_HW_RENDER leaves behind */
+   memset(&video_st->hw_render, 0, sizeof(video_st->hw_render));
+   video_st->hw_render.context_type    = RETRO_HW_CONTEXT_OPENGL;
+   video_st->hw_render.context_reset   = hw_lane_context_reset;
+   video_st->hw_render.context_destroy = hw_lane_context_destroy;
+   retro_atomic_store_release_int(&video_st->hw_context_type,
+         (int)RETRO_HW_CONTEXT_OPENGL);
+   hw_lane_resets = hw_lane_destroys   = 0;
+
+   before = video_driver_is_hw_context();
+   command_event(CMD_EVENT_REINIT, NULL);
+   run_loop_frames(2);
+   after  = video_driver_is_hw_context();
+
+   CHECK(before, "hw restart: the core's request was not in place before the restart");
+   CHECK(video_st->hw_render.context_type == RETRO_HW_CONTEXT_OPENGL
+         && video_st->hw_render.context_reset == hw_lane_context_reset,
+         "hw restart: the core's request did not come back after the restart");
+   CHECK(after,
+         "hw restart: after a driver restart the frontend no longer knows the core renders with the GPU");
+   CHECK(hw_lane_destroys == 1,
+         "hw restart: the core's context was not destroyed exactly once");
+
+   /* as the lanes after this found it */
+   memset(&video_st->hw_render, 0, sizeof(video_st->hw_render));
+   retro_atomic_store_release_int(&video_st->hw_context_type,
+         (int)RETRO_HW_CONTEXT_NONE);
+   command_event(CMD_EVENT_REINIT, NULL);
+   run_loop_frames(2);
+
+   if (failures == had)
+      printf("[pass] hw restart: across a driver restart a GPU-rendering"
+            " core's request comes back, its context is destroyed once"
+            " (reset %u time(s)), and the frontend still knows it has one\n",
+            hw_lane_resets);
+}
+
+/* A remap file with a disabled button, content closed from the menu,
+ * the core started again from the menu, and closed again
+ * (issue #19698). */
+#if !defined(_WIN32) && defined(HAVE_MENU)
+static bool remap_has(const char *path, const char *want)
+{
+   char line[256];
+   bool found = false;
+   FILE *f    = fopen(path, "r");
+   if (!f)
+      return false;
+   while (fgets(line, sizeof(line), f))
+      if (strstr(line, want))
+         found = true;
+   fclose(f);
+   return found;
+}
+#endif
+
+static void lane_remap_close(void)
+{
+#if !defined(_WIN32) && defined(HAVE_MENU)
+   runloop_state_t *runloop_st = runloop_state_get_ptr();
+   settings_t *settings        = config_get_ptr();
+   content_ctx_info_t info     = {0};
+   const char *core_name       = runloop_st->system.info.library_name;
+   char dir[256], path[768], cmd[900];
+   unsigned had = failures;
+   unsigned i;
+
+   if (!core_name || !*core_name)
+   {
+      CHECK(false, "remap close: the core has no name");
+      return;
+   }
+   snprintf(dir, sizeof(dir), "/tmp/harness_remaps_%d", (int)getpid());
+   snprintf(path, sizeof(path), "%s/%s/%s.rmp", dir, core_name, core_name);
+   strlcpy(settings->paths.directory_input_remapping, dir,
+         sizeof(settings->paths.directory_input_remapping));
+
+   CHECK(runloop_st->system.input_desc_btn[0][RETRO_DEVICE_ID_JOYPAD_L] != NULL,
+         "remap close: the core's buttons are not described");
+
+   /* L is disabled and B is given to A, and the remap is saved as a
+    * core remap, as the menu saves it */
+   settings->uints.input_remap_ids[0][RETRO_DEVICE_ID_JOYPAD_L] = RARCH_UNMAPPED;
+   settings->uints.input_remap_ids[0][RETRO_DEVICE_ID_JOYPAD_B] = RETRO_DEVICE_ID_JOYPAD_A;
+   CHECK(input_remapping_save_file(path), "remap close: the remap file was not saved");
+   if (runloop_st->name.remapfile)
+      free(runloop_st->name.remapfile);
+   runloop_st->name.remapfile  = strdup(path);
+   runloop_st->flags          |= RUNLOOP_FLAG_REMAPS_CORE_ACTIVE;
+   CHECK(remap_has(path, "input_player1_btn_l = \"-1\""),
+         "remap close: the disabled button is not in the file as saved");
+
+   /* content closed from the menu */
+   command_event(CMD_EVENT_CLOSE_CONTENT, NULL);
+   for (i = 0; i < 40; i++)
+      run_loop_frames(1);
+   CHECK(remap_has(path, "input_player1_btn_l = \"-1\""),
+         "remap close: closing content dropped the disabled button from the remap file");
+
+   /* the core started again from the menu: the remap file is loaded */
+   task_push_load_new_core(core_path_g, NULL, &info, CORE_TYPE_PLAIN, NULL, NULL);
+   task_push_start_current_core(&info);
+   for (i = 0; i < 60; i++)
+      run_loop_frames(1);
+   CHECK(   (content_get_flags() & CONTENT_ST_FLAG_IS_INITED)
+         && runloop_st->name.remapfile
+         && settings->uints.input_remap_ids[0][RETRO_DEVICE_ID_JOYPAD_L] == RARCH_UNMAPPED
+         && runloop_st->system.input_desc_btn[0][RETRO_DEVICE_ID_JOYPAD_L],
+         "remap close: started again from the menu, the core is not up with its remap and its descriptions");
+
+   /* and closed again, this time with a configuration override in
+    * use. Unloading the override loads the remap file once more, so
+    * the remap is saved a second time when the core itself closes -
+    * a frame later, as a staged load does it. */
+   {
+      char cfg[600];
+      FILE *f;
+      snprintf(cfg, sizeof(cfg), "%s/harness.cfg", harness_dir_g);
+      if ((f = fopen(cfg, "ab")))
+      {
+         fprintf(f, "input_remapping_directory = \"%s\"\n", dir);
+         fclose(f);
+      }
+   }
+   runloop_st->flags |= RUNLOOP_FLAG_OVERRIDES_ACTIVE;
+   command_event(CMD_EVENT_CLOSE_CONTENT, NULL);
+   for (i = 0; i < 40; i++)
+      run_loop_frames(1);
+   CHECK(remap_has(path, "input_player1_btn_l = \"-1\""),
+         "remap close: closing content with an override in use dropped the disabled button from the remap file");
+   CHECK(remap_has(path, "input_player1_btn_b = \"8\""),
+         "remap close: closing content dropped a remapped button from the remap file");
+   /* the old core's descriptions do go, once it has closed */
+   CHECK(!runloop_st->system.input_desc_btn[0][RETRO_DEVICE_ID_JOYPAD_L],
+         "remap close: the closed core's button descriptions were kept");
+   snprintf(cmd, sizeof(cmd), "rm -rf '%s'", dir);
+   if (system(cmd)) { }
+   if (failures == had)
+      printf("[pass] remap close: a disabled button stays in the remap file"
+            " through Close Content, with and without a configuration"
+            " override in use\n");
+#else
+   printf("[skip] remap close: needs the menu\n");
 #endif
 }
 
@@ -3083,15 +4066,27 @@ int main(int argc, char *argv[])
        * loop paused */
       lane_first_press();
       lane_socd();
+   lane_remap_idle();
       lane_input_rotation();
       lane_triggers();
+      lane_remap_pressure();
       lane_network_retropad();
+      lane_pointer_capture();
+      lane_menu_combo_gate();
+      lane_menu_pause();
+      lane_aim_stick();
       lane_core_view();
       lane_key_events();
       /* last: these restart the drivers */
       lane_input_kept();
       lane_joypad_reinit();
    }
+
+   lane_sensor_snapshot_idle();
+   lane_hw_context_restart();
+
+   /* last: it closes the content the other lanes run on */
+   lane_remap_close();
 
    if (failures)
    {

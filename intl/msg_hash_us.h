@@ -1740,6 +1740,10 @@ MSG_HASH(
    "A built-in laptop or all-in-one panel carries no EDID. An external display connected over DDC does."
    )
 MSG_HASH(
+   MENU_ENUM_LABEL_VALUE_DISPLAY_EDID_UNAVAILABLE_ANDROID,
+   "Android does not let apps read the EDID of a phone or tablet's built-in screen. A TV box driving a display over HDMI exposes it where the device allows."
+   )
+MSG_HASH(
    MENU_ENUM_LABEL_VALUE_DISPLAY_EDID_RAW,
    "Raw"
    )
@@ -12438,6 +12442,14 @@ MSG_HASH(
 MSG_HASH(
    MENU_ENUM_SUBLABEL_INPUT_MOUSE_INDEX,
    "The physical mouse as recognized by RetroArch. Where the input driver can tell mice apart, a mouse chosen here is remembered by what it is, and stays this port's when mice are plugged in or out."
+   )
+MSG_HASH(
+   MENU_ENUM_LABEL_VALUE_INPUT_AIM_STICK,
+   "Aim From Analog Stick"
+   )
+MSG_HASH(
+   MENU_ENUM_SUBLABEL_INPUT_AIM_STICK,
+   "Lets an analog stick aim this port's lightgun or pointer: where the stick is held is where it points on the screen, with the centre of the stick at the centre. Several players can then each aim without a mouse each. The gun's buttons are bound below as usual."
    )
 MSG_HASH(
    MENU_ENUM_LABEL_VALUE_INPUT_KEYBOARD_INDEX,
@@ -24845,6 +24857,14 @@ MSG_HASH(
    "Set all input remapping options to default values."
    )
 MSG_HASH(
+   MENU_ENUM_LABEL_VALUE_INPUT_REMAP_FIND,
+   "Find a Button by Pressing It"
+   )
+MSG_HASH(
+   MENU_ENUM_SUBLABEL_INPUT_REMAP_FIND,
+   "Press a button or push a stick on this port's controller, or a key bound to one, and the list below jumps to it."
+   )
+MSG_HASH(
    MENU_ENUM_LABEL_VALUE_REMAP_FILE_FLUSH,
    "Update Input Remap File"
    )
@@ -32753,6 +32773,10 @@ MSG_HASH(
 MSG_HASH(
    MSG_REMAP_FILE_RESET,
    "All input remapping options reset to default."
+   )
+MSG_HASH(
+   MSG_INPUT_REMAP_FIND_PRESS,
+   "Press a button or push a stick on the controller of Port %u\n(Timeout %u seconds)"
    )
 MSG_HASH(
    MSG_REMOVING_TEMPORARY_CONTENT_FILE,

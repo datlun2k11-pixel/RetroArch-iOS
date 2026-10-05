@@ -125,9 +125,6 @@ enum
 #define GC_JOYSTICK_THRESHOLD (48 * 256)
 #define WII_JOYSTICK_THRESHOLD (40 * 256)
 
-/* TODO/FIXME - global referenced outside */
-extern uint64_t lifecycle_state;
-
 /* TODO/FIXME - static globals */
 static uint64_t pad_state[DEFAULT_MAX_PADS];
 static uint32_t pad_type[DEFAULT_MAX_PADS] = { WPAD_EXP_NOCONTROLLER, WPAD_EXP_NOCONTROLLER, WPAD_EXP_NOCONTROLLER, WPAD_EXP_NOCONTROLLER };
@@ -213,8 +210,7 @@ static void handle_hotplug(unsigned port, uint32_t ptype)
 
 static void check_port0_active(uint8_t pad_count)
 {
-   settings_t *settings = config_get_ptr();
-   int idx = settings->uints.input_joypad_index[0];
+   int idx = (int)input_config_get_joypad_index(0);
 
    if (pad_count < 2 && idx != 0)
    {
@@ -223,7 +219,7 @@ static void check_port0_active(uint8_t pad_count)
 #else
       pad_type[0] = WPAD_EXP_GAMECUBE;
 #endif
-      settings->uints.input_joypad_index[0] = 0;
+      input_config_set_joypad_index(0, 0);
 
       input_autoconfigure_connect(
             gx_joypad_name(0),
@@ -604,7 +600,7 @@ static void gx_joypad_poll(void)
 
    state_p1 = pad_state[0];
 
-   BIT64_CLEAR(lifecycle_state, RARCH_MENU_TOGGLE);
+   input_driver_set_platform_menu_button(false);
    if (g_menu)
    {
       state_p1 |= (UINT64_C(1) << GX_GC_HOME);
@@ -617,7 +613,7 @@ static void gx_joypad_poll(void)
 #endif
 
    if (check_menu_toggle & state_p1)
-      BIT64_SET(lifecycle_state, RARCH_MENU_TOGGLE);
+      input_driver_set_platform_menu_button(true);
 }
 
 static void *gx_joypad_init(void *data)

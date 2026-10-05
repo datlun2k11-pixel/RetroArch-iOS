@@ -17,6 +17,7 @@
 #include <stdint.h>
 #include "../../apple_runtime.h"
 #include <unistd.h>
+#include <string.h>
 
 #include <retro_miscellaneous.h>
 
@@ -341,15 +342,14 @@ static bool apple_input_handle_icade_event(unsigned kb_type_idx, unsigned *code,
 void apple_input_keyboard_event(bool down,
       unsigned code, uint32_t character, uint32_t mod, unsigned device)
 {
-   settings_t *settings         = config_get_ptr();
-   bool keyboard_gamepad_enable = settings->bools.input_keyboard_gamepad_enable;
-   bool small_keyboard_enable   = settings->bools.input_small_keyboard_enable;
+   bool keyboard_gamepad_enable = input_config_get_keyboard_gamepad_enable();
+   bool small_keyboard_enable   = input_config_get_small_keyboard_enable();
    unsigned original_code       = code;
 
    if (keyboard_gamepad_enable)
    {
       if (apple_input_handle_icade_event(
-               settings->uints.input_keyboard_gamepad_mapping_type,
+               input_config_get_keyboard_gamepad_mapping_type(),
                &code, &down))
          character = 0;
       else
@@ -450,35 +450,43 @@ static void cocoa_input_poll(void *data)
    if (!apple)
       return;
 
-   apple->mouse_rel_x = apple->window_pos_x - apple->mouse_x_last;
-   apple->mouse_x_last = apple->window_pos_x;
-
-   apple->mouse_rel_y = apple->window_pos_y - apple->mouse_y_last;
-   apple->mouse_y_last = apple->window_pos_y;
+   {
+      uint32_t pos        = apple->window_pos;
+      uint32_t last       = apple->mouse_last;
+      apple->mouse_rel    = COCOA_POS_PACK(
+            COCOA_POS_X(pos) - COCOA_POS_X(last),
+            COCOA_POS_Y(pos) - COCOA_POS_Y(last));
+      apple->mouse_last   = pos;
+   }
 
    for (i = 0; i < apple->touch_count || i == 0; i++)
    {
       struct video_viewport vp;
+      cocoa_touch_data_t *touch = &apple->touches[i];
+      int screen_x              = COCOA_POS_X(touch->screen_pos) * backing_scale_factor;
+      int screen_y              = COCOA_POS_Y(touch->screen_pos) * backing_scale_factor;
+      int16_t confined_x        = COCOA_POS_X(touch->confined_pos);
+      int16_t confined_y        = COCOA_POS_Y(touch->confined_pos);
+      int16_t fixed_x           = COCOA_POS_X(touch->fixed_pos);
+      int16_t fixed_y           = COCOA_POS_Y(touch->fixed_pos);
+      int16_t full_x            = COCOA_POS_X(touch->full_pos);
+      int16_t full_y            = COCOA_POS_Y(touch->full_pos);
 
       memset(&vp, 0, sizeof(vp));
 
+      /* each pair is written whole, as it was read: a translation that
+       * fails leaves it as it was */
       video_driver_translate_coord_viewport_confined_wrap(
-            &vp,
-            apple->touches[i].screen_x * backing_scale_factor,
-            apple->touches[i].screen_y * backing_scale_factor,
-            &apple->touches[i].confined_x,
-            &apple->touches[i].confined_y,
-            &apple->touches[i].full_x,
-            &apple->touches[i].full_y);
+            &vp, screen_x, screen_y,
+            &confined_x, &confined_y, &full_x, &full_y);
 
       video_driver_translate_coord_viewport_wrap(
-            &vp,
-            apple->touches[i].screen_x * backing_scale_factor,
-            apple->touches[i].screen_y * backing_scale_factor,
-            &apple->touches[i].fixed_x,
-            &apple->touches[i].fixed_y,
-            &apple->touches[i].full_x,
-            &apple->touches[i].full_y);
+            &vp, screen_x, screen_y,
+            &fixed_x, &fixed_y, &full_x, &full_y);
+
+      touch->confined_pos = COCOA_POS_PACK(confined_x, confined_y);
+      touch->fixed_pos    = COCOA_POS_PACK(fixed_x, fixed_y);
+      touch->full_pos     = COCOA_POS_PACK(full_x, full_y);
    }
 }
 
@@ -491,8 +499,8 @@ static int16_t cocoa_lightgun_aiming_state(
    int16_t res_screen_x        = 0;
    int16_t res_screen_y        = 0;
 
-   int16_t x = apple->window_pos_x;
-   int16_t y = apple->window_pos_y;
+   int16_t x = COCOA_POS_X(apple->window_pos);
+   int16_t y = COCOA_POS_Y(apple->window_pos);
 
 #if !TARGET_OS_IPHONE
    x *= cocoa_screen_get_backing_scale_factor();
@@ -634,22 +642,22 @@ static int16_t cocoa_input_state(
             if (device == RARCH_DEVICE_MOUSE_SCREEN)
             {
 #if TARGET_OS_IPHONE
-               return apple->window_pos_x;
+               return COCOA_POS_X(apple->window_pos);
 #else
-               return apple->window_pos_x * cocoa_screen_get_backing_scale_factor();
+               return COCOA_POS_X(apple->window_pos) * cocoa_screen_get_backing_scale_factor();
 #endif
             }
-            return apple->mouse_rel_x;
+            return COCOA_POS_X(apple->mouse_rel);
          case RETRO_DEVICE_ID_MOUSE_Y:
             if (device == RARCH_DEVICE_MOUSE_SCREEN)
             {
 #if TARGET_OS_IPHONE
-               return apple->window_pos_y;
+               return COCOA_POS_Y(apple->window_pos);
 #else
-               return apple->window_pos_y * cocoa_screen_get_backing_scale_factor();
+               return COCOA_POS_Y(apple->window_pos) * cocoa_screen_get_backing_scale_factor();
 #endif
             }
-            return apple->mouse_rel_y;
+            return COCOA_POS_Y(apple->mouse_rel);
          case RETRO_DEVICE_ID_MOUSE_LEFT:
             return apple->mouse_buttons & 1;
          case RETRO_DEVICE_ID_MOUSE_RIGHT:
@@ -682,16 +690,16 @@ static int16_t cocoa_input_state(
                         if (!apple->touch_count)
                            return 0;
                         if (device == RARCH_DEVICE_POINTER_SCREEN)
-                           return (touch->full_x  != -0x8000) && (touch->full_y  != -0x8000); /* Inside? */
-                        return    (touch->fixed_x != -0x8000) && (touch->fixed_y != -0x8000); /* Inside? */
+                           return (COCOA_POS_X(touch->full_pos)  != -0x8000) && (COCOA_POS_Y(touch->full_pos)  != -0x8000); /* Inside? */
+                        return    (COCOA_POS_X(touch->fixed_pos) != -0x8000) && (COCOA_POS_Y(touch->fixed_pos) != -0x8000); /* Inside? */
                      case RETRO_DEVICE_ID_POINTER_X:
-                        return (device == RARCH_DEVICE_POINTER_SCREEN) ? touch->full_x : touch->confined_x;
+                        return (device == RARCH_DEVICE_POINTER_SCREEN) ? COCOA_POS_X(touch->full_pos) : COCOA_POS_X(touch->confined_pos);
                      case RETRO_DEVICE_ID_POINTER_Y:
-                        return (device == RARCH_DEVICE_POINTER_SCREEN) ? touch->full_y : touch->confined_y;
+                        return (device == RARCH_DEVICE_POINTER_SCREEN) ? COCOA_POS_Y(touch->full_pos) : COCOA_POS_Y(touch->confined_pos);
                      case RETRO_DEVICE_ID_POINTER_COUNT:
                         return apple->touch_count;
                      case RETRO_DEVICE_ID_POINTER_IS_OFFSCREEN:
-                        return input_driver_pointer_is_offscreen(touch->fixed_x, touch->fixed_y);
+                        return input_driver_pointer_is_offscreen(COCOA_POS_X(touch->fixed_pos), COCOA_POS_Y(touch->fixed_pos));
                   }
                }
             }
@@ -743,8 +751,7 @@ static int16_t cocoa_input_state(
                         return 1;
                      else
                      {
-                        settings_t *settings = config_get_ptr();
-                        if (settings->uints.input_mouse_index[port] == 0)
+                        if (input_config_get_mouse_index(port) == 0)
                         {
                            if (cocoa_mouse_button_pressed(apple, port, binds[port][new_id].mbutton))
                               return 1;
@@ -1004,8 +1011,7 @@ static void cocoa_input_keypress_vibrate(void)
       if (!keypressHapticEngine)
          cocoa_input_init_haptic_engine();
 
-      settings_t *settings = config_get_ptr();
-      if (!settings || !keypressHapticEngine)
+      if (!keypressHapticEngine)
          return;
 
       /* Ensure engine is started (may have been stopped by backgrounding) */
@@ -1020,7 +1026,7 @@ static void cocoa_input_keypress_vibrate(void)
          if (!keypressHapticEngine)
             return;
       }
-      unsigned rumble_gain = settings->uints.input_rumble_gain;
+      unsigned rumble_gain = input_config_get_rumble_gain();
       float intensity = (float)rumble_gain / 100.0f;
 
       /* Create player on first use */
@@ -1142,3 +1148,111 @@ input_driver_t input_cocoa = {
    NULL                          /* vibrate */
 #endif
 };
+
+/* What the Apple UI hands the Cocoa input driver.
+ *
+ * The UI gets the platform's mouse, pointer and touch events and used
+ * to write them into this driver's data itself, which it took out of
+ * the input state. It calls these instead: the data is the driver's,
+ * and only the driver writes it. Each does what the UI's code did.
+ * All of them are on the main thread, where the UI's events arrive,
+ * and do nothing while the Cocoa driver is not the one in use. */
+static cocoa_input_data_t *cocoa_input_current(void)
+{
+   return (cocoa_input_data_t*)input_driver_current_data();
+}
+
+/* The mouse moved by @dx, @dy and is now at @x, @y in the window. */
+void cocoa_input_mouse_moved(int16_t dx, int16_t dy, int16_t x, int16_t y)
+{
+   cocoa_input_data_t *apple = cocoa_input_current();
+   if (!apple)
+      return;
+   /* Relative */
+   apple->mouse_rel           = COCOA_POS_PACK(
+         COCOA_POS_X(apple->mouse_rel) + dx,
+         COCOA_POS_Y(apple->mouse_rel) + dy);
+   /* Absolute */
+   apple->touches[0].screen_pos = COCOA_POS_PACK(x, y);
+   if (apple->mouse_grabbed)
+      apple->window_pos       = COCOA_POS_PACK(
+            COCOA_POS_X(apple->window_pos) + dx,
+            COCOA_POS_Y(apple->window_pos) + dy);
+   else
+      apple->window_pos       = COCOA_POS_PACK(x, y);
+}
+
+/* A mouse with no position of its own moved the pointer by @dx, @dy
+ * (iOS, GCMouse). */
+void cocoa_input_mouse_moved_by(int16_t dx, int16_t dy)
+{
+   cocoa_input_data_t *apple = cocoa_input_current();
+   if (!apple)
+      return;
+   apple->window_pos = COCOA_POS_PACK(
+         COCOA_POS_X(apple->window_pos) + dx,
+         COCOA_POS_Y(apple->window_pos) + dy);
+}
+
+/* Mouse button @number went down or up. With @as_touch it is the one
+ * touch of a pointer too, as a click is on macOS. */
+void cocoa_input_mouse_button(unsigned number, bool down, bool as_touch)
+{
+   cocoa_input_data_t *apple = cocoa_input_current();
+   if (!apple || number >= 32)
+      return;
+   if (down)
+      apple->mouse_buttons |=  (1U << number);
+   else
+      apple->mouse_buttons &= ~(1U << number);
+   if (as_touch)
+      apple->touch_count     = down ? 1 : 0;
+}
+
+/* The pointer hovers at @x, @y, with nothing pressed (iOS, a trackpad
+ * or a mouse over the view). */
+void cocoa_input_pointer_at(int16_t x, int16_t y)
+{
+   cocoa_input_data_t *apple = cocoa_input_current();
+   if (!apple)
+      return;
+   apple->touches[0].screen_pos = COCOA_POS_PACK(x, y);
+   apple->window_pos          = COCOA_POS_PACK(x, y);
+}
+
+/* The touches on screen are given anew: none, then one call of
+ * cocoa_input_touch_add() for each, which says false once there is no
+ * room for more. */
+void cocoa_input_touches_begin(void)
+{
+   cocoa_input_data_t *apple = cocoa_input_current();
+   if (apple)
+      apple->touch_count = 0;
+}
+
+bool cocoa_input_touch_add(int16_t x, int16_t y)
+{
+   cocoa_input_data_t *apple = cocoa_input_current();
+   if (!apple || apple->touch_count >= MAX_TOUCHES)
+      return false;
+   apple->touches[apple->touch_count++].screen_pos = COCOA_POS_PACK(x, y);
+   return true;
+}
+
+/* Every touch is let go and forgotten: the application lost the
+ * screen and will not see them end. */
+void cocoa_input_touches_reset(void)
+{
+   cocoa_input_data_t *apple = cocoa_input_current();
+   if (!apple)
+      return;
+   apple->touch_count = 0;
+   memset(apple->touches, 0, sizeof(apple->touches));
+}
+
+/* Whether the mouse is held in the window. */
+bool cocoa_input_mouse_grabbed(void)
+{
+   cocoa_input_data_t *apple = cocoa_input_current();
+   return apple && apple->mouse_grabbed;
+}

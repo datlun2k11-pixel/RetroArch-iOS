@@ -820,8 +820,9 @@ void libretro_get_environment_info(
    runloop_st->flags &= ~RUNLOOP_FLAG_IGNORE_ENVIRONMENT_CB;
 }
 
-static dylib_t load_dynamic_core(const char *path, char *s,
-      size_t len)
+/* Whether the core path is resolved through symlinks before it is
+ * opened (and saved to history) */
+static bool load_dynamic_core_resolves_symlinks(void)
 {
 #if defined(ANDROID)
    /* Can't resolve symlinks when dealing with cores
@@ -829,10 +830,181 @@ static dylib_t load_dynamic_core(const char *path, char *s,
     * source files have non-standard file names (which
     * will not be recognised by regular core handling
     * routines) */
-   bool resolve_symlinks = !play_feature_delivery_enabled();
+   return !play_feature_delivery_enabled();
 #else
-   bool resolve_symlinks = true;
+   return true;
 #endif
+}
+
+/* ---- the core's library, opened ahead of the load ----
+ *
+ * Mapping a core and running its constructors is the system loader's
+ * work, sized by the core (MAME and friends are hundreds of
+ * megabytes), so a staged load opens it on the task worker while the
+ * frame loop goes on, and the core stage takes the handle.  Only the
+ * open moves: retro_init, the content read and retro_load_game stay on
+ * the thread that will call retro_run.
+ *
+ * The open starts only once the previous core's handle is closed (the
+ * load's close stage): dlopen of a path already loaded returns the
+ * instance already there, so opening the new core before the old one
+ * is released would hand back the old core's statics on a same-core
+ * reload.  The slot is touched on the main thread (begin, take, the
+ * callback); the worker touches only its own task state.  A generation
+ * counter discards a result whose load was superseded by teardown. */
+#if defined(HAVE_DYNAMIC) && defined(HAVE_THREADS)
+typedef struct core_preload_handle
+{
+   char   *path;
+   dylib_t lib;
+   unsigned generation;
+} core_preload_handle_t;
+
+static char    *core_preload_slot_path = NULL;  /* what the slot holds */
+static dylib_t  core_preload_slot_lib  = NULL;  /* NULL if it would not open */
+static bool     core_preload_slot_done = false;
+static bool     core_preload_pending   = false;
+static unsigned core_preload_generation = 0;
+
+static void core_preload_task_handler(retro_task_t *task)
+{
+   core_preload_handle_t *h = task ? (core_preload_handle_t*)task->state : NULL;
+   /* The open: the one thing off the main thread */
+   if (h && h->path)
+      h->lib = dylib_load(h->path);
+   if (task)
+      task_set_flags(task, RETRO_TASK_FLG_FINISHED, true);
+}
+
+static void core_preload_task_cb(retro_task_t *task,
+      void *task_data, void *user_data, const char *err)
+{
+   core_preload_handle_t *h = task ? (core_preload_handle_t*)task->state : NULL;
+   (void)task_data; (void)user_data; (void)err;
+   if (!h)
+      return;
+   core_preload_pending = false;
+   /* Superseded while it was opening: the handle is nobody's now */
+   if (h->generation != core_preload_generation)
+   {
+      if (h->lib)
+         dylib_close(h->lib);
+      h->lib = NULL;
+      return;
+   }
+   core_preload_slot_lib  = h->lib;
+   h->lib                 = NULL;
+   core_preload_slot_done = true;   /* lib NULL here means it would not open */
+}
+
+static void core_preload_task_free(retro_task_t *task)
+{
+   core_preload_handle_t *h = task ? (core_preload_handle_t*)task->state : NULL;
+   if (!h)
+      return;
+   if (h->lib)
+      dylib_close(h->lib);
+   if (h->path)
+      free(h->path);
+   free(h);
+   task->state = NULL;
+}
+
+/* Main thread.  Drops an unconsumed handle and tells an in-flight open
+ * to discard its result. */
+static void core_preload_reset(void)
+{
+   if (core_preload_slot_lib)
+   {
+      dylib_close(core_preload_slot_lib);
+      core_preload_slot_lib = NULL;
+   }
+   if (core_preload_slot_path)
+   {
+      free(core_preload_slot_path);
+      core_preload_slot_path = NULL;
+   }
+   core_preload_slot_done = false;
+   core_preload_generation++;   /* invalidate any open still running */
+}
+
+/* Main thread.  Hands over the opened handle when the slot holds one
+ * for @path, else NULL - the caller opens it itself. */
+static dylib_t core_preload_take(const char *path)
+{
+   dylib_t lib;
+   if (     !core_preload_slot_done
+         || !core_preload_slot_path
+         || !string_is_equal(core_preload_slot_path, path ? path : ""))
+      return NULL;
+   lib                    = core_preload_slot_lib;
+   core_preload_slot_lib  = NULL;
+   core_preload_reset();
+   return lib;
+}
+
+bool runloop_core_preload_begin(void)
+{
+   retro_task_t          *task = NULL;
+   core_preload_handle_t *h    = NULL;
+   const char            *path = path_get(RARCH_PATH_CORE);
+
+   /* Only a plain core named by the push, and only with a worker to
+    * open it on: inline, the open would run on this thread at the next
+    * check, which is the synchronous path. */
+   if (     !path || !*path
+         || !(runloop_state.flags & RUNLOOP_FLAG_HAS_SET_CORE)
+         ||  runloop_state.explicit_current_core_type != CORE_TYPE_PLAIN
+         || !task_queue_is_threaded()
+         || core_preload_pending)
+      return false;
+
+   core_preload_reset();
+
+   /* The path load_dynamic_core() will open: resolved the same way,
+    * in place, so the core stage finds the handle under it */
+   path_resolve_realpath(path_get_ptr(RARCH_PATH_CORE),
+         path_get_realsize(RARCH_PATH_CORE),
+         load_dynamic_core_resolves_symlinks());
+   path = path_get(RARCH_PATH_CORE);
+
+   if (     !(task = task_init())
+         || !(h    = (core_preload_handle_t*)calloc(1, sizeof(*h))))
+   {
+      if (task)
+         free(task);
+      return false;
+   }
+
+   h->path                = strdup(path);
+   h->generation          = core_preload_generation;
+   core_preload_slot_path = strdup(path);
+   task->handler          = core_preload_task_handler;
+   task->state            = h;
+   task->callback         = core_preload_task_cb;
+   task->cleanup          = core_preload_task_free;
+   task->flags           |= RETRO_TASK_FLG_MUTE;
+
+   core_preload_pending   = true;
+   task_queue_push(task);
+   return true;
+}
+
+bool runloop_core_preload_ready(void)
+{
+   return !core_preload_pending;
+}
+
+void runloop_core_preload_cancel(void)
+{
+   core_preload_reset();
+}
+#endif
+
+static dylib_t load_dynamic_core(const char *path, char *s,
+      size_t len)
+{
+   bool resolve_symlinks = load_dynamic_core_resolves_symlinks();
 
    /* Can't lookup symbols in itself on UWP */
 #if !(defined(__WINRT__) || defined(WINAPI_FAMILY) && WINAPI_FAMILY == WINAPI_FAMILY_PHONE_APP)
@@ -853,6 +1025,13 @@ static dylib_t load_dynamic_core(const char *path, char *s,
     * saved to content history, and a relative path would
     * break in that scenario. */
    path_resolve_realpath(s, len, resolve_symlinks);
+#if defined(HAVE_DYNAMIC) && defined(HAVE_THREADS)
+   {
+      dylib_t pre = core_preload_take(path);
+      if (pre)
+         return pre;
+   }
+#endif
    return dylib_load(path);
 }
 
@@ -889,6 +1068,14 @@ static dylib_t libretro_get_system_info_lib(const char *path,
 
    return lib;
 }
+#endif
+
+#if !(defined(HAVE_DYNAMIC) && defined(HAVE_THREADS))
+/* No worker to open the library on: the core stage loads it
+ * (or links it statically), so the preload stage has nothing to do. */
+bool runloop_core_preload_begin(void)  { return false; }
+bool runloop_core_preload_ready(void)  { return true; }
+void runloop_core_preload_cancel(void) { }
 #endif
 
 static void runloop_update_runtime_log(
@@ -4781,6 +4968,30 @@ uint32_t runloop_get_flags(void)
    return runloop_state.flags;
 }
 
+/* The platform has taken the application away, or given it back:
+ * paused and idle while it is away. */
+void runloop_set_platform_paused(bool paused)
+{
+   if (paused)
+      runloop_state.flags |=  (RUNLOOP_FLAG_PAUSED | RUNLOOP_FLAG_IDLE);
+   else
+      runloop_state.flags &= ~(RUNLOOP_FLAG_PAUSED | RUNLOOP_FLAG_IDLE);
+}
+
+/* Whether the keyboard callback in place is the frontend's own, which
+ * is the one a replay feeds its recorded keys to. */
+bool runloop_key_event_is_frontend(void)
+{
+   return     runloop_state.key_event
+           && runloop_state.key_event == runloop_state.frontend_key_event;
+}
+
+/* Whether a core has content loaded. */
+bool runloop_content_loaded(void)
+{
+   return (runloop_state.current_core.flags & RETRO_CORE_FLAG_GAME_LOADED) != 0;
+}
+
 void runloop_system_info_free(void)
 {
    runloop_state_t *runloop_st   = &runloop_state;
@@ -4810,6 +5021,7 @@ void runloop_system_info_free(void)
 
    runloop_st->key_event                              = NULL;
    runloop_st->frontend_key_event                     = NULL;
+   runloop_st->secondary_key_event                    = NULL;
 
    memset(&runloop_st->system, 0, sizeof(rarch_system_info_t));
 }
@@ -5966,6 +6178,11 @@ bool runloop_event_init_core(
    sys_info->load_no_content = false;
    runloop_st->current_core.retro_set_environment(runloop_environment_cb);
 
+   /* The dummy stands in for the selected core, which the menu
+    * describes - on static builds, the linked core. */
+   if (type == CORE_TYPE_DUMMY)
+      command_event(CMD_EVENT_LOAD_CORE_PERSIST, NULL);
+
    /* Load any input remap files
     * > Note that we always cache the current global
     *   input settings when initialising a core
@@ -7029,6 +7246,17 @@ static void runloop_idle_wait(void)
       retro_sleep(10);
 }
 
+#ifdef HAVE_REWIND
+/* The rewind buffer a load asked for: one full serialize of the core,
+ * taken on the frame after the load, before the core runs. */
+static VIDEO_NOINLINE void runloop_rewind_init_pending(
+      runloop_state_t *runloop_st)
+{
+   runloop_st->rewind_st.flags &= ~STATE_MGR_REWIND_ST_FLAG_INIT_PENDING;
+   command_event(CMD_EVENT_REWIND_INIT, NULL);
+}
+#endif
+
 static enum runloop_state_enum runloop_check_state(
       input_driver_state_t *input_st,
       audio_driver_state_t *audio_st,
@@ -7109,6 +7337,12 @@ static enum runloop_state_enum runloop_check_state(
 
 #ifdef HAVE_MENU
    last_input                       = current_bits;
+#ifdef HAVE_OVERLAY
+   /* buttons held on an overlay that has its own menu button do not
+    * add up to the combination */
+   if (menu_toggle_gamepad_combo != INPUT_COMBO_NONE)
+      input_driver_menu_combo_source_gate(&last_input);
+#endif
    if (     menu_toggle_gamepad_combo != INPUT_COMBO_NONE
          && input_driver_button_combo(
                menu_toggle_gamepad_combo,
@@ -7186,9 +7420,8 @@ static enum runloop_state_enum runloop_check_state(
    /* Automatic mouse grab on focus */
    if (     settings->bools.input_auto_mouse_grab
          && (is_focused)
-         && (is_focused != (((runloop_st->flags & RUNLOOP_FLAG_FOCUSED)) > 0))
-         && !(input_st->flags & INP_FLAG_GRAB_MOUSE_STATE))
-      command_event(CMD_EVENT_GRAB_MOUSE_TOGGLE, NULL);
+         && (is_focused != (((runloop_st->flags & RUNLOOP_FLAG_FOCUSED)) > 0)))
+      input_pointer_capture_hold(INPUT_CAPTURE_AUTO_FOCUS);
 
    if (is_focused)
       runloop_st->flags |=  RUNLOOP_FLAG_FOCUSED;
@@ -8197,6 +8430,9 @@ static enum runloop_state_enum runloop_check_state(
             cbs->poll_cb();
             return RUNLOOP_STATE_PAUSE;
          }
+
+         if (runloop_st->rewind_st.flags & STATE_MGR_REWIND_ST_FLAG_INIT_PENDING)
+            runloop_rewind_init_pending(runloop_st);
 
          rewinding           = state_manager_check_rewind(
                &runloop_st->rewind_st,
@@ -9409,7 +9645,9 @@ int runloop_iterate(void)
     * has in cache; no bit needed. */
    if (input_st->bsv_movie_state_handle)
    {
-      bsv_movie_next_frame(input_st);
+      bsv_movie_next_frame(input_st,
+            settings->uints.replay_checkpoint_interval,
+            settings->bools.replay_checkpoint_deserialize);
       if (input_st->bsv_movie_state.flags & BSV_FLAG_MOVIE_END)
       {
          movie_stop(input_st);

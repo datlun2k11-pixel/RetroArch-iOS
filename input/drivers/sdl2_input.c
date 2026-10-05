@@ -175,8 +175,7 @@ static bool sdl2_key_pressed(int key)
       if (sdl2_webos_sticky_pressed(slot))
          return true;
 
-      if (input_state_get_ptr()
-            && (input_state_get_ptr()->flags & INP_FLAG_KB_MAPPING_BLOCKED))
+      if (input_driver_keyboard_mapping_blocked())
          return false;
    }
    if (key == RETROK_F1 && keymap[SDL_WEBOS_SCANCODE_EXIT])
@@ -277,7 +276,7 @@ static int16_t sdl2_input_state(
          return ret;
       case RETRO_DEVICE_MOUSE:
       case RARCH_DEVICE_MOUSE_SCREEN:
-         if (config_get_ptr()->uints.input_mouse_index[ port ] == 0)
+         if (input_config_get_mouse_index(port) == 0)
          {
             switch (id)
             {
@@ -490,15 +489,8 @@ static float sdl2_get_sensor_input(void *data, unsigned port, unsigned id)
 
 static void sdl2_input_grab_mouse(void *data, bool state)
 {
-   sdl2_video_t *video_ptr = NULL;
-
-   if (string_is_not_equal(video_driver_get_ident(), "sdl2"))
-      return;
-
-   video_ptr = (sdl2_video_t*)video_driver_get_ptr();
-
-   if (video_ptr)
-      SDL_SetWindowGrab(video_ptr->window, state ? SDL_TRUE : SDL_FALSE);
+   /* the window is the video driver's */
+   sdl2_video_grab_window(state);
 }
 
 static void sdl2_poll_mouse(sdl2_input_t *sdl)
@@ -532,8 +524,7 @@ static void sdl2_input_poll(void *data)
          unsigned code = input_keymaps_translate_keysym_to_rk(
                event.key.keysym.sym);
 #ifdef WEBOS
-         input_driver_state_t *input_st = input_state_get_ptr();
-         bool osk_active = input_st && (input_st->flags & INP_FLAG_KB_MAPPING_BLOCKED);
+         bool osk_active = input_driver_keyboard_mapping_blocked();
 
          if (!osk_active)
             sdl2_webos_phys_kbd_typing = false;

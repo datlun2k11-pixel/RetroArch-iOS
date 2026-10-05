@@ -68,6 +68,7 @@
 #include "../../../content.h"
 #include "../../../input/input_driver.h"
 #include "../../../runahead.h"
+#include "../../../state_manager.h"
 #ifdef HAVE_NETWORKING
 #include "../../../network/netplay/netplay.h"
 #endif
@@ -155,6 +156,14 @@ static unsigned core_export(const char *name)
 static unsigned core_inits(void)
 {
    return core_export("harness_core_inits");
+}
+
+static unsigned long core_export_ul(const char *name)
+{
+   dylib_t lib = runloop_state_get_ptr()->lib_handle;
+   unsigned long (*fn)(void) = lib
+      ? (unsigned long (*)(void))dylib_proc(lib, name) : NULL;
+   return fn ? fn() : 0;
 }
 
 /* What one frame of the load looked like. */
@@ -457,6 +466,153 @@ static void lane_prefetch_follows_new_core(void)
       fprintf(stderr, "[pass] prefetch-follows-new-core lane\n");
 }
 #endif
+#endif
+
+#if defined(HAVE_DYNAMIC) && defined(HAVE_MENU)
+/* A load without content names its saves after the core, not after
+ * the content loaded before it. */
+static void lane_contentless_names(void)
+{
+   runloop_state_t *runloop_st = runloop_state_get_ptr();
+   content_ctx_info_t info;
+   char nohw[600];
+   char game[600];
+   FILE *f;
+   unsigned had = failures;
+
+   harness_sibling(nohw, sizeof(nohw), "harness_core_nohw.so");
+   snprintf(game, sizeof(game), "%s/names.bin", harness_dir);
+   if ((f = fopen(game, "wb")))
+   {
+      fputs("harness content", f);
+      fclose(f);
+   }
+   memset(&info, 0, sizeof(info));
+   open_menu();
+
+   CHECK(task_push_load_contentless_core_from_menu(core_path),
+         "the contentless load was not started");
+   pump(LOAD_FRAMES);
+   CHECK(task_push_load_content_with_new_core_from_menu(nohw, game,
+            &info, CORE_TYPE_PLAIN, NULL, NULL),
+         "the content load was not started");
+   pump(LOAD_FRAMES * 4);
+   CHECK(core_is_up() && strstr(path_get(RARCH_PATH_BASENAME), "names"),
+         "the content load did not name its saves after the content (\"%s\")",
+         path_get(RARCH_PATH_BASENAME));
+
+   CHECK(task_push_load_contentless_core_from_menu(core_path),
+         "the second contentless load was not started");
+   pump(LOAD_FRAMES);
+   CHECK(core_is_up(), "the second contentless load did not go through");
+   CHECK(path_is_empty(RARCH_PATH_BASENAME),
+         "the contentless load kept the content's name \"%s\"",
+         path_get(RARCH_PATH_BASENAME));
+   CHECK(    !strstr(runloop_st->name.savestate, "names")
+         &&  strstr(runloop_st->name.savestate, "content_load_harness"),
+         "the contentless load saves states to \"%s\"",
+         runloop_st->name.savestate);
+
+   remove(game);
+   if (failures == had)
+      fprintf(stderr, "[pass] contentless-names lane\n");
+}
+#endif
+
+#ifdef HAVE_REWIND
+/* The rewind buffer is one full serialize of the core: a load leaves
+ * it for the frame after, which takes it before the core runs. */
+static void lane_rewind_after_load(void)
+{
+   struct load_frame log[LOAD_FRAMES];
+   settings_t *settings        = config_get_ptr();
+   runloop_state_t *runloop_st = runloop_state_get_ptr();
+   bool rewind_enable          = settings->bools.rewind_enable;
+   unsigned n, i;
+   unsigned had = failures;
+
+   configuration_set_bool(settings, settings->bools.rewind_enable, true);
+   open_menu();
+   CHECK(task_push_load_contentless_core_from_menu(core_path),
+         "the load was not started");
+   for (n = 0; n < LOAD_FRAMES && runloop_is_content_switching(); n++)
+   {
+      runloop_iterate();
+      task_queue_check();
+      CHECK(!(runloop_st->rewind_st.flags
+               & STATE_MGR_REWIND_ST_FLAG_INIT_ATTEMPTED),
+            "frame %u of the load set up the rewind buffer", n);
+   }
+   CHECK(!runloop_is_content_switching() && core_is_up(),
+         "the load did not finish");
+   CHECK(runloop_st->rewind_st.flags & STATE_MGR_REWIND_ST_FLAG_INIT_PENDING,
+         "the load did not leave the rewind buffer for the frame after");
+   for (i = 0; i < 2 && !(runloop_st->rewind_st.flags
+            & STATE_MGR_REWIND_ST_FLAG_INIT_ATTEMPTED); i++)
+   {
+      runloop_iterate();
+      task_queue_check();
+   }
+   CHECK(i == 1,
+         "the rewind buffer was set up %u frames after the load, not on "
+         "the first", i);
+   CHECK(!(runloop_st->rewind_st.flags & STATE_MGR_REWIND_ST_FLAG_INIT_PENDING),
+         "the rewind buffer is still pending after it was set up");
+
+   command_event(CMD_EVENT_REWIND_DEINIT, NULL);
+   configuration_set_bool(settings, settings->bools.rewind_enable,
+         rewind_enable);
+   if (failures == had)
+      fprintf(stderr, "[pass] rewind-after-load lane\n");
+}
+#endif
+
+#if defined(HAVE_DYNAMIC) && defined(HAVE_THREADS)
+/* A staged load opens the core's library on the task worker, off the
+ * frame-loop thread, and the core stage takes that handle; a same-core
+ * reload still comes up on fresh statics, because the open waits for
+ * the old handle to be released. */
+static void lane_core_preloaded(void)
+{
+   settings_t *settings = config_get_ptr();
+   unsigned long load_tid, init_tid;
+   unsigned had = failures;
+
+   configuration_set_bool(settings, settings->bools.threaded_data_runloop_enable, true);
+   task_queue_set_threaded();
+   open_menu();
+
+   CHECK(task_push_load_contentless_core_from_menu(core_path),
+         "the load was not started");
+   pump(LOAD_FRAMES);
+   CHECK(core_is_up(), "the core did not come up");
+   CHECK(core_inits() == 1, "the core came up %u times", core_inits());
+
+   load_tid = core_export_ul("harness_core_load_tid");
+   init_tid = core_export_ul("harness_core_init_tid");
+   CHECK(load_tid != 0 && init_tid != 0, "the core did not record its threads");
+   CHECK(load_tid != init_tid,
+         "the library was opened on the frame-loop thread, not a worker");
+
+   /* Same core again: the old handle is released before the open, so
+    * the reloaded instance's statics are its own */
+   CHECK(task_push_load_contentless_core_from_menu(core_path),
+         "the reload was not started");
+   pump(LOAD_FRAMES);
+   CHECK(core_is_up(), "the reload did not go through");
+   CHECK(core_inits() == 1,
+         "the reload came up on the previous instance's statics (inits %u)",
+         core_inits());
+   CHECK(core_export_ul("harness_core_load_tid") != core_export_ul("harness_core_init_tid"),
+         "the reload's library open was not on a worker");
+
+   configuration_set_bool(settings, settings->bools.threaded_data_runloop_enable, false);
+   task_queue_unset_threaded();
+   pump(2);
+
+   if (failures == had)
+      fprintf(stderr, "[pass] core-preloaded lane\n");
+}
 #endif
 
 static void lane_one_at_a_time(void)
@@ -1605,6 +1761,8 @@ static void lane_secondary_threaded(void)
    runloop_state_t *runloop_st = runloop_state_get_ptr();
    enum runahead_copy_status st = RUNAHEAD_COPY_PENDING;
    unsigned (*sec_inits)(void)  = NULL;
+   unsigned (*sec_keys)(void)   = NULL;
+   unsigned primary_keys_before, sec_keys_before;
    const char *slash            = strrchr(core_path, '/');
    char nohw[600];
    unsigned primary_inits;
@@ -1642,7 +1800,23 @@ static void lane_secondary_threaded(void)
    CHECK(runloop_st->secondary_lib_handle != runloop_st->lib_handle,
          "the second instance shares the running core's handle");
 
+   /* A key event bound for the core reaches both instances */
+   if (menu_is_up())
+      command_event(CMD_EVENT_MENU_TOGGLE, NULL);
+   if (runloop_st->secondary_lib_handle)
+      sec_keys = (unsigned (*)(void))dylib_proc(
+            runloop_st->secondary_lib_handle, "harness_core_key_events");
+   primary_keys_before = core_export("harness_core_key_events");
+   sec_keys_before     = sec_keys ? sec_keys() : 0;
+   input_keyboard_event(true, RETROK_KP7, 0, 0, RETRO_DEVICE_KEYBOARD);
+   CHECK(core_export("harness_core_key_events") == primary_keys_before + 1,
+         "the running core did not get the key event");
+   CHECK(sec_keys && sec_keys() == sec_keys_before + 1,
+         "the second instance did not get the key event");
+
    runahead_secondary_core_destroy(runloop_st);
+   CHECK(!runloop_st->secondary_key_event,
+         "the closed second instance's keyboard callback is still held");
    configuration_set_bool(settings, settings->bools.threaded_data_runloop_enable, false);
    task_queue_unset_threaded();
    pump(2);
@@ -1908,6 +2082,51 @@ static void lane_close_content(void)
 }
 
 /* ------------------------------------------------------------------ */
+/* Lane: dummy session describes the selected core                    */
+/* ------------------------------------------------------------------ */
+
+/* How a static build boots: the dummy session carries the selected
+ * core's system info, or the menu offers no Start Core. */
+static void lane_dummy_selected_core(void)
+{
+   struct load_frame log[LOAD_FRAMES];
+   content_ctx_info_t content_info = {0};
+   runloop_state_t *runloop_st = runloop_state_get_ptr();
+   unsigned n;
+   unsigned had = failures;
+
+   open_menu();
+   path_set(RARCH_PATH_CORE, core_path);
+
+   CHECK(task_push_start_dummy_core(&content_info),
+         "the dummy session was not started");
+   n = run_load(log, LOAD_FRAMES);
+   CHECK(n < LOAD_FRAMES && !runloop_is_content_switching(),
+         "the dummy session did not come up within %u frames",
+         LOAD_FRAMES);
+   CHECK(runloop_st->current_core_type == CORE_TYPE_DUMMY,
+         "the dummy core is not running");
+   CHECK(runloop_st->system.load_no_content,
+         "the selected core's no-game support is missing (no Start Core)");
+   CHECK(string_is_equal(runloop_st->system.info.library_name,
+            "content_load_harness"),
+         "the session names \"%s\", not the selected core",
+         runloop_st->system.info.library_name);
+
+   /* Start Core, to leave a core running */
+   CHECK(task_push_start_current_core(&content_info),
+         "Start Core was not started");
+   n = run_load(log, LOAD_FRAMES);
+   CHECK(n < LOAD_FRAMES && core_is_up()
+         && runloop_st->current_core_type != CORE_TYPE_DUMMY,
+         "Start Core did not go through");
+   runloop_iterate();
+
+   if (failures == had)
+      fprintf(stderr, "[pass] dummy selected-core lane\n");
+}
+
+/* ------------------------------------------------------------------ */
 
 int main(int argc, char *argv[])
 {
@@ -1951,6 +2170,10 @@ int main(int argc, char *argv[])
       fprintf(cfg, "threaded_data_runloop_enable = \"false\"\n");
       /* The records of the cores asked live next to the info cache */
       fprintf(cfg, "libretro_info_path = \"%s\"\n", dir);
+      /* Where a contentless core's states go, named after the core:
+       * the close-waits-for-save lane needs a save that can be
+       * written, on every load */
+      fprintf(cfg, "savestate_directory = \"%s\"\n", dir);
       fclose(cfg);
    }
 
@@ -1984,11 +2207,7 @@ int main(int argc, char *argv[])
    }
    rarch_argv[rarch_argc++] = (char*)"-L";
    rarch_argv[rarch_argc++] = core_path;
-   /* A state path of its own: a contentless core derives none, and
-    * the close-waits-for-save lane needs a save that can be written. */
    snprintf(state_path, sizeof(state_path), "%s/harness.state", dir);
-   rarch_argv[rarch_argc++] = (char*)"-S";
-   rarch_argv[rarch_argc++] = state_path;
    if (getenv("HARNESS_VERBOSE"))
       rarch_argv[rarch_argc++] = (char*)"-v";
 
@@ -2011,6 +2230,12 @@ int main(int argc, char *argv[])
    lane_probe_cached();
 #endif
    lane_one_at_a_time();
+#if defined(HAVE_DYNAMIC) && defined(HAVE_THREADS)
+   lane_core_preloaded();
+#endif
+#ifdef HAVE_REWIND
+   lane_rewind_after_load();
+#endif
    lane_reinit_deferred();
    lane_fallback();
    lane_fallback_threaded();
@@ -2022,6 +2247,7 @@ int main(int argc, char *argv[])
    lane_hw_request();
    lane_queue_survives();
    lane_close_content();
+   lane_dummy_selected_core();
    lane_close_waits_for_save();
 #ifdef HAVE_NETWORKING
    lane_host_setup_deferred();
@@ -2037,6 +2263,7 @@ int main(int argc, char *argv[])
    /* Last: a content load leaves its save state name behind for the
     * contentless loads after it */
    lane_prefetch_follows_new_core();
+   lane_contentless_names();
 #endif
 
    main_exit(NULL);
@@ -2050,6 +2277,19 @@ int main(int argc, char *argv[])
       snprintf(leftover, sizeof(leftover), "%s/core_info.cache", dir);
       remove(leftover);
       snprintf(leftover, sizeof(leftover), "%s.png", state_path);
+      remove(leftover);
+      /* the contentless core's states, flat or in its own folder */
+      snprintf(leftover, sizeof(leftover),
+            "%s/content_load_harness.state", dir);
+      remove(leftover);
+      snprintf(leftover, sizeof(leftover),
+            "%s/content_load_harness.state.png", dir);
+      remove(leftover);
+      snprintf(leftover, sizeof(leftover),
+            "%s/content_load_harness/content_load_harness.state", dir);
+      remove(leftover);
+      snprintf(leftover, sizeof(leftover),
+            "%s/content_load_harness/content_load_harness.state.png", dir);
       remove(leftover);
       /* the per-core save folder a content load makes */
       snprintf(leftover, sizeof(leftover), "%s/content_load_harness", dir);

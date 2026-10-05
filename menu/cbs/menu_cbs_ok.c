@@ -4073,8 +4073,7 @@ static int action_ok_rename_entry(const char *path,
    if ((playlist = playlist_get_cached()))
       playlist_get_index(playlist, entry_idx, &entry);
    if (entry && entry->label && *entry->label)
-      input_keyboard_line_append(&input_state_get_ptr()->keyboard_line,
-            entry->label, strlen(entry->label));
+      input_driver_keyboard_line_append(entry->label, strlen(entry->label));
 
    return 0;
 }
@@ -4321,6 +4320,14 @@ static int action_ok_remap_file_reset(const char *path,
    input_remapping_set_defaults(false);
    runloop_msg_queue_push(_msg, strlen(_msg), 1, 100, true, NULL,
          MESSAGE_QUEUE_ICON_DEFAULT, MESSAGE_QUEUE_CATEGORY_INFO);
+   return 0;
+}
+
+static int action_ok_input_remap_find(const char *path,
+      const char *label, unsigned type, size_t idx, size_t entry_idx)
+{
+   /* the entry carries its port */
+   menu_input_remap_find_begin((unsigned)entry_idx);
    return 0;
 }
 
@@ -9861,6 +9868,7 @@ static int menu_cbs_init_bind_ok_compare_label(menu_file_list_cbs_t *cbs,
          {MENU_ENUM_LABEL_REMAP_FILE_REMOVE_CONTENT_DIR,       action_ok_remap_file_remove_content_dir},
          {MENU_ENUM_LABEL_REMAP_FILE_REMOVE_GAME,              action_ok_remap_file_remove_game},
          {MENU_ENUM_LABEL_REMAP_FILE_RESET,                    action_ok_remap_file_reset},
+         {MENU_ENUM_LABEL_INPUT_REMAP_FIND,                    action_ok_input_remap_find},
          {MENU_ENUM_LABEL_REMAP_FILE_FLUSH,                    action_ok_remap_file_flush},
          {MENU_ENUM_LABEL_OVERRIDE_FILE_LOAD,                  action_ok_override_file},
          {MENU_ENUM_LABEL_OVERRIDE_FILE_SAVE_AS,               action_ok_override_file_save_as},

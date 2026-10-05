@@ -4236,13 +4236,20 @@ bool video_driver_texture_load(void *data,
    if (ti && ti->compressed && !ti->pixels)
       image_texture_realize_rgba(ti);
 
-   /* A 10-bit (XRGB2101010) texture is only kept for drivers that advertise
-    * native 10-bit source support; otherwise narrow to 8-bit ARGB8888 before
-    * upload so the driver's ordinary 8-bit path stays correct. */
+   /* A 10-bit (XRGB2101010) texture is only kept for drivers whose
+    * texture path samples it; otherwise it is narrowed to 8 bits before
+    * upload so the driver's ordinary path stays correct. That is the
+    * texture path's own answer, not GFX_CTX_FLAGS_SCREEN_10BPC_SOURCE,
+    * which says whether a context presents 10-bit core frames. */
    if (     ti
          && ti->pix10
-         && !video_driver_test_all_flags(GFX_CTX_FLAGS_SCREEN_10BPC_SOURCE))
+         && !video_driver_supports_texture_format(TEXTURE_GPU_FORMAT_RGB10A2))
       image_texture_narrow_10bit(ti);
+   /* Half floats have no 8-bit form to fall back to here. */
+   if (     ti
+         && ti->fp16
+         && !video_driver_supports_texture_format(TEXTURE_GPU_FORMAT_RGBA16F))
+      return false;
 
    GFX_INSTR_INC(GFX_INSTR_TEX_LOAD);
    *id = poke->load_texture(video_st->data, data, threaded, filter_type);
@@ -4270,8 +4277,13 @@ bool video_driver_texture_load_async(void *data,
    if (!ti->compressed && video_driver_thread_wrapper_active())
    {
       if (     ti->pix10
-            && !video_driver_test_all_flags(GFX_CTX_FLAGS_SCREEN_10BPC_SOURCE))
+            && !video_driver_supports_texture_format(
+               TEXTURE_GPU_FORMAT_RGB10A2))
          image_texture_narrow_10bit(ti);
+      if (     ti->fp16
+            && !video_driver_supports_texture_format(
+               TEXTURE_GPU_FORMAT_RGBA16F))
+         return false;
       GFX_INSTR_INC(GFX_INSTR_TEX_LOAD_ASYNC);
       if (video_thread_texture_load_async(ti, filter_type,
                done, user, release))
@@ -4322,6 +4334,33 @@ bool video_driver_texture_can_update(void)
       return video_thread_texture_can_update();
 #endif
    return poke && poke->update_texture;
+}
+
+void *video_driver_texture_lend(uintptr_t id, unsigned slot,
+      size_t pitch)
+{
+   video_driver_state_t *video_st     = &video_driver_st;
+   const video_poke_interface_t *poke = video_st->poke;
+#ifdef HAVE_THREADS
+   if (video_driver_thread_wrapper_active())
+      return NULL;
+#endif
+   if (!id || !poke || !poke->texture_lend || !video_st->data)
+      return NULL;
+   return poke->texture_lend(video_st->data, id, slot, pitch);
+}
+
+bool video_driver_texture_lend_ready(uintptr_t id, unsigned slot)
+{
+   video_driver_state_t *video_st     = &video_driver_st;
+   const video_poke_interface_t *poke = video_st->poke;
+#ifdef HAVE_THREADS
+   if (video_driver_thread_wrapper_active())
+      return true;
+#endif
+   if (!id || !poke || !poke->texture_lend_ready || !video_st->data)
+      return true;
+   return poke->texture_lend_ready(video_st->data, id, slot);
 }
 
 bool video_driver_texture_unload(uintptr_t *id)
@@ -5448,6 +5487,92 @@ bool video_context_driver_get_refresh_rate(float *refresh_rate)
    return true;
 }
 
+bool video_context_driver_is(const char *ident)
+{
+   video_driver_state_t *video_st = &video_driver_st;
+   return   ident
+         && video_st->current_video_context.ident
+         && string_is_equal(video_st->current_video_context.ident, ident);
+}
+
+#ifdef HAVE_THREADS
+/* EGL bindings are per-thread. Under threaded video the context is made
+ * current on the video thread, so an eglMakeCurrent() issued from the
+ * frontend's releases that thread's (empty) binding and leaves the
+ * surface current on the worker - and a later create_surface() would
+ * bind the same context a second time, on a second thread. Both entry
+ * points therefore run where the context lives. */
+static uintptr_t video_context_surface_create_cb(void *data)
+{
+   video_driver_state_t *video_st = &video_driver_st;
+
+   if (!video_st->current_video_context.create_surface)
+      return 0;
+
+   return video_st->current_video_context.create_surface(data) ? 1 : 0;
+}
+
+static uintptr_t video_context_surface_destroy_cb(void *data)
+{
+   video_driver_state_t *video_st = &video_driver_st;
+
+   if (video_st->current_video_context.destroy_surface)
+      video_st->current_video_context.destroy_surface(data);
+
+   return 0;
+}
+#endif
+
+bool video_context_surface_can_create(void)
+{
+   return video_driver_st.current_video_context.create_surface != NULL;
+}
+
+bool video_context_surface_create(void)
+{
+   video_driver_state_t *video_st = &video_driver_st;
+#ifdef HAVE_THREADS
+   /* The callback null-checks the hook and reports failure, and the
+    * dispatch reports failure when the worker is gone. It goes to the
+    * video thread, or straight through when the wrapper is inactive or
+    * this already is the video thread. */
+   return video_thread_texture_handle(video_st->context_data,
+         video_context_surface_create_cb) != 0;
+#else
+   if (!video_st->current_video_context.create_surface)
+      return false;
+   return video_st->current_video_context.create_surface(
+         video_st->context_data);
+#endif
+}
+
+void video_context_surface_destroy(void)
+{
+   video_driver_state_t *video_st = &video_driver_st;
+
+   if (!video_st->current_video_context.destroy_surface)
+      return;
+
+#ifdef HAVE_THREADS
+   /* The video worker may still be recording a frame that references the
+    * surface. Drain it before the context driver frees the surface. */
+   video_thread_wait_idle();
+
+   /* Dispatches to the video thread, or calls straight through when the
+    * wrapper is inactive or this already is the video thread. */
+   video_thread_texture_handle(video_st->context_data,
+         video_context_surface_destroy_cb);
+#else
+   video_st->current_video_context.destroy_surface(video_st->context_data);
+#endif
+}
+
+const char *video_driver_get_configured_ident(void)
+{
+   video_driver_state_t *video_st = &video_driver_st;
+   return video_st->cached_driver_id[0] ? video_st->cached_driver_id : NULL;
+}
+
 bool video_context_driver_get_ident(gfx_ctx_ident_t *ident)
 {
    video_driver_state_t *video_st  = &video_driver_st;
@@ -6324,24 +6449,12 @@ bool video_driver_init_internal(bool *video_is_threaded, bool verbosity_enabled)
    if ((enum rotation)settings->uints.screen_orientation != ORIENTATION_NORMAL)
       video_display_server_set_screen_orientation((enum rotation)settings->uints.screen_orientation);
 
-   /* Ensure that we preserve the 'grab mouse'
-    * state if it was enabled prior to driver
-    * (re-)initialisation */
-   if (input_driver_get_flags() & INP_FLAG_GRAB_MOUSE_STATE)
-   {
-      if (     video_st->poke
-            && video_st->poke->show_mouse)
-         video_st->poke->show_mouse(video_st->data, false);
-      input_driver_grab_mouse_for_video();
-   }
-   else if (video.fullscreen)
-   {
-      if (     video_st->poke
-            && video_st->poke->show_mouse)
-         video_st->poke->show_mouse(video_st->data, false);
-      if (!settings->bools.video_windowed_fullscreen)
-         input_driver_grab_mouse_for_video();
-   }
+   /* The reasons the pointer is captured for are kept above the
+    * drivers. What fullscreen adds is worked out for this video mode,
+    * and all of it is applied to the driver that has just started. */
+   input_pointer_capture_set_fullscreen(video.fullscreen,
+         !settings->bools.video_windowed_fullscreen);
+   input_pointer_capture_apply(true);
 
 #ifdef HAVE_OVERLAY
    input_overlay_check_mouse_cursor();
@@ -7704,6 +7817,15 @@ static void video_driver_reinit_context(settings_t *settings, int flags)
 
    memcpy(hwr, &hwr_copy, sizeof(*hwr));
    video_st->hw_render_context_negotiation = iface;
+   /* And the published type with it. The uninit clears both the
+    * struct and its mirror (video_driver_free_hw_context()), and
+    * video_driver_is_hw_context() reads only the mirror: put back
+    * without it, every restart under a core that renders with the
+    * GPU - a fullscreen toggle, a core option that changes the
+    * resolution - left the frontend believing it had a software core,
+    * drivers_init() below included. */
+   retro_atomic_store_release_int(&video_st->hw_context_type,
+         (int)hwr_copy.context_type);
 
    drivers_init(settings, flags, DRIVER_LIFETIME_RESET, verbosity_is_enabled());
 }

@@ -82,6 +82,10 @@ extern float g_win32_refresh_rate;
 extern ui_window_win32_t main_window;
 extern HACCEL window_accelerators;
 
+/* A line of text has been opened in the frontend, or closed: the main
+ * window has its IME input context only while one is open. */
+void win32_text_entry(bool active);
+
 void win32_monitor_get_info(void);
 
 void win32_monitor_info(void *data, void *hm_data, unsigned *mon_id);
@@ -187,6 +191,11 @@ void win32_destroy_window(void);
  * destroying it; win32_set_video_mode() then takes it rather than make
  * one. False if it cannot be left - the caller destroys it as before. */
 bool win32_window_keep(void);
+
+/* The size the window's client area really is, which is not always
+ * the size win32_set_video_mode() was asked for; @dims with no window.
+ * For the swap chain a driver makes on it. */
+unsigned win32_window_client_dims(unsigned dims);
 
 /* A window left up that the next driver did not take goes. Called
  * once that driver is up, or has failed to come up. */

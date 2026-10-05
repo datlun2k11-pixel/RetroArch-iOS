@@ -45,6 +45,8 @@ const struct rarch_key_map rarch_key_map_winraw[] = { { 0, RETROK_UNKNOWN } };
 static settings_t stub_settings;
 static struct menu_state stub_menu;
 settings_t *config_get_ptr(void) { return &stub_settings; }
+/* the settings a driver asks for by name, read from the ones above */
+#include "../input_config_stubs.h"
 
 /* A port's keyboard, as the frontend works it out from the port's pin
  * and number: the rule itself (input/common/input_device_pins.h), fed
@@ -91,6 +93,7 @@ unsigned input_mouse_port_index(unsigned port)
    return choice[port] < 0 ? MAX_INPUT_DEVICES : (unsigned)choice[port];
 }
 struct menu_state *menu_state_get_ptr(void) { return &stub_menu; }
+bool menu_driver_alive(void) { return (stub_menu.flags & MENU_ST_FLAG_ALIVE) != 0; }
 void RARCH_LOG(const char *fmt, ...) { (void)fmt; }
 void RARCH_DBG(const char *fmt, ...) { (void)fmt; }
 void RARCH_ERR(const char *fmt, ...) { (void)fmt; }

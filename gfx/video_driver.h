@@ -906,7 +906,10 @@ typedef struct video_poke_interface
    /* Optional GPU-native compressed-texture path (BCn/ETC/ASTC).
     * Drivers that can sample the format implement both; leaving them
     * NULL (the default) makes video_driver_texture_load() fall back to
-    * a CPU decode + the normal RGBA8 load_texture. */
+    * a CPU decode + the normal RGBA8 load_texture.
+    * supports_texture_format also answers TEXTURE_GPU_FORMAT_RGB10A2:
+    * whether load_texture and update_texture take a pix10 image as
+    * 10-bit. Without it such an image is narrowed to 8 bits first. */
    bool      (*supports_texture_format)(void *data,
          enum texture_gpu_format fmt);
    uintptr_t (*load_texture_compressed)(void *video_data,
@@ -1002,6 +1005,27 @@ typedef struct video_poke_interface
     * while the audio rate was scaled for the full multiple. Drivers
     * that hold a frame for as long as they are asked leave it NULL. */
    unsigned (*get_swap_interval_cap)(void *data);
+
+   /* Lending a streamed texture's upload memory, so a producer writes
+    * a frame where update_texture copies it to the GPU from and the
+    * copy into it goes away. Direct video only: the thread wrapper
+    * leaves both NULL, since the lent memory's readiness is the
+    * video thread's to know.
+    *
+    * texture_lend hands out slot @slot of texture @id's upload memory,
+    * mapped and writable, when its rows lie the @pitch bytes apart the
+    * caller writes them at; NULL, with nothing lent, otherwise. The
+    * memory is the texture's until it is unloaded. update_texture given a texture_image whose pixels
+    * are a lent slot uploads from there; with any slot lent, an update
+    * from other memory only ever goes through the slots not lent.
+    *
+    * texture_lend_ready answers whether lent slot @slot may be written:
+    * false while the GPU may still read the last upload from it. Never
+    * waits. */
+   void *(*texture_lend)(void *video_data, uintptr_t id, unsigned slot,
+         size_t pitch);
+   bool (*texture_lend_ready)(void *video_data, uintptr_t id,
+         unsigned slot);
 } video_poke_interface_t;
 
 /* dims is the frame's size, VIDEO_SCALE_PACK'd; msg is for showing a
@@ -1224,10 +1248,12 @@ typedef struct
 #endif
 
    /* hw_render.context_type, published for cross-thread readers:
-    * both writers run on the main thread and store-release this
-    * mirror after their edit lands - SET_HW_RENDER after copying
+    * every writer runs on the main thread and store-releases this
+    * mirror after its edit lands - SET_HW_RENDER after copying
     * the callback in, video_driver_free_hw_context() after
-    * context_destroy() and the memset - so an acquire load reading
+    * context_destroy() and the memset, and whoever puts a saved
+    * request back (video_driver_hw_request_restore(), a driver
+    * restart) after the copy - so an acquire load reading
     * RETRO_HW_CONTEXT_NONE is guaranteed the teardown completed.
     * video_driver_is_hw_context() reads only this; the hw_render
     * struct itself stays main-thread state. */
@@ -1894,8 +1920,16 @@ bool video_driver_texture_update(uintptr_t id, void *data);
  * replacement load on this, once per surface rather than per frame. */
 bool video_driver_texture_can_update(void);
 
-/* Whether the active driver can sample @fmt as a compressed texture.
- * False with no driver, no poke, or a format it declines. */
+/* texture_lend / texture_lend_ready of the active driver; NULL and
+ * true under the thread wrapper or with a driver that lends nothing,
+ * where no slot is ever lent. Main thread. */
+void *video_driver_texture_lend(uintptr_t id, unsigned slot,
+      size_t pitch);
+bool video_driver_texture_lend_ready(uintptr_t id, unsigned slot);
+
+/* Whether the active driver can sample @fmt: a compressed texture, or
+ * for TEXTURE_GPU_FORMAT_RGB10A2 a pix10 image as 10-bit. False with
+ * no driver, no poke, or a format it declines. */
 bool video_driver_supports_texture_format(enum texture_gpu_format fmt);
 
 /* Upload without making the caller wait for the video thread. @data
@@ -1994,6 +2028,31 @@ const gfx_ctx_driver_t *video_context_driver_init_first(
 bool video_context_driver_set(const gfx_ctx_driver_t *data);
 
 bool video_context_driver_get_ident(gfx_ctx_ident_t *ident);
+
+/* Whether the video context in use is the one named. */
+bool video_context_driver_is(const char *ident);
+
+/* A context's window surface, for a platform that takes the surface
+ * away while the context lives on - Android does when the app goes to
+ * the background, and gives one back when it returns. Both run where
+ * the context lives: EGL's bindings are per thread, so under threaded
+ * video they are handed to the video thread.
+ *
+ * video_context_surface_can_create() says whether the context can be
+ * given a new surface at all; video_context_surface_create() does it
+ * and returns false when it cannot or it failed, which leaves a
+ * restart of the video driver. video_context_surface_destroy() lets
+ * the surface go, after the video thread has finished the frame that
+ * may still be using it. */
+bool video_context_surface_can_create(void);
+bool video_context_surface_create(void);
+void video_context_surface_destroy(void);
+
+/* The video driver the configuration names, when a core has forced
+ * another for as long as it is loaded and the setting holds that one
+ * for now; NULL when the setting is the configured one. For code that
+ * writes the configuration out while the core is still loaded. */
+const char *video_driver_get_configured_ident(void);
 
 bool video_context_driver_get_refresh_rate(float *refresh_rate);
 

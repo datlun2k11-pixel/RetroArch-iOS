@@ -543,6 +543,11 @@ struct menu_state
 
    /* unsigned alignment */
    unsigned input_dialog_kb_idx;
+   /* Nonzero: the input held now is held back - from the menu, the
+    * hotkeys and the core - until it is all let go, which clears it.
+    * Set when the menu opens or closes, a bind or a text entry ends,
+    * and the mouse clicks, so that the press that did it does nothing
+    * more. It is a wait for release and not a count of frames. */
    unsigned input_driver_flushing_input;
    menu_dialog_t dialog_st;
    enum menu_action prev_action;
@@ -578,6 +583,14 @@ struct menu_state
 #ifdef HAVE_MENU
    char input_dialog_kb_label_setting[256];
    char input_dialog_kb_label[256];
+
+   /* The on-screen keyboard, which is the menu's widget: what its keys
+    * show, where its cursor is, and which page of keys is up. What it
+    * types goes to the frontend's line of text, as a hardware key's
+    * does. */
+   char *osk_grid[45];
+   int osk_ptr;
+   enum osk_type osk_idx;
 #endif
    unsigned char kb_key_state[RETROK_LAST];
 
@@ -820,6 +833,10 @@ size_t menu_update_fullscreen_thumbnail_label(
       bool is_quick_menu, const char *title);
 
 bool menu_is_running_quick_menu(void);
+
+/* "Find a Button by Pressing It": waits for a button of @port's
+ * controller and puts the selection on its entry. */
+void menu_input_remap_find_begin(unsigned port);
 
 bool menu_input_key_bind_set_mode(
       enum menu_input_binds_ctl_state state, void *data);

@@ -1694,13 +1694,21 @@ static bool gfx_display_texture_load_ex(struct texture_image *ti,
       if (e)
       {
          enum gfx_surface_submit_result r;
+         gfx_surface_src_t src;
          /* A newer load for the same slot replaces one in flight */
          gfx_display_texture_loads_cancel(item, sizeof(*item));
-         e->item  = item;
-         e->img   = *ti;
-         e->owned = owned;
-         r        = gfx_surface_submit_external(s, ti->pixels,
-               ti->supports_rgba, gfx_display_tex_load_release, e);
+         e->item          = item;
+         e->img           = *ti;
+         e->owned         = owned;
+         /* The entry frees the pixels from its release, which always
+          * runs: a display load's surface is only freed there. */
+         src.pixels       = ti->pixels;
+         src.payload      = NULL;
+         src.payload_free = NULL;
+         src.pixfmt       = GFX_SURFACE_PIXFMT_8888;
+         src.rgba         = ti->supports_rgba;
+         r                = gfx_surface_submit_external(s, &src,
+               gfx_display_tex_load_release, e);
          if (r == GFX_SURFACE_SUBMIT_QUEUED)
          {
             e->next               = gfx_display_tex_loads;
@@ -1745,6 +1753,7 @@ bool gfx_display_reset_textures_list_buffer(
    ti.pixels        = NULL;
    ti.supports_rgba = gfx_surface_wants_rgba();
    ti.pix10         = false;
+   ti.fp16          = false;
 
    if (image_texture_load_buffer(&ti, image_type, buffer, buffer_len))
    {
@@ -1779,6 +1788,7 @@ bool gfx_display_reset_textures_list(
    ti.pixels                     = NULL;
    ti.supports_rgba              = gfx_surface_wants_rgba();
    ti.pix10                      = false;
+   ti.fp16                       = false;
 
    if (!texture_path || !*texture_path)
       return false;
@@ -1815,6 +1825,7 @@ bool gfx_display_reset_icon_texture(
    ti.pixels                     = NULL;
    ti.supports_rgba              = gfx_surface_wants_rgba();
    ti.pix10                      = false;
+   ti.fp16                       = false;
 
    if (!texture_path || !*texture_path)
       return false;
@@ -1920,6 +1931,7 @@ void gfx_display_init_white_texture(void)
    ti.pixels        = (uint32_t*)&white_data;
    ti.compressed    = NULL; /* raw pixels, not a loaded compressed texture */
    ti.pix10         = false; /* 8-bit white; must not be read as 10-bit */
+   ti.fp16          = false;
    /* Four 0xff bytes read either way, but the drivers read this field
     * and it is the caller's to set: nothing here fills the struct
     * beforehand, so an unset one is whatever the stack held. */

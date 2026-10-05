@@ -91,6 +91,9 @@ int      gt_uploads;
 unsigned gt_last_crc;
 extern int gt_async_mode, gt_async_posted, gt_async_pending;
 extern int gt_can_update, gt_updates;
+extern int gt_lend_mode, gt_lends, gt_lend_violations, gt_lent_uploads,
+       gt_lend_stale;
+extern void gt_lend_reset(void);
 void gt_async_flush(void);
 
 /* Whether the thumbnail's animation surface has a frame on its way to
@@ -392,6 +395,82 @@ int main(void)
       }
       gt_can_update = 1;
    }
+
+   /* 6. thumbnails closed while their jobs still wait for the worker.
+    *    A waiting job cannot be pulled out from under the worker, so
+    *    it is cancelled and its block kept until the worker has let it
+    *    go: freed any sooner, the worker walks into freed memory. The
+    *    worker must pass every one of them over and still serve the
+    *    thumbnail that comes after. */
+   {
+      static gfx_thumbnail_t many[24];
+      int r, k, opened = 0;
+      for (r = 0; r < 20; r++)
+      {
+         for (k = 0; k < 24; k++)
+         {
+            reset_thumb(&many[k]);
+            gfx_thumbnail_anim_open(&many[k], path);
+            if (many[k].anim)
+               opened++;
+            gfx_thumbnail_animate(&many[k], cpu_features_get_time_usec());
+         }
+         for (k = 0; k < 24; k++)
+            gfx_thumbnail_reset(&many[k]);
+      }
+      reset_thumb(&th);
+      gt_uploads  = 0;
+      gt_last_crc = 0;
+      gfx_thumbnail_anim_open(&th, path);
+      for (i = 0; i < 240 && gt_uploads < 3; i++)
+      {
+         gfx_thumbnail_animate(&th, cpu_features_get_time_usec());
+         usleep(16666);
+      }
+      if (opened && gt_uploads >= 2)
+         printf("[ok]   %d animations closed with a job waiting; the "
+                "next one still animates\n", opened);
+      else
+      {
+         printf("[FAIL] after %d animations closed with a job waiting, "
+                "the next uploaded %d frames\n", opened, gt_uploads);
+         bad = 1;
+      }
+      gfx_thumbnail_reset(&th);
+   }
+   /* 7. direct video lends the job pipeline's slots the driver's
+    *    upload memory: jobs decode straight into it, are handed a slot
+    *    only once the GPU is done with it, and every upload from it
+    *    carries a frame a job wrote there. */
+   reset_thumb(&th);
+   gt_async_mode = 0;
+   gt_can_update = 1;
+   gt_lend_mode  = 1;
+   gt_lends = gt_lend_violations = gt_lent_uploads = gt_lend_stale = 0;
+   gt_uploads    = 0;
+   gt_last_crc   = 0;
+   gfx_thumbnail_anim_open(&th, path);
+   for (i = 0; i < 480 && gt_lent_uploads < 6; i++)
+   {
+      gfx_thumbnail_animate(&th, cpu_features_get_time_usec());
+      usleep(16666);
+   }
+   if (     th.anim && gt_lends >= 2 && gt_lent_uploads >= 6
+         && !gt_lend_violations && !gt_lend_stale)
+      printf("[ok]   lent slots: %d lends, %d uploads from lent memory, "
+             "none written early or stale\n", gt_lends, gt_lent_uploads);
+   else
+   {
+      printf("[FAIL] lent slots: %d lends, %d lent uploads, %d written "
+             "while on the GPU, %d stale\n", gt_lends, gt_lent_uploads,
+             gt_lend_violations, gt_lend_stale);
+      bad = 1;
+   }
+   gfx_thumbnail_reset(&th);
+   gt_lend_mode = 0;
+   gt_lend_reset();
+
+   gfx_thumbnail_anim_worker_deinit();
 
    remove(path);
    printf("%s\n", bad ? "FAILED" : "PASS");

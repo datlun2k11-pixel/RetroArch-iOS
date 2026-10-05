@@ -233,6 +233,8 @@ bool input_autoconfigure_disconnect(unsigned port, const char *name)
 /* the driver reads one setting: whether Xbox pads are XInput's */
 static settings_t stub_settings;
 settings_t *config_get_ptr(void) { return &stub_settings; }
+/* the settings a driver asks for by name, read from the ones above */
+#include "../input_config_stubs.h"
 bool winraw_raw_input_polled(void) { return true; }
 void winraw_queue_read(void) { }
 void winraw_queue_claim_thread(bool claim) { (void)claim; }
@@ -350,6 +352,57 @@ int main(void)
    CHECK(wait_for(edge, 3, 0x80, 200), "after a run of changes the last was not what was written");
    printf("   ok   a run of changes ends with the last one written\n");
 
+   /* Controller Player Lights. Off, as it has been so far: nothing
+    * above asked for the lights */
+   len = written_to(edge, buf, sizeof(buf));
+   CHECK(len > 44 && !(buf[2] & 0x10) && buf[44] == 0,
+         "with the setting off the DualSense's player lights were asked for");
+   len = written_to(ds4, buf, sizeof(buf));
+   CHECK(len > 8 && buf[1] == 0x01 && !buf[6] && !buf[7] && !buf[8],
+         "with the setting off the DualShock 4's light bar was asked for");
+   /* on: the DualSense is on the first port, the DualShock 4 on the
+    * second, and their lights say so; the motors stay as they were */
+   {
+      unsigned i;
+      stub_settings.bools.input_winraw_player_lights = true;
+      stub_settings.uints.input_joypad_index[0]      = 0;
+      stub_settings.uints.input_joypad_index[1]      = 1;
+      for (i = 2; i < MAX_USERS; i++)
+         stub_settings.uints.input_joypad_index[i]   = i;
+      for (i = 0; i < 40; i++)
+         winraw_joypad_player_lights();
+      CHECK(wait_for(edge, 44, 0x04, 0x00), "the DualSense on the first port does not show player 1");
+      len = written_to(edge, buf, sizeof(buf));
+      CHECK((buf[2] & 0x10) && buf[3] == 0x80 && buf[4] == 200,
+            "the player lights were not asked for, or the motors were not kept beside them");
+      CHECK(wait_for(ds4, 6, 0x40, 0x00), "the DualShock 4 on the second port is not red");
+      len = written_to(ds4, buf, sizeof(buf));
+      CHECK(buf[1] == 0x03 && buf[8] == 0x00, "the DualShock 4's light bar was not asked for");
+      /* the two swap ports: the lights follow */
+      stub_settings.uints.input_joypad_index[0]      = 1;
+      stub_settings.uints.input_joypad_index[1]      = 0;
+      for (i = 0; i < 40; i++)
+         winraw_joypad_player_lights();
+      CHECK(wait_for(edge, 44, 0x0A, 0x00), "the DualSense moved to the second port does not show player 2");
+      CHECK(wait_for(ds4, 7, 0x00, 0x40), "the DualShock 4 moved to the first port is not blue");
+      /* turned off again: the lights that were lit are put out, with
+       * the motors kept as they were */
+      stub_settings.bools.input_winraw_player_lights = false;
+      stub_settings.uints.input_joypad_index[0]      = 0;
+      stub_settings.uints.input_joypad_index[1]      = 1;
+      for (i = 0; i < 40; i++)
+         winraw_joypad_player_lights();
+      CHECK(wait_for(edge, 44, 0x00, 0x00), "turned off, the DualSense's player lights stayed lit");
+      len = written_to(edge, buf, sizeof(buf));
+      CHECK((buf[2] & 0x10) && buf[3] == 0x80 && buf[4] == 200,
+            "turned off, the lights were not asked to go out, or the motors were not kept");
+      CHECK(wait_for(ds4, 7, 0x00, 0x00), "turned off, the DualShock 4's light bar stayed lit");
+      len = written_to(ds4, buf, sizeof(buf));
+      CHECK(buf[1] == 0x03 && !buf[6] && !buf[8],
+            "turned off, the DualShock 4's light bar was not asked to go out");
+      printf("   ok   Controller Player Lights: off from the start, the lights are left alone; on, each pad shows its port and follows it; turned off again, they go out\n");
+   }
+
    /* ---- what cannot rumble ---------------------------------------- */
    CHECK(!winraw_joypad_joypad_set_rumble(2, RETRO_RUMBLE_STRONG, 0xFFFF),
          "set_rumble() said a pad there is no report for can rumble");
@@ -412,7 +465,7 @@ int main(void)
    winraw_joypad_joypad_destroy();
    len = written_to(ds4, buf, sizeof(buf));
    CHECK(len && buf[4] == 0 && buf[5] == 0, "the driver stopped with the DualShock 4 rumbling at %u and %u", buf[4], buf[5]);
-   CHECK(!winraw_joypad_out_thread && !winraw_joypad_out[1].present
+   CHECK(!winraw_joypad_out_writer && !winraw_joypad_out[1].present
          && !winraw_joypad_out[1].dev,
          "the driver stopped and left its thread or a device behind");
    {
@@ -483,7 +536,7 @@ int main(void)
    CHECK(xpad[0].left == 0 && xpad[0].right == 0 && xpad[1].left == 0 && xpad[1].right == 0,
          "the driver stopped with Xbox pads rumbling at %u %u and %u %u",
          xpad[0].left, xpad[0].right, xpad[1].left, xpad[1].right);
-   CHECK(!winraw_joypad_out_thread && !winraw_xinput_dll, "the driver stopped and left its thread or XInput behind");
+   CHECK(!winraw_joypad_out_writer && !winraw_xinput_dll, "the driver stopped and left its thread or XInput behind");
    printf("   ok   an unplugged Xbox pad is stilled and XInput's pad let go; stopping the driver stills the rest\n");
 
    /* ============ Xbox pads read through XInput ================== */

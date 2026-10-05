@@ -306,6 +306,9 @@ struct runloop
 
    retro_keyboard_event_t key_event;             /* ptr alignment */
    retro_keyboard_event_t frontend_key_event;    /* ptr alignment */
+   /* Run-ahead's second instance's keyboard callback: an event bound
+    * for the core goes to both instances */
+   retro_keyboard_event_t secondary_key_event;   /* ptr alignment */
 
    rarch_system_info_t system;                   /* ptr alignment */
    struct retro_frame_time_callback frame_time;  /* ptr alignment */
@@ -843,6 +846,15 @@ bool libretro_get_system_info(
       struct retro_system_info *info,
       bool *load_no_content);
 
+/* A staged load opens the core's library on the task worker once the
+ * previous core is closed; the core stage then takes the handle.
+ * begin returns false when there is no worker to open it on (the core
+ * stage opens it itself), ready is true once no open is in flight,
+ * cancel drops an untaken handle. */
+bool runloop_core_preload_begin(void);
+bool runloop_core_preload_ready(void);
+void runloop_core_preload_cancel(void);
+
 #ifdef HAVE_DYNAMIC
 /* Frees the records libretro_get_system_info() keeps of the cores it
  * has asked; the next question reads them back from disk. */
@@ -940,6 +952,17 @@ void runloop_path_set_basename(const char *path);
 void runloop_path_set_names(void);
 
 uint32_t runloop_get_flags(void);
+
+/* The platform has taken the application away, or given it back:
+ * paused and idle while it is away. */
+void runloop_set_platform_paused(bool paused);
+
+/* Whether a core has content loaded. */
+bool runloop_content_loaded(void);
+
+/* Whether the keyboard callback in place is the frontend's own, which
+ * is the one a replay feeds its recorded keys to. */
+bool runloop_key_event_is_frontend(void);
 
 bool runloop_get_entry_state_path(char *path, size_t len, int slot);
 

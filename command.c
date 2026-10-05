@@ -3353,7 +3353,6 @@ static void command_reinit_snapshot_cb(void *userdata,
 void command_event_reinit(const int flags)
 {
    settings_t *settings           = config_get_ptr();
-   input_driver_state_t *input_st = input_state_get_ptr();
    video_driver_state_t *video_st = video_state_get_ptr();
 #ifdef HAVE_MENU
    gfx_display_t *p_disp          = disp_get_ptr();
@@ -3364,15 +3363,6 @@ void command_event_reinit(const int flags)
 #endif
    enum input_game_focus_cmd_type
       game_focus_cmd              = GAME_FOCUS_CMD_REAPPLY;
-   const input_device_driver_t
-      *joypad                     = input_st->primary_joypad;
-#ifdef HAVE_MFI
-   const input_device_driver_t
-      *sec_joypad                 = input_st->secondary_joypad;
-#else
-   const input_device_driver_t
-      *sec_joypad                 = NULL;
-#endif
 
    /* Snapshot the last cached core frame before tearing the video
     * driver down.  video_driver_free() invalidates the cache as
@@ -3415,21 +3405,11 @@ void command_event_reinit(const int flags)
     * anyway. Guarded here, in the layer that owns reinit, so every
     * caller is covered and call sites stay bare command_events.
     *
-    * Nothing can be ungrabbed with the drivers down, but the grab
-    * flag is bookkeeping the win32 focus pump and the grab toggle
-    * read later, so leave it as the skipped reinit's game-focus
-    * reapply would have: released, unless exclusive fullscreen
-    * (which re-grabs on init), auto-grab or game focus keeps it.
-    * Everything below reuses this function's own locals. */
+    * The reasons the pointer is captured for are kept above the
+    * drivers, so there is nothing to put right about the grab here:
+    * the next video driver has them applied to it. */
    if (!video_st->data)
-   {
-      if (     !settings->bools.video_fullscreen
-            && !(video_driver_get_disp_flags() & VIDEO_FLAG_FORCE_FULLSCREEN)
-            && !settings->bools.input_auto_mouse_grab
-            && !input_st->game_focus_state.enabled)
-         input_st->flags &= ~INP_FLAG_GRAB_MOUSE_STATE;
       return;
-   }
 
    /* A staged content load ends in a reinit of every driver against
     * the new core: one asked for before then - the old override
@@ -3525,12 +3505,7 @@ void command_event_reinit(const int flags)
    }
 
    /* Poll input to avoid possibly stale data to corrupt things. */
-   if (joypad && joypad->poll)
-      joypad->poll();
-   if (sec_joypad && sec_joypad->poll)
-      sec_joypad->poll();
-   if (input_st->current_driver && input_st->current_driver->poll)
-      input_st->current_driver->poll(input_st->current_data);
+   input_driver_poll_devices();
    command_event(CMD_EVENT_GAME_FOCUS_TOGGLE, &game_focus_cmd);
 
 #ifdef HAVE_MENU

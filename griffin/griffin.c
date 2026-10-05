@@ -850,6 +850,11 @@ INPUT
 #endif
 #endif
 
+/* the thread the joypad drivers write to their controllers from */
+#if defined(HAVE_XINPUT) || defined(HAVE_WINRAWINPUT) || defined(HAVE_UDEV)
+#include "../input/common/output_writer.c"
+#endif
+
 #if defined(__linux__) && !defined(ANDROID)
 #include "../input/common/linux_common.c"
 #include "../input/drivers/linuxraw_input.c"
@@ -1841,6 +1846,9 @@ CLOUD SYNC
 #endif
 #ifdef HAVE_SMBCLIENT
 #include "../network/cloud_sync/smb.c"
+#endif
+#ifdef HAVE_NFSCLIENT
+#include "../network/cloud_sync/nfs.c"
 #endif
 #ifdef HAVE_S3
 #include "../network/cloud_sync/s3.c"
