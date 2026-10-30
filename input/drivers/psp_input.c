@@ -89,10 +89,8 @@ typedef struct psp_input
 {
    int keyboard_hid_handle;
    int mouse_hid_handle;
-   int32_t mouse_x;
-   int32_t mouse_y;
-   int32_t mouse_x_delta;
-   int32_t mouse_y_delta;
+   uint32_t mouse_pos;     /* VIDEO_POS_PACK */
+   uint32_t mouse_delta;   /* VIDEO_POS_PACK */
    uint8_t prev_keys[6];
 #ifdef VITA
    SceTouchData touch[SCE_TOUCH_PORT_MAX_NUM];
@@ -430,19 +428,17 @@ static void vita_input_poll(void *data)
       }
    }
 
-   psp->mouse_x_delta  = mouse_velocity_x;
-   psp->mouse_y_delta  = mouse_velocity_y;
-   psp->mouse_x       += mouse_velocity_x;
-   psp->mouse_y       += mouse_velocity_y;
-   if (psp->mouse_x < 0)
-      psp->mouse_x     = 0;
-   else if (psp->mouse_x > MOUSE_MAX_X)
-      psp->mouse_x     = MOUSE_MAX_X;
+   psp->mouse_delta = VIDEO_POS_PACK(mouse_velocity_x, mouse_velocity_y);
+   VIDEO_POS_ADD(psp->mouse_pos, mouse_velocity_x, mouse_velocity_y);
+   if (VIDEO_POS_X(psp->mouse_pos) < 0)
+      VIDEO_POS_PUT_X(psp->mouse_pos, 0);
+   else if (VIDEO_POS_X(psp->mouse_pos) > MOUSE_MAX_X)
+      VIDEO_POS_PUT_X(psp->mouse_pos, MOUSE_MAX_X);
 
-   if (psp->mouse_y < 0)
-      psp->mouse_y     = 0;
-   else if (psp->mouse_y > MOUSE_MAX_Y)
-      psp->mouse_y     = MOUSE_MAX_Y;
+   if (VIDEO_POS_Y(psp->mouse_pos) < 0)
+      VIDEO_POS_PUT_Y(psp->mouse_pos, 0);
+   else if (VIDEO_POS_Y(psp->mouse_pos) > MOUSE_MAX_Y)
+      VIDEO_POS_PUT_Y(psp->mouse_pos, MOUSE_MAX_Y);
 
    for(port = 0; port < VITA_MAX_TOUCH; port++){
       sceTouchPeek(port, &psp->touch[port], 1);
@@ -470,10 +466,8 @@ static void vita_input_poll(void *data)
 static int16_t vita_input_state(
       void *data,
       const input_device_driver_t *joypad,
-      const input_device_driver_t *sec_joypad,
       rarch_joypad_info_t *joypad_info,
       const retro_keybind_set *binds,
-      bool keyboard_mapping_blocked,
       unsigned port,
       unsigned device,
       unsigned idx,
@@ -505,17 +499,17 @@ static int16_t vita_input_state(
                   return psp->mouse_button_middle;
                case RETRO_DEVICE_ID_MOUSE_X:
                   if (screen)
-                     return psp->mouse_x;
+                     return VIDEO_POS_X(psp->mouse_pos);
 
-                  val                = psp->mouse_x_delta;
-                  psp->mouse_x_delta = 0;
+                  val                = VIDEO_POS_X(psp->mouse_delta);
+                  VIDEO_POS_PUT_X(psp->mouse_delta, 0);
                   /* flush delta after it has been read */
                   break;
                case RETRO_DEVICE_ID_MOUSE_Y:
                   if (screen)
-                     return psp->mouse_y;
-                  val                = psp->mouse_y_delta;
-                  psp->mouse_y_delta = 0;
+                     return VIDEO_POS_Y(psp->mouse_pos);
+                  val                = VIDEO_POS_Y(psp->mouse_delta);
+                  VIDEO_POS_PUT_Y(psp->mouse_delta, 0);
                   /* flush delta after it has been read */
                   break;
             }
@@ -532,38 +526,35 @@ static int16_t vita_input_state(
                struct video_viewport vp    = {0};
                bool screen                 =
                   (device == RARCH_DEVICE_POINTER_SCREEN);
-               int16_t res_x               = 0;
-               int16_t res_y               = 0;
-               int16_t res_screen_x        = 0;
-               int16_t res_screen_y        = 0;
+               uint32_t res_pos               = 0;
+               uint32_t res_screen_pos        = 0;
                float tmp_x, tmp_y;
 
                video_driver_get_viewport_info(&vp);
                tmp_x = (psp->touch[0].report[idx].x - psp->panelInfo[0].minAaX) * VIDEO_SCALE_W(vp.dims)/(psp->panelInfo[0].maxAaX - psp->panelInfo[0].minAaX);
                tmp_y = (psp->touch[0].report[idx].y - psp->panelInfo[0].minAaY) * VIDEO_SCALE_H(vp.dims)/(psp->panelInfo[0].maxAaY - psp->panelInfo[0].minAaY);
 
-               if (video_driver_translate_coord_viewport_confined_wrap(
+               if (input_driver_translate_coord_viewport_confined_wrap(
                         &vp,
                         (int)tmp_x,
                         (int)tmp_y,
-                        &res_x, &res_y, &res_screen_x, &res_screen_y))
+                        &res_pos, &res_screen_pos))
                {
                   if (screen)
                   {
-                     res_x = res_screen_x;
-                     res_y = res_screen_y;
+                     res_pos = res_screen_pos;
                   }
 
                   switch (id)
                   {
                      case RETRO_DEVICE_ID_POINTER_X:
-                        return res_x;
+                        return VIDEO_POS_X(res_pos);
                      case RETRO_DEVICE_ID_POINTER_Y:
-                        return res_y;
+                        return VIDEO_POS_Y(res_pos);
                      case RETRO_DEVICE_ID_POINTER_PRESSED:
                         return (idx < psp->touch[0].reportNum);
                      case RETRO_DEVICE_ID_POINTER_IS_OFFSCREEN:
-                        return input_driver_pointer_is_offscreen(res_x, res_y);
+                        return input_driver_pointer_is_offscreen(VIDEO_POS_X(res_pos), VIDEO_POS_Y(res_pos));
                      case RETRO_DEVICE_ID_POINTER_COUNT:
                         return psp->touch[0].reportNum;
                   }
@@ -694,8 +685,7 @@ static void *vita_input_initialize(const char *joypad_driver)
       psp->keyboard_state[i] = false;
    for (i = 0; i < 6; i++)
       psp->prev_keys[i]      = 0;
-   psp->mouse_x              = 0;
-   psp->mouse_y              = 0;
+   psp->mouse_pos = 0;
 
    for(i = 0; i < SCE_TOUCH_PORT_MAX_NUM; i++){
       if (i < VITA_MAX_TOUCH)

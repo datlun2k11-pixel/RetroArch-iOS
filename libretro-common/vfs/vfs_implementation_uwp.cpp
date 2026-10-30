@@ -166,6 +166,22 @@ int64_t retro_vfs_file_seek_impl(libretro_vfs_implementation_file* stream,
     return retro_vfs_file_seek_internal(stream, offset, seek_position);
 }
 
+int64_t retro_vfs_file_view_impl(libretro_vfs_implementation_file *stream,
+      uint64_t len, const uint8_t **ptr)
+{
+   /* Local files are never mapped here (see
+    * retro_vfs_file_get_mapped_ptr_impl), so only an smb:// stream's
+    * read-ahead window can be lent; anything else answers -1 and the
+    * caller reads. */
+   if (!stream || !ptr)
+      return -1;
+#ifdef HAVE_SMBCLIENT
+   if (stream->scheme == VFS_SCHEME_SMB)
+      return retro_vfs_file_view_smb(stream, len, ptr);
+#endif
+   return -1;
+}
+
 int64_t retro_vfs_file_read_impl(libretro_vfs_implementation_file* stream,
     void* s, uint64_t len)
 {
@@ -751,6 +767,22 @@ const uint8_t *retro_vfs_file_get_mapped_ptr_impl(
    if (len)
       *len = 0;
    return NULL;
+}
+
+void retro_vfs_file_prefetch_impl(
+      libretro_vfs_implementation_file *stream, uint64_t offset,
+      uint64_t len)
+{
+   /* A hint, and one this backend has nothing to give: it never maps a
+    * file, so there is no mapping to make resident, and its handles
+    * come from the app's brokered file calls, which offer no read-ahead
+    * request. Doing nothing is the documented answer where the OS has
+    * none. Defined all the same, for the reason above:
+    * filestream_prefetch() calls it whenever no frontend VFS is
+    * installed. */
+   (void)stream;
+   (void)offset;
+   (void)len;
 }
 
 int retro_vfs_stat_64_impl(const char *path, int64_t *size)

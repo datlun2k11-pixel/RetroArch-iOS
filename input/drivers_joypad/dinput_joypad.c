@@ -464,7 +464,8 @@ static int16_t dinput_joypad_axis(unsigned port, uint32_t joyaxis)
 
 static int16_t dinput_joypad_state(
       rarch_joypad_info_t *joypad_info,
-      const struct retro_keybind *binds,
+      const uint16_t *joykeys,
+      const uint32_t *joyaxes,
       unsigned port)
 {
    unsigned i;
@@ -490,11 +491,8 @@ static int16_t dinput_joypad_state(
    ret = 0;
    for (i = 0; i < RARCH_FIRST_CUSTOM_BIND; i++)
    {
-      /* Auto-binds are per joypad, not per user. */
-      const uint64_t joykey  = (binds[i].joykey  != NO_BTN)
-         ? binds[i].joykey   : joypad_info->auto_binds[i].joykey;
-      const uint32_t joyaxis = (binds[i].joyaxis  != AXIS_NONE)
-         ? binds[i].joyaxis  : joypad_info->auto_binds[i].joyaxis;
+      const uint64_t joykey  = joykeys[i];
+      const uint32_t joyaxis = joyaxes[i];
 
       if (     (uint16_t)joykey != NO_BTN
             && dinput_joypad_button_state(pad, (uint16_t)joykey))
@@ -607,6 +605,8 @@ static const char *dinput_joypad_name(unsigned port)
 #include <windowsx.h>
 #include <dinput.h>
 #include <mmsystem.h>
+
+#include "../common/input_ignore_devices.h"
 
 /* ---------------------------------------------------------------------------
  * dinput_joypad_cleanup_pad
@@ -749,6 +749,15 @@ static BOOL CALLBACK enum_joypad_cb(const DIDEVICEINSTANCE *inst, void *p)
     * PID is in the high 16 bits. */
    pad->vid = (int32_t)(inst->guidProduct.Data1 & 0xFFFFu);
    pad->pid = (int32_t)(inst->guidProduct.Data1 >> 16);
+
+   /* Another program reads it and stands in for it (Steam Input) */
+   if (input_device_ignored((uint16_t)pad->vid, (uint16_t)pad->pid))
+      goto cfg_failed;
+
+   /* A pad already listed, on its other link */
+   pad->link_addr = dinput_pad_link_addr(dev, pad->vid, pad->pid);
+   if (dinput_pad_is_link(job->pads, job->cnt, pad->link_addr))
+      goto cfg_failed;
 
    /* Set data format to extended joystick state.
     * If either SetDataFormat or SetCooperativeLevel fails the device

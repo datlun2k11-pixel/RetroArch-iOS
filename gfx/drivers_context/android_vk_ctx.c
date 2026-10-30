@@ -27,6 +27,7 @@
 #endif
 
 #include "../common/vulkan_common.h"
+#include "../common/android_windows.h"
 
 #include "../../frontend/frontend_driver.h"
 #include "../../frontend/drivers/platform_unix.h"
@@ -54,6 +55,7 @@ static void android_gfx_ctx_vk_destroy(void *data)
    if (!and)
       return;
 
+   android_windows_free(and, android_windows_destroy);
    vulkan_context_destroy(&and->vk, android_app_window(android_app));
 
    if (and->vk.context.queue_lock)
@@ -220,12 +222,11 @@ static bool android_gfx_ctx_vk_destroy_surface(void *data)
 }
 
 static void android_gfx_ctx_vk_input_driver(void *data,
-      const char *joypad_name,
-      input_driver_t **input, void **input_data)
+      const char *joypad_name)
 {
    /* no input driver of this context's own: the frontend starts the
     * platform's */
-   input_driver_left_to_frontend(INPUT_WINDOW_PLATFORM, input, input_data);
+   input_driver_video_window(INPUT_WINDOW_PLATFORM, NULL);
 }
 
 static enum gfx_ctx_api android_gfx_ctx_vk_get_api(void *data)
@@ -297,7 +298,7 @@ static uint32_t android_gfx_ctx_vk_get_flags(void *data)
 {
    uint32_t flags = 0;
 
-#if defined(HAVE_SLANG) && defined(HAVE_SPIRV_CROSS)
+#if defined(HAVE_SLANG) && (defined(HAVE_SPIRV_CROSS) || defined(HAVE_RSLC))
    BIT32_SET(flags, GFX_CTX_FLAGS_SHADERS_SLANG);
 #endif
 
@@ -305,6 +306,17 @@ static uint32_t android_gfx_ctx_vk_get_flags(void *data)
 }
 
 static void android_gfx_ctx_vk_set_flags(void *data, uint32_t flags) { }
+
+/* The renderer makes the second display's VkSurfaceKHR from the
+ * window's ANativeWindow itself */
+static const gfx_ctx_window_driver_t android_gfx_ctx_vk_windows = {
+   android_windows_create,
+   android_windows_update,
+   android_windows_poll,
+   NULL, /* bind_gl */
+   NULL, /* present_gl */
+   android_windows_destroy
+};
 
 const gfx_ctx_driver_t gfx_ctx_vk_android = {
    android_gfx_ctx_vk_init,
@@ -340,5 +352,11 @@ const gfx_ctx_driver_t gfx_ctx_vk_android = {
    NULL,                                     /* make_current */
    android_gfx_ctx_vk_create_surface,
    android_gfx_ctx_vk_destroy_surface,
-   android_gfx_ctx_vk_presentable
+   android_gfx_ctx_vk_presentable,
+   NULL, /* last_present_time */
+   NULL, /* release_current */
+   NULL, /* shared_context_new */
+   NULL, /* shared_context_bind */
+   NULL, /* shared_context_free */
+   &android_gfx_ctx_vk_windows
 };

@@ -2,6 +2,7 @@
  * content, pushes a frame per retro_run, and counts its own
  * retro_init calls behind an export, so the harness can tell exactly
  * which frame the frontend brought it up on. */
+#include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
 #include <libretro.h>
@@ -54,11 +55,34 @@ static void harness_key_event(bool down, unsigned keycode,
 static unsigned hw_resets;
 static unsigned hw_destroys;
 
+/* The MIDI interface the frontend handed over at load (HARNESS_CORE_MIDI
+ * set), played the way a core plays music: every retro_run sends a
+ * note-on through it while output_enabled() says yes, and retro_deinit
+ * sends the note-off. The harness counts what reaches the driver. */
+static struct retro_midi_interface midi_if;
+static bool     midi_asked;
+static unsigned midi_runs;      /* retro_run calls that found the output enabled */
+static unsigned midi_notes;     /* notes written and flushed in full */
+RETRO_API unsigned harness_core_midi_runs(void)  { return midi_runs; }
+RETRO_API unsigned harness_core_midi_notes(void) { return midi_notes; }
+
+static bool midi_send(uint8_t status, uint8_t key, uint8_t velocity)
+{
+   return midi_if.write(status, 0)
+       && midi_if.write(key, 0)
+       && midi_if.write(velocity, 0)
+       && midi_if.flush();
+}
+
 /* RETRO_API, like the core's own entry points: a Windows DLL exports
  * only what is marked, and the harness looks these up by name. */
 RETRO_API unsigned harness_core_inits(void)       { return inits; }
 RETRO_API unsigned harness_core_hw_resets(void)   { return hw_resets; }
 RETRO_API unsigned harness_core_hw_destroys(void) { return hw_destroys; }
+/* Calls into the core's state functions, which a command must leave to
+ * a task: it can arrive from the core's own input poll. */
+static unsigned state_calls;
+RETRO_API unsigned harness_core_state_calls(void) { return state_calls; }
 
 static void hw_context_reset(void)   { hw_resets++; }
 static void hw_context_destroy(void) { hw_destroys++; }
@@ -115,7 +139,12 @@ void retro_set_input_state(retro_input_state_t cb) { (void)cb; }
 #ifndef HARNESS_CORE_NO_INIT
 void retro_init(void) { inits++; harness_init_tid = harness_self_tid(); }
 #endif
-void retro_deinit(void) { }
+void retro_deinit(void)
+{
+   if (midi_asked && midi_if.output_enabled())
+      midi_send(0x80, 0x3C, 0x00);
+   midi_asked = false;
+}
 unsigned retro_api_version(void) { return RETRO_API_VERSION; }
 void retro_get_system_info(struct retro_system_info *info)
 {
@@ -144,20 +173,32 @@ void retro_run(void)
    for (i = 0; i < W * H; i++)
       frame[i] = (uint16_t)(runs + i);
    video_cb(frame, W, H, W * 2);
+   if (midi_asked && midi_if.output_enabled())
+   {
+      midi_runs++;
+      if (midi_send(0x90, 0x3C, 0x40))
+         midi_notes++;
+   }
 }
 /* A state large enough that the save task writes it over several
  * checks (task_save writes one chunk per tick at least, and a chunk
  * is 16 MiB on desktop), so a close can find the save in flight. */
 #define STATE_SIZE (64u * 1024 * 1024)
-size_t retro_serialize_size(void) { return STATE_SIZE; }
+size_t retro_serialize_size(void) { state_calls++; return STATE_SIZE; }
 bool retro_serialize(void *data, size_t size)
 {
+   state_calls++;
    if (size < STATE_SIZE)
       return false;
    memset(data, 0x5a, STATE_SIZE);
    return true;
 }
-bool retro_unserialize(const void *data, size_t size) { (void)data; return size >= STATE_SIZE; }
+bool retro_unserialize(const void *data, size_t size)
+{
+   (void)data;
+   state_calls++;
+   return size >= STATE_SIZE;
+}
 void retro_cheat_reset(void) { }
 void retro_cheat_set(unsigned index, bool enabled, const char *code) { (void)index; (void)enabled; (void)code; }
 bool retro_load_game(const struct retro_game_info *game)
@@ -178,6 +219,14 @@ bool retro_load_game(const struct retro_game_info *game)
    hw.context_destroy = hw_context_destroy;
    environ_cb(RETRO_ENVIRONMENT_SET_HW_RENDER, &hw);
 #endif
+   /* HARNESS_CORE_MIDI set: the MIDI interface is asked for here, as
+    * cores that play music through it do */
+   {
+      const char *midi = getenv("HARNESS_CORE_MIDI");
+      midi_runs = midi_notes = 0;
+      midi_asked = midi && *midi
+         && environ_cb(RETRO_ENVIRONMENT_GET_MIDI_INTERFACE, &midi_if);
+   }
    (void)game;
    return true;
 }

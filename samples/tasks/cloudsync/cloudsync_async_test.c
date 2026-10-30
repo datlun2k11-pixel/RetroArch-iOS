@@ -18,11 +18,17 @@
  *   a call the driver refuses without calling back fails, an upload's
  *   file going back to the handler to close;
  * - a sync whose BEGIN fails, and one that ends, let the worker go, and
- *   the next sync starts a new one;
+ *   the next sync starts a new one, even one begun as the worker leaves;
+ * - a poll given a budget runs the oldest result whatever the budget,
+ *   and then only as many as the budget allows, in order;
  * - on exit, cloud_sync_deinit() waits for the call under way, drops
  *   the ones not started (closing an upload's file) without running
- *   their handlers, and gives up on a call stuck past its bound;
- * - a driver without the blocking flag is still called directly.
+ *   their handlers, and gives up on a call stuck past its bound; that
+ *   call's result, once it comes, is freed by the worker and never
+ *   reaches a poll - not one of a sync begun after it either;
+ * - a driver without the blocking flag is still called directly;
+ * - cloud_sync_capture() runs the driver's capture hook on the calling
+ *   thread, and is a no-op for a driver without one.
  */
 
 #include <stdio.h>
@@ -32,6 +38,7 @@
 #include <unistd.h>
 
 #include <boolean.h>
+#include <retro_atomic.h>
 #include <retro_timers.h>
 #include <rthreads/rthreads.h>
 #include <features/features_cpu.h>
@@ -147,10 +154,28 @@ static bool drv_free(const char *path, cloud_sync_complete_handler_t cb,
    return true;
 }
 
+static unsigned  captures;
+static uintptr_t capture_thread;
+static void drv_capture(void)
+{
+   captures++;
+   capture_thread = sthread_get_current_thread_id();
+}
+
 static cloud_sync_driver_t blocking = {
    drv_begin, drv_end, drv_read, drv_update, drv_free, "blocking",
-   CLOUD_SYNC_DRIVER_FLG_BLOCKING
+   CLOUD_SYNC_DRIVER_FLG_BLOCKING, drv_capture
 };
+
+/* The worker's leaving hook: once armed, it begins the next sync right
+ * there, from the worker's own thread. */
+static retro_atomic_int_t leaving_arm;
+static void on_done(void *ud, const char *path, bool success, RFILE *file);
+void cloud_sync_test_worker_leaving(void)
+{
+   if (retro_atomic_exchange_int(&leaving_arm, 0))
+      cloud_sync_begin(on_done, (void*)3);
+}
 
 /* ---- results as the handlers see them ---- */
 
@@ -178,13 +203,25 @@ static void on_done(void *ud, const char *path, bool success, RFILE *file)
    snprintf(r->path, sizeof(r->path), "%s", path ? path : "");
 }
 
+/* A budget with @budget more results in it after the first. */
+static bool budget_left(void *budget, size_t avail, size_t len)
+{
+   unsigned *left = (unsigned*)budget;
+   (void)avail;
+   (void)len;
+   if (!*left)
+      return false;
+   (*left)--;
+   return true;
+}
+
 /* polls until @n results have arrived, or about five seconds pass */
 static bool wait_results(unsigned n)
 {
    int i;
    for (i = 0; i < 5000 && nresults < n; i++)
    {
-      cloud_sync_poll();
+      cloud_sync_poll(NULL, NULL);
       if (nresults < n)
          retro_sleep(1);
    }
@@ -227,7 +264,7 @@ int main(void)
    for (i = 0; i < 2000 && entered_count() == 0; i++)
       retro_sleep(1);
    CHECK(entered_count() == 1, "driver blocked inside the first call");
-   cloud_sync_poll();
+   cloud_sync_poll(NULL, NULL);
    CHECK(nresults == 0, "nothing completes while the driver blocks");
 
    gate_release(6);
@@ -252,7 +289,7 @@ int main(void)
    CHECK(results[3].success && results[3].file == upload_file, "update result");
    CHECK(!results[4].success && results[4].has_path, "failed free result");
    CHECK(results[5].success, "end result");
-   cloud_sync_poll();
+   cloud_sync_poll(NULL, NULL);
    CHECK(nresults == 6, "each handler runs once");
 
    /* refused calls fail; the upload's file goes back to be closed */
@@ -285,6 +322,43 @@ int main(void)
    CHECK(wait_results(3) && results[1].success && results[2].success,
          "a sync after a failed begin");
 
+   /* a burst of results is spread over the polls by the budget */
+   reset();
+   {
+      unsigned left;
+      cloud_sync_begin(on_done, (void*)1);
+      cloud_sync_read("saves/a.srm", "/l", on_done, (void*)2);
+      cloud_sync_read("saves/b.srm", "/l", on_done, (void*)3);
+      cloud_sync_end(on_done, (void*)4);
+      gate_release(4);
+      for (i = 0; i < 5000 && entered_count() < 4; i++)
+         retro_sleep(1);
+      /* the worker queues END's result just after the driver returns */
+      retro_sleep(50);
+      left = 0;
+      cloud_sync_poll(budget_left, &left);
+      CHECK(nresults == 1 && results[0].tag == 1,
+            "a spent budget still runs the oldest result, and only it");
+      left = 1;
+      cloud_sync_poll(budget_left, &left);
+      CHECK(nresults == 3 && results[1].tag == 2 && results[2].tag == 3,
+            "one more for each unit of budget, in order");
+      cloud_sync_poll(NULL, NULL);
+      CHECK(nresults == 4 && results[3].tag == 4, "no budget runs the rest");
+   }
+
+   /* a sync begun just as the last one's worker decides to leave */
+   reset();
+   retro_atomic_store_release_int(&leaving_arm, 1);
+   gate_release(3);
+   cloud_sync_begin(on_done, (void*)1);
+   cloud_sync_end(on_done, (void*)2);
+   CHECK(wait_results(3) && results[2].tag == 3,
+         "a sync begun as the worker leaves gets a worker");
+   cloud_sync_end(on_done, (void*)4);
+   gate_release(1);
+   CHECK(wait_results(4), "and ends");
+
    /* exit: the call under way finishes, the rest are dropped */
    reset();
    {
@@ -309,7 +383,7 @@ int main(void)
       sthread_join(releaser);
       CHECK(cpu_features_get_time_usec() - t0 < 900000, "deinit returned once the call finished");
       CHECK(entered_count() == 1, "calls not started were dropped");
-      cloud_sync_poll();
+      cloud_sync_poll(NULL, NULL);
       CHECK(nresults == 0, "no handler runs after deinit");
       /* LeakSanitizer reports the upload's RFILE if it was not closed */
       unlink(tmp);
@@ -326,14 +400,28 @@ int main(void)
       cloud_sync_deinit(100);
       took = cpu_features_get_time_usec() - t0;
       CHECK(took >= 90000 && took < 2000000, "deinit gives up at its bound");
+      /* A sync begun while the abandoned call is still stuck: the same
+       * worker serves it once that call ends, and the old result must
+       * not come back through this sync's polls. */
+      cloud_sync_begin(on_done, (void*)7);
+      gate_release(2);
+      CHECK(wait_results(1) && results[0].tag == 7,
+            "a later sync gets its own result");
+      for (i = 0; i < 100; i++)
+      {
+         cloud_sync_poll(NULL, NULL);
+         retro_sleep(1);
+      }
+      CHECK(nresults == 1, "and never the abandoned one's");
+      cloud_sync_end(on_done, (void*)8);
       gate_release(1);
-      /* the stuck call ends on its own, the worker leaves, and its
-       * result is dropped with the rest */
+      CHECK(wait_results(2) && results[1].tag == 8, "the later sync ends");
+      /* the stuck call ended on its own and the worker leaves */
       t0 = cpu_features_get_time_usec();
       cloud_sync_deinit(2000);
       CHECK(cpu_features_get_time_usec() - t0 < 1900000, "the stuck call ended after release");
-      cloud_sync_poll();
-      CHECK(nresults == 0, "a late result is dropped, not handed back");
+      cloud_sync_poll(NULL, NULL);
+      CHECK(nresults == 2, "a late result is dropped, not handed back");
    }
 
    /* a driver without the flag is called directly */
@@ -343,6 +431,16 @@ int main(void)
    CHECK(cloud_sync_free("direct", on_done, (void*)9), "direct call");
    CHECK(nresults == 1 && results[0].tag == 9 && results[0].thread == me
          && driver_thread == me, "direct call completes inline on this thread");
+
+   /* the settings a driver's calls read are copied on the caller's
+    * thread, once per sync, and a driver without the hook is skipped */
+   captures = 0;
+   cloud_sync_capture();
+   CHECK(captures == 1 && capture_thread == me,
+         "capture runs once, on the calling thread");
+   blocking.cloud_sync_capture = NULL;
+   cloud_sync_capture();
+   CHECK(captures == 1, "a driver without a capture hook is left alone");
 
    /* let the last worker leave before the process does */
    retro_sleep(50);

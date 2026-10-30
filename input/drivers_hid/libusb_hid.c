@@ -96,6 +96,8 @@ typedef struct libusb_command
 
 /* Bytes of commands an adapter holds before it drops new ones. */
 #define LIBUSB_SEND_QUEUE_MAX 4096
+#define LIBUSB_REMOVING 1
+#define LIBUSB_SENDER   2
 
 struct libusb_adapter
 {
@@ -127,11 +129,8 @@ struct libusb_adapter
    libusb_command_t *queue;
    retro_atomic_int_t out_busy;
    retro_atomic_int_t queued_bytes;
-   /* send_control() calls inside the adapter; it is not freed under
-    * one. */
-   retro_atomic_int_t senders;
-   /* Set on the event-handling thread when the pad goes. */
-   retro_atomic_int_t removing;
+   /* Removal (bit 0) and send_control() calls (increments of 2). */
+   retro_atomic_int_t sender_gate;
    /* The event-handling thread's alone. */
    bool in_busy;
 
@@ -197,7 +196,7 @@ static void libusb_adapter_send_next(struct libusb_adapter *adapter)
       {
          size_t _len = cmd->len;
          retro_atomic_fetch_sub_int(&adapter->queued_bytes, (int)_len);
-         if (retro_atomic_load_seq_cst_int(&adapter->removing))
+         if (retro_atomic_load_seq_cst_int(&adapter->sender_gate) & LIBUSB_REMOVING)
          {
             free(cmd);
             continue;
@@ -238,7 +237,7 @@ static void LIBUSB_CALL libusb_adapter_in_cb(struct libusb_transfer *transfer)
    /* in_busy and removal are the event-handling thread's, as this
     * callback is. */
    adapter->in_busy = false;
-   if (!retro_atomic_load_acquire_int(&adapter->removing))
+   if (!(retro_atomic_load_acquire_int(&adapter->sender_gate) & LIBUSB_REMOVING))
       resubmit = (   transfer->status == LIBUSB_TRANSFER_COMPLETED
                   || transfer->status == LIBUSB_TRANSFER_TIMED_OUT);
 
@@ -275,8 +274,8 @@ static void libusb_hid_device_send_control(void *data,
    if (!adapter || !adapter->endpoint_out)
       return;
 
-   retro_atomic_fetch_add_seq_cst_int(&adapter->senders, 1);
-   if (retro_atomic_load_seq_cst_int(&adapter->removing))
+   if (retro_atomic_fetch_add_int(&adapter->sender_gate, LIBUSB_SENDER)
+         & LIBUSB_REMOVING)
       goto done;
 
    if (     len > sizeof(adapter->send_buf)
@@ -309,9 +308,9 @@ done:
        * free it: no transfer of its own is left to wake that. Taken
        * before letting go, after which the adapter may be gone. */
       libusb_hid_t *hid = adapter->hid;
-      bool removed      = retro_atomic_load_seq_cst_int(&adapter->removing) != 0;
-      if (     retro_atomic_fetch_sub_int(&adapter->senders, 1) == 1
-            && removed && hid)
+      int state = retro_atomic_fetch_sub_int(
+            &adapter->sender_gate, LIBUSB_SENDER);
+      if (state == (LIBUSB_REMOVING | LIBUSB_SENDER) && hid)
          libusb_hid_wake(hid);
    }
 }
@@ -353,7 +352,8 @@ static bool libusb_hid_reap(void)
 
       idle =   !adapter->in_busy
             && !retro_atomic_load_seq_cst_int(&adapter->out_busy)
-            && !retro_atomic_load_seq_cst_int(&adapter->senders);
+            && !(retro_atomic_load_seq_cst_int(&adapter->sender_gate)
+                  & ~LIBUSB_REMOVING);
 
       if (!idle)
       {
@@ -468,8 +468,7 @@ static int add_adapter(void *data, struct libusb_device *dev)
    mpsc_stack_init(&adapter->pending);
    retro_atomic_int_init(&adapter->out_busy, 0);
    retro_atomic_int_init(&adapter->queued_bytes, 0);
-   retro_atomic_int_init(&adapter->senders, 0);
-   retro_atomic_int_init(&adapter->removing, 0);
+   retro_atomic_int_init(&adapter->sender_gate, 0);
 
    rc = libusb_get_device_descriptor(dev, &desc);
 
@@ -599,7 +598,9 @@ error:
    return -1;
 }
 
-static int remove_adapter(void *data, struct libusb_device *dev)
+/* @gone: the pad left, and is said to have; not when the driver is
+ * only stopping, as every joypad driver does at a restart. */
+static int remove_adapter(void *data, struct libusb_device *dev, bool gone)
 {
    struct libusb_adapter     *prev = &adapters;
    struct libusb_hid          *hid = (struct libusb_hid*)data;
@@ -621,15 +622,16 @@ static int remove_adapter(void *data, struct libusb_device *dev)
        * the list's sentinel head instead - slot 0, NULL, NULL - so
        * it disconnected and deinitialised slot 0 whatever pad had
        * left, freed nothing, and left the real slot connected. */
-      input_autoconfigure_disconnect(adapter->slot,
-            (const char*)adapter->name);
+      if (gone)
+         input_autoconfigure_disconnect(adapter->slot,
+               (const char*)adapter->name);
 
       /* No new reads or sends from here on; cancel what is in
        * flight. The cancellations come back through event handling,
        * and the adapter is freed by libusb_hid_reap() once both have.
        * Nothing here waits for them - this can be running inside the
        * hotplug callback, on the very thread that delivers them. */
-      retro_atomic_exchange_int(&adapter->removing, 1);
+      retro_atomic_fetch_or_int(&adapter->sender_gate, LIBUSB_REMOVING);
       /* A sender that claims the OUT transfer after this sees the
        * flag and sends nothing; one that claimed it before may still
        * submit after the cancel, and is reaped when that completes,
@@ -662,7 +664,7 @@ static int libusb_hid_hotplug_callback(struct libusb_context *ctx,
          add_adapter(hid, dev);
          break;
       case LIBUSB_HOTPLUG_EVENT_DEVICE_LEFT:
-         remove_adapter(hid, dev);
+         remove_adapter(hid, dev, true);
          break;
       default:
          RARCH_WARN("[libusb] Unhandled event: %d\n", event);
@@ -725,6 +727,14 @@ static bool libusb_hid_joypad_rumble(void *data, unsigned pad,
    return pad_connection_rumble(&hid->slots[pad], pad, effect, strength);
 }
 
+static void libusb_hid_set_player(void *data, unsigned pad, unsigned player)
+{
+   libusb_hid_t *hid = (libusb_hid_t*)data;
+   if (!hid || pad >= MAX_USERS)
+      return;
+   pad_connection_set_player(&hid->slots[pad], player);
+}
+
 static int16_t libusb_hid_joypad_axis(void *data,
       unsigned port, uint32_t joyaxis)
 {
@@ -752,21 +762,18 @@ static int16_t libusb_hid_joypad_axis(void *data,
 static int16_t libusb_hid_joypad_state(
       void *data,
       rarch_joypad_info_t *joypad_info,
-      const void *binds_data,
+      const uint16_t *joykeys,
+      const uint32_t *joyaxes,
       unsigned port)
 {
    unsigned i;
    int16_t ret                          = 0;
-   const struct retro_keybind *binds    = (const struct retro_keybind*)binds_data;
    uint16_t port_idx                    = joypad_info->joy_idx;
 
    for (i = 0; i < RARCH_FIRST_CUSTOM_BIND; i++)
    {
-      /* Auto-binds are per joypad, not per user. */
-      const uint64_t joykey  = (binds[i].joykey != NO_BTN)
-         ? binds[i].joykey  : joypad_info->auto_binds[i].joykey;
-      const uint32_t joyaxis = (binds[i].joyaxis != AXIS_NONE)
-         ? binds[i].joyaxis : joypad_info->auto_binds[i].joyaxis;
+      const uint64_t joykey  = joykeys[i];
+      const uint32_t joyaxis = joyaxes[i];
       if (
                (uint16_t)joykey != NO_BTN
             && libusb_hid_joypad_button(data, port_idx, (uint16_t)joykey))
@@ -810,7 +817,7 @@ static void libusb_hid_free(const void *data)
 
    while (adapters.next)
    {
-      if (remove_adapter(hid, adapters.next->device) == -1)
+      if (remove_adapter(hid, adapters.next->device, false) == -1)
       {
          /* Cannot happen - the head is on the list - but the old
           * loop would have spun here forever if it did. */
@@ -1002,4 +1009,13 @@ hid_driver_t libusb_hid = {
    libusb_hid_joypad_name,
    "libusb",
    libusb_hid_device_send_control,
+   NULL, /* set_report */
+   NULL, /* get_report */
+   NULL, /* set_idle */
+   NULL, /* set_protocol */
+   NULL, /* read */
+   NULL, /* get_bt_host */
+   NULL, /* set_bt_host */
+   NULL, /* is_bluetooth */
+   libusb_hid_set_player
 };

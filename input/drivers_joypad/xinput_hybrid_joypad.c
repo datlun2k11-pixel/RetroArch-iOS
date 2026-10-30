@@ -49,6 +49,8 @@
 #include "../../retroarch.h"
 
 #include "../../verbosity.h"
+#include "../common/input_ignore_devices.h"
+#include "../common/win_pad_ident.h"
 
 #include <queues/task_queue.h>
 
@@ -387,7 +389,8 @@ static int16_t dinput_joypad_axis(unsigned port, uint32_t joyaxis)
 
 static int16_t dinput_joypad_state(
       rarch_joypad_info_t *joypad_info,
-      const struct retro_keybind *binds,
+      const uint16_t *joykeys,
+      const uint32_t *joyaxes,
       unsigned port)
 {
    unsigned i;
@@ -410,11 +413,8 @@ static int16_t dinput_joypad_state(
    threshold_int = (int16_t)(joypad_info->axis_threshold * 0x8000);
    for (i = 0; i < RARCH_FIRST_CUSTOM_BIND; i++)
    {
-      /* Auto-binds are per joypad, not per user. */
-      const uint64_t joykey  = (binds[i].joykey  != NO_BTN)
-         ? binds[i].joykey   : joypad_info->auto_binds[i].joykey;
-      const uint32_t joyaxis = (binds[i].joyaxis  != AXIS_NONE)
-         ? binds[i].joyaxis  : joypad_info->auto_binds[i].joyaxis;
+      const uint64_t joykey  = joykeys[i];
+      const uint32_t joyaxis = joyaxes[i];
 
       if (     (uint16_t)joykey != NO_BTN
             && dinput_joypad_button_state(pad, (uint16_t)joykey))
@@ -722,8 +722,8 @@ static void dinput_hid_dev_cache_free(struct dinput_enum_job *job)
 }
 
 /* Lazily resolves and memoizes whether the device ID of a cached
- * HID device contains "IG_" (the XInput marker; this information
- * can not be found from DirectInput). */
+ * HID device contains "IG_", in either case (the XInput marker; this
+ * information can not be found from DirectInput). */
 static bool dinput_hid_dev_cache_is_ig(dinput_hid_dev_cache_entry_t *e)
 {
    UINT name_size = 0;
@@ -738,7 +738,7 @@ static bool dinput_hid_dev_cache_is_ig(dinput_hid_dev_cache_entry_t *e)
        && ((dev_name = (char*)malloc(name_size)) != NULL)
        && (GetRawInputDeviceInfoA(e->hDevice,
            RIDI_DEVICENAME, dev_name, &name_size) != ((UINT)-1))
-       && (strstr(dev_name, "IG_")))
+       && win_pad_path_is_xinput(dev_name))
       e->is_ig = 1;
 
    if (dev_name)
@@ -834,6 +834,19 @@ static BOOL CALLBACK enum_joypad_cb_hybrid(
       if (job->next_xuser < 4)
          job->xuser[idx] = (int)job->next_xuser++;
       goto enum_iteration_done;
+   }
+
+   /* Another program reads it and stands in for it (Steam Input), or
+    * a pad already listed, on its other link */
+   pad->link_addr = dinput_pad_link_addr(dev, pad->vid, pad->pid);
+   if (     input_device_ignored((uint16_t)pad->vid, (uint16_t)pad->pid)
+         || dinput_pad_is_link(job->pads, job->cnt, pad->link_addr))
+   {
+      IDirectInputDevice8_Release(dev);
+      free(pad->joy_name);
+      free(pad->joy_friendly_name);
+      memset(pad, 0, sizeof(*pad));
+      return DIENUM_CONTINUE;
    }
 
    /* Set data format to simple joystick */
@@ -1017,7 +1030,14 @@ static void *xinput_joypad_init(void *data)
    /* Zero out the states. */
    for (i = 0; i < 4; ++i)
    {
-      memset(&g_xinput_states[i].xstate, 0, sizeof(XINPUT_STATE));
+      g_xinput_states[i].xstate.dwPacketNumber        = 0;
+      g_xinput_states[i].xstate.Gamepad.wButtons      = 0;
+      g_xinput_states[i].xstate.Gamepad.bLeftTrigger  = 0;
+      g_xinput_states[i].xstate.Gamepad.bRightTrigger = 0;
+      g_xinput_states[i].xstate.Gamepad.sThumbLX      = 0;
+      g_xinput_states[i].xstate.Gamepad.sThumbLY      = 0;
+      g_xinput_states[i].xstate.Gamepad.sThumbRX      = 0;
+      g_xinput_states[i].xstate.Gamepad.sThumbRY      = 0;
       g_xinput_states[i].connected                    =
          !(g_XInputGetStateEx(i, &dummy_state) == ERROR_DEVICE_NOT_CONNECTED);
    }
@@ -1150,7 +1170,8 @@ static int16_t xinput_joypad_axis(unsigned port, uint32_t joyaxis)
 
 static int16_t xinput_joypad_state_func(
       rarch_joypad_info_t *joypad_info,
-      const struct retro_keybind *binds,
+      const uint16_t *joykeys,
+      const uint32_t *joyaxes,
       unsigned port)
 {
    int i;
@@ -1162,7 +1183,7 @@ static int16_t xinput_joypad_state_func(
    XINPUT_GAMEPAD *pad;
    int16_t threshold_int;
    if (xuser == -1)
-      return dinput_joypad_state(joypad_info, binds, port_idx);
+      return dinput_joypad_state(joypad_info, joykeys, joyaxes, port_idx);
    state = &g_xinput_states[xuser];
    pad   = &state->xstate.Gamepad;
    if (!state->connected)
@@ -1172,11 +1193,8 @@ static int16_t xinput_joypad_state_func(
 
    for (i = 0; i < RARCH_FIRST_CUSTOM_BIND; i++)
    {
-      /* Auto-binds are per joypad, not per user. */
-      const uint64_t joykey  = (binds[i].joykey != NO_BTN)
-         ? binds[i].joykey  : joypad_info->auto_binds[i].joykey;
-      const uint32_t joyaxis = (binds[i].joyaxis != AXIS_NONE)
-         ? binds[i].joyaxis : joypad_info->auto_binds[i].joyaxis;
+      const uint64_t joykey  = joykeys[i];
+      const uint32_t joyaxis = joyaxes[i];
       if (
                (uint16_t)joykey != NO_BTN
             && xinput_joypad_button_state(
@@ -1304,11 +1322,20 @@ static void xinput_joypad_poll(void)
       if (success)
          state->xstate = tmp_xstate;
       else
+      {
          /* Any status other than ERROR_DEVICE_NOT_CONNECTED leaves
           * the pad marked connected, so the cached state would keep
           * reporting the buttons held at the last good read - see
           * the matching comment in xinput_joypad.c */
-         memset(&state->xstate, 0, sizeof(state->xstate));
+         state->xstate.dwPacketNumber        = 0;
+         state->xstate.Gamepad.wButtons      = 0;
+         state->xstate.Gamepad.bLeftTrigger  = 0;
+         state->xstate.Gamepad.bRightTrigger = 0;
+         state->xstate.Gamepad.sThumbLX      = 0;
+         state->xstate.Gamepad.sThumbLY      = 0;
+         state->xstate.Gamepad.sThumbRX      = 0;
+         state->xstate.Gamepad.sThumbRY      = 0;
+      }
 
       if (new_connected != state->connected)
       {
@@ -1393,7 +1420,14 @@ static void xinput_joypad_destroy(void)
 
    for (i = 0; i < 4; ++i)
    {
-      memset(&g_xinput_states[i].xstate, 0, sizeof(XINPUT_STATE));
+      g_xinput_states[i].xstate.dwPacketNumber        = 0;
+      g_xinput_states[i].xstate.Gamepad.wButtons      = 0;
+      g_xinput_states[i].xstate.Gamepad.bLeftTrigger  = 0;
+      g_xinput_states[i].xstate.Gamepad.bRightTrigger = 0;
+      g_xinput_states[i].xstate.Gamepad.sThumbLX      = 0;
+      g_xinput_states[i].xstate.Gamepad.sThumbLY      = 0;
+      g_xinput_states[i].xstate.Gamepad.sThumbRX      = 0;
+      g_xinput_states[i].xstate.Gamepad.sThumbRY      = 0;
       g_xinput_states[i].connected                    = false;
    }
 

@@ -25,22 +25,8 @@ static const char *qnx_joypad_name(unsigned pad)
    return input_config_get_device_name(pad);
 }
 
-static void *qnx_joypad_init(void *data)
-{
-   unsigned autoconf_pad;
-
-   for (autoconf_pad = 0; autoconf_pad < MAX_USERS; autoconf_pad++)
-      input_autoconfigure_connect(
-            qnx_joypad_name(autoconf_pad),
-            NULL, NULL,
-            qnx_joypad.ident,
-            autoconf_pad,
-            0,
-            0
-            );
-
-   return (void*)-1;
-}
+/* Gamepads are announced by the input driver as libscreen finds them. */
+static void *qnx_joypad_init(void *data) { return (void*)-1; }
 
 static int32_t qnx_joypad_button(unsigned port, uint16_t joykey)
 {
@@ -115,7 +101,8 @@ static int16_t qnx_joypad_axis(unsigned port, uint32_t joyaxis)
 
 static int16_t qnx_joypad_state(
       rarch_joypad_info_t *joypad_info,
-      const struct retro_keybind *binds,
+      const uint16_t *joykeys,
+      const uint32_t *joyaxes,
       unsigned port)
 {
    int i;
@@ -131,11 +118,8 @@ static int16_t qnx_joypad_state(
 
    for (i = 0; i < RARCH_FIRST_CUSTOM_BIND; i++)
    {
-      /* Auto-binds are per joypad, not per user. */
-      const uint64_t joykey  = (binds[i].joykey != NO_BTN)
-         ? binds[i].joykey  : joypad_info->auto_binds[i].joykey;
-      const uint32_t joyaxis = (binds[i].joyaxis != AXIS_NONE)
-         ? binds[i].joyaxis : joypad_info->auto_binds[i].joyaxis;
+      const uint64_t joykey  = joykeys[i];
+      const uint32_t joyaxis = joyaxes[i];
       if (
                (uint16_t)joykey != NO_BTN
             && (joykey <= 19)
@@ -155,7 +139,9 @@ static void qnx_joypad_poll(void) { }
 
 static bool qnx_joypad_query_pad(unsigned pad)
 {
-   return (pad < MAX_USERS);
+   qnx_input_t *qnx = (qnx_input_t*)input_driver_current_data();
+   return qnx && pad < DEFAULT_MAX_PADS
+      && qnx->devices[pad].type == SCREEN_EVENT_GAMEPAD;
 }
 
 static void qnx_joypad_destroy(void) { }

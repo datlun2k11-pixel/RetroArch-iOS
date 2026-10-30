@@ -72,10 +72,7 @@ enum task_cloud_sync_phase
 typedef struct
 {
    MD5_CTX        md5;
-   int64_t        map_len;
-   int64_t        pos;
    RFILE         *file;  /* NULL when idle */
-   const uint8_t *map;
 } tcs_hash_t;
 
 struct tcs_fetched;
@@ -162,6 +159,9 @@ typedef struct
     * than a process-wide cache: a fresh list per sync is a handful of
     * strdups, and it cannot go stale against the sync toggles. */
    struct string_list *dirlist;
+   /* Whoever pushed the sync, told when it is done. */
+   retro_task_callback_t cb;
+   void *cb_data;
 } task_cloud_sync_state_t;
 
 /* An entry for updated_server_manifest or updated_local_manifest, on
@@ -260,6 +260,7 @@ static void task_cloud_sync_begin_handler(void *user_data, const char *path, boo
    else
    {
       RARCH_WARN(CSPFX "Begin failed.\n");
+      sync_state->failures = true;
       task_free_title(task);
       task_set_title(task, strdup("Cloud Sync failed"));
       task_set_flags(task, RETRO_TASK_FLG_FINISHED, true);
@@ -499,8 +500,13 @@ static bool task_cloud_sync_should_ignore_file(const char *filename)
        return true;
 
    /* a download still being written, or left by one that never
-    * finished (network/cloud_sync/nfs.c) */
+    * finished (CS_FETCHING_SUFFIX) */
    if (string_ends_with(filename, ".rafetching"))
+       return true;
+
+   /* a save, state or disk index still being written, or left by one
+    * that never finished (filestream_atomic_temp_name) */
+   if (string_ends_with(filename, ".tmp"))
        return true;
 
    return false;
@@ -963,12 +969,14 @@ static void task_cloud_sync_md5_hex(char *hash, MD5_CTX *md5)
    hash[32] = '\0';
 }
 
+/* Octets per chunk of a file's hash. */
+#define CS_HASH_CHUNK (256 * 1024)
+
 static char *task_cloud_sync_md5_rfile(RFILE *file)
 {
-   MD5_CTX md5;
-   const uint8_t *map     = NULL;
-   int64_t        map_len = 0;
-   char          *hash    = (char*)malloc(33);
+   MD5_CTX        md5;
+   unsigned char *buf  = NULL;
+   char          *hash = (char*)malloc(33);
 
    if (!hash)
       return NULL;
@@ -987,64 +995,43 @@ static char *task_cloud_sync_md5_rfile(RFILE *file)
     * other way round. */
    filestream_seek(file, 0, RETRO_VFS_SEEK_POSITION_START);
 
-   /* The files are opened with HINT_FREQUENT_ACCESS, so where the
-    * platform maps them the whole file is already addressable and
-    * there is nothing to copy.  This used to read the mapping out of
-    * the VFS handle directly - the only place in the tree that did -
-    * which meant a task reaching past filestream into a struct it
-    * does not own, and getting no answer at all from a
-    * frontend-supplied VFS.  filestream_get_mapped_ptr() answers the
-    * same question through the layer that owns it, and NULL is a
-    * normal answer, so the read loop below stays the general case. */
-   if ((map = filestream_get_mapped_ptr(file, &map_len)) && map_len > 0)
-      MD5_Update(&md5, map, (size_t)map_len);
-   else
+   /* Hashed where it lies when the stream can lend it - the files are
+    * opened with HINT_FREQUENT_ACCESS, so where the platform maps them
+    * nothing is copied - and read into a buffer made on first need
+    * otherwise. 256 KB at a time either way, same reasoning as
+    * intfstream_get_crc: at 4 KB a call it is call overhead, not
+    * hashing. */
+   for (;;)
    {
-      /* 256 KB reads, same reasoning as intfstream_get_crc: hashing a
-       * large savestate at 4 KB a call is call overhead, not hashing.
-       * Heap once per file; this is a background sync path.
-       *
-       * Allocated here rather than before the branch above, where it
-       * was malloc'd and freed on every mapped hash as well without a
-       * byte of it ever being touched. */
-      size_t         buf_len = 256 * 1024;
-      unsigned char *buf     = (unsigned char*)malloc(buf_len);
-      int            rv;
+      const uint8_t *ptr = NULL;
+      int64_t        n   = filestream_view(file, CS_HASH_CHUNK, &ptr);
 
-      if (!buf)
+      if (n < 0)
       {
-         free(hash);
-         return NULL;
+         if (!buf && !(buf = (unsigned char*)malloc(CS_HASH_CHUNK)))
+         {
+            free(hash);
+            return NULL;
+         }
+         n   = filestream_read(file, buf, CS_HASH_CHUNK);
+         ptr = buf;
       }
-
-      do
-      {
-         rv = (int)filestream_read(file, buf, (int64_t)buf_len);
-         if (rv > 0)
-            MD5_Update(&md5, buf, rv);
-      } while (rv > 0);
-
-      free(buf);
+      if (n <= 0)
+         break;
+      MD5_Update(&md5, ptr, (unsigned long)n);
    }
+   free(buf);
 
    task_cloud_sync_md5_hex(hash, &md5);
    return hash;
 }
-
-/* Reads per chunk of the current file's hash. */
-#define CS_HASH_CHUNK (256 * 1024)
 
 /* Starts @h on @file, from its start. */
 static void task_cloud_sync_hash_begin(tcs_hash_t *h, RFILE *file)
 {
    MD5_Init(&h->md5);
    filestream_seek(file, 0, RETRO_VFS_SEEK_POSITION_START);
-   h->file    = file;
-   h->pos     = 0;
-   h->map_len = 0;
-   h->map     = filestream_get_mapped_ptr(file, &h->map_len);
-   if (h->map_len <= 0)
-      h->map  = NULL;
+   h->file = file;
 }
 
 /* Hashes @h's file a chunk at a time while @b allows. True once it is
@@ -1056,22 +1043,18 @@ static bool task_cloud_sync_hash_step(tcs_hash_t *h, uint8_t *buf,
 {
    for (;;)
    {
-      int64_t n;
+      const uint8_t *ptr = NULL;
+      int64_t        n;
       if (!task_nbio_slice_within_budget(b, 0, 0))
          return false;
-      if (h->map)
+      if ((n = filestream_view(h->file, CS_HASH_CHUNK, &ptr)) < 0)
       {
-         n = h->map_len - h->pos;
-         if (n > CS_HASH_CHUNK)
-            n = CS_HASH_CHUNK;
-         if (n > 0)
-            MD5_Update(&h->md5, h->map + h->pos, (size_t)n);
+         n   = filestream_read(h->file, buf, CS_HASH_CHUNK);
+         ptr = buf;
       }
-      else if ((n = filestream_read(h->file, buf, CS_HASH_CHUNK)) > 0)
-         MD5_Update(&h->md5, buf, (size_t)n);
       if (n <= 0)
          break;
-      h->pos += n;
+      MD5_Update(&h->md5, ptr, (unsigned long)n);
    }
    task_cloud_sync_md5_hex(hash, &h->md5);
    h->file = NULL;
@@ -1225,7 +1208,79 @@ typedef struct
 {
    task_cloud_sync_state_t *sync_state;
    struct item_file        *server_file;
+   /* Where the download goes once it is complete; the driver writes it
+    * beside that, under CS_FETCHING_SUFFIX. */
+   char                     local[PATH_MAX_LENGTH];
 } task_cloud_sync_fetch_state_t;
+
+/* A download is written here first and moved into place only once it
+ * is whole, so a transfer that fails part-way leaves the local file as
+ * it was, and a file a core took meanwhile is never replaced. The walk
+ * skips names ending in it. */
+#define CS_FETCHING_SUFFIX ".rafetching"
+
+/* @local's download, under CS_FETCHING_SUFFIX, into @s. False when the
+ * name does not fit. */
+static bool task_cloud_sync_fetching_path(char *s, size_t len,
+      const char *local)
+{
+   size_t _len = strlcpy(s, local, len);
+   return    _len < len
+          && strlcpy(s + _len, CS_FETCHING_SUFFIX, len - _len)
+               < len - _len;
+}
+
+/* Moves a whole download into place. A core that has taken the file
+ * since the fetch began keeps it, and the download goes, as at the
+ * start of the fetch. False when the download did not land. */
+static bool task_cloud_sync_fetch_commit(
+      task_cloud_sync_fetch_state_t *fetch_state, const char *key)
+{
+   char tmp[PATH_MAX_LENGTH];
+   task_cloud_sync_state_t *sync_state = fetch_state->sync_state;
+   const char *server_hash = CS_FILE_HASH(fetch_state->server_file);
+
+   if (!task_cloud_sync_fetching_path(tmp, sizeof(tmp), fetch_state->local))
+      return false;
+   if (content_savefile_is_live(fetch_state->local))
+   {
+      RARCH_LOG(CSPFX "Deferring \"%s\", the running core took it during the fetch.\n", key);
+      filestream_delete(tmp);
+      task_cloud_sync_carry_manifests_forward(sync_state, key, server_hash);
+      return false;
+   }
+   if (!sync_state->destructive && path_is_valid(fetch_state->local))
+   {
+      struct item_file local_file = {0};
+      local_file.alt  = (char*)key;
+      local_file.path = fetch_state->local;
+      if (!task_cloud_sync_backup_file(&local_file, sync_state->dir_core_assets))
+      {
+         filestream_delete(tmp);
+         task_cloud_sync_carry_manifests_forward(sync_state, key, server_hash);
+         sync_state->failures = true;
+         return false;
+      }
+   }
+   if (filestream_rename(tmp, fetch_state->local) != 0)
+   {
+      RARCH_WARN(CSPFX "Could not move the download of \"%s\" into place.\n", key);
+      filestream_delete(tmp);
+      task_cloud_sync_add_to_updated_manifest(sync_state, key, server_hash, true);
+      sync_state->failures = true;
+      return false;
+   }
+   return true;
+}
+
+/* What a fetch that never completed left beside its file. */
+static void task_cloud_sync_fetch_discard(
+      task_cloud_sync_fetch_state_t *fetch_state)
+{
+   char tmp[PATH_MAX_LENGTH];
+   if (task_cloud_sync_fetching_path(tmp, sizeof(tmp), fetch_state->local))
+      filestream_delete(tmp);
+}
 
 /* A download waiting to be hashed by the task thread. */
 typedef struct tcs_fetched
@@ -1349,8 +1404,9 @@ static void task_cloud_sync_fetched_run(task_cloud_sync_state_t *sync_state,
          free(h);
       }
       filestream_close(rec->file);
-      task_cloud_sync_fetched(sync_state, rec->fetch_state->server_file,
-            rec->path, hash);
+      if (task_cloud_sync_fetch_commit(rec->fetch_state, rec->path))
+         task_cloud_sync_fetched(sync_state, rec->fetch_state->server_file,
+               rec->path, hash);
       sync_state->fetched = rec->next;
       free(rec->fetch_state);
       free(rec);
@@ -1363,7 +1419,6 @@ static void task_cloud_sync_fetch_cb(void *user_data, const char *path, bool suc
    task_cloud_sync_fetch_state_t *fetch_state = (task_cloud_sync_fetch_state_t *)user_data;
    task_cloud_sync_state_t       *sync_state;
    struct item_file              *server_file;
-   char                          *hash = NULL;
 
    if (!fetch_state)
       return;
@@ -1377,10 +1432,12 @@ static void task_cloud_sync_fetch_cb(void *user_data, const char *path, bool suc
        * in flight until then */
       if (task_cloud_sync_fetched_push(fetch_state, path, file))
          return;
-      hash = task_cloud_sync_md5_rfile(file);
       filestream_close(file);
-      task_cloud_sync_fetched(sync_state, server_file, path, hash);
-      free(hash);
+      task_cloud_sync_fetch_discard(fetch_state);
+      task_cloud_sync_carry_manifests_forward(sync_state, path,
+            CS_FILE_HASH(server_file));
+      sync_state->failures = true;
+      RARCH_WARN(CSPFX "Could not queue the download of \"%s\".\n", path);
    }
    else if (success)
    {
@@ -1397,6 +1454,9 @@ static void task_cloud_sync_fetch_cb(void *user_data, const char *path, bool suc
    {
       /* on failure, don't add it to local manifest, that will cause a fetch again next time */
       RARCH_WARN(CSPFX "Failed to fetch \"%s\".\n", path);
+      if (file)
+         filestream_close(file);
+      task_cloud_sync_fetch_discard(fetch_state);
       task_cloud_sync_add_to_updated_manifest(sync_state, path, CS_FILE_HASH(server_file), true);
       sync_state->failures = true;
    }
@@ -1410,6 +1470,7 @@ static void task_cloud_sync_fetch_server_file(task_cloud_sync_state_t *sync_stat
 {
    size_t                         i;
    char                           filename[PATH_MAX_LENGTH];
+   char                           fetching[PATH_MAX_LENGTH];
    char                           directory[DIR_MAX_LENGTH];
    struct string_list            *dirlist     = sync_state->dirlist;
    struct item_file              *server_file = &sync_state->server_manifest->list[sync_state->server_idx];
@@ -1474,20 +1535,6 @@ static void task_cloud_sync_fetch_server_file(task_cloud_sync_state_t *sync_stat
             CS_FILE_HASH(server_file)))
       return;
 
-   if (!sync_state->destructive && path_is_valid(filename))
-   {
-      size_t idx;
-      if (     file_list_search(sync_state->current_manifest, key, &idx)
-            && !task_cloud_sync_backup_file(&sync_state->current_manifest->list[idx],
-                  sync_state->dir_core_assets))
-      {
-         RARCH_ERR(CSPFX "Not fetching \"%s\", the local file could not be backed up.\n", key);
-         task_cloud_sync_carry_manifests_forward(sync_state, key, CS_FILE_HASH(server_file));
-         sync_state->failures = true;
-         return;
-      }
-   }
-
    fill_pathname_basedir(directory, filename, sizeof(directory));
    path_mkdir(directory);
    fetch_state = (task_cloud_sync_fetch_state_t*)malloc(sizeof(task_cloud_sync_fetch_state_t));
@@ -1500,7 +1547,9 @@ static void task_cloud_sync_fetch_server_file(task_cloud_sync_state_t *sync_stat
    }
    fetch_state->sync_state  = sync_state;
    fetch_state->server_file = server_file;
-   if (cloud_sync_read(key, filename, task_cloud_sync_fetch_cb, fetch_state))
+   strlcpy(fetch_state->local, filename, sizeof(fetch_state->local));
+   if (     task_cloud_sync_fetching_path(fetching, sizeof(fetching), filename)
+         && cloud_sync_read(key, fetching, task_cloud_sync_fetch_cb, fetch_state))
       task_cloud_sync_waiting_inc(sync_state);
    else
    {
@@ -2235,6 +2284,7 @@ static void task_cloud_sync_task_step(retro_task_t *task,
          if (!cloud_sync_begin(task_cloud_sync_begin_handler, task))
          {
             RARCH_WARN(CSPFX "Could not begin.\n");
+            sync_state->failures = true;
             task_free_title(task);
             task_set_title(task, strdup("Cloud Sync failed"));
             goto task_finished;
@@ -2274,6 +2324,7 @@ static void task_cloud_sync_task_step(retro_task_t *task,
          if (!cloud_sync_end(task_cloud_sync_end_handler, task))
          {
             RARCH_WARN(CSPFX "Could not end?!\n");
+            sync_state->failures = true;
             goto task_finished;
          }
          break;
@@ -2298,17 +2349,31 @@ static void task_cloud_sync_task_handler(retro_task_t *task)
       return;
    }
 
-   /* Results of calls a blocking driver finished on its worker: their
+   /* One window per run, shared by the results of calls a blocking
+    * driver finished on its worker, the downloads being hashed and the
+    * diff; every run makes at least one unit of progress. The results'
     * handlers run here, on this thread, before the in-flight count is
     * read. */
-   cloud_sync_poll();
-
-   /* One window per run, shared by the downloads being hashed and the
-    * diff; every run makes at least one unit of progress. */
    task_nbio_slice_open(&b);
+   cloud_sync_poll(task_nbio_slice_within_budget, &b);
    task_cloud_sync_fetched_run(sync_state, &b);
    task_cloud_sync_task_step(task, sync_state, &b);
    task_nbio_slice_close(&b);
+}
+
+/* Runs on the main thread before the state is released. A sync that
+ * failed, or finished with failures or conflicts, reports its title -
+ * the sync's own summary - as the error. */
+static void task_cloud_sync_cb(retro_task_t *task, void *task_data,
+      void *user_data, const char *error)
+{
+   task_cloud_sync_state_t *sync_state = (task_cloud_sync_state_t *)task->state;
+
+   if (!sync_state || !sync_state->cb)
+      return;
+   if (!error && (sync_state->failures || sync_state->conflicts))
+      error = task->title ? task->title : "Cloud Sync failed";
+   sync_state->cb(task, NULL, sync_state->cb_data, error);
 }
 
 /* Releases the sync's state when the task retires. Every manifest owns
@@ -2349,6 +2414,7 @@ static void task_cloud_sync_cleanup(retro_task_t *task)
       tcs_fetched_t *rec  = sync_state->fetched;
       sync_state->fetched = rec->next;
       filestream_close(rec->file);
+      task_cloud_sync_fetch_discard(rec->fetch_state);
       free(rec->fetch_state);
       free(rec);
    }
@@ -2364,8 +2430,11 @@ static void task_cloud_sync_task_setup(retro_task_t *task,
    task->state       = sync_state;
    task->title       = strdup(title);
    task->handler     = task_cloud_sync_task_handler;
+   task->callback    = task_cloud_sync_cb;
    task->cleanup     = task_cloud_sync_cleanup;
    task->progress_cb = task_window_progress_cb;
+   /* Save ownership and local mutations share the content thread. */
+   task->flags     |= RETRO_TASK_FLG_MAIN_THREAD;
 }
 
 static bool task_cloud_sync_task_finder(retro_task_t *task, void *user_data)
@@ -2377,7 +2446,8 @@ static bool task_cloud_sync_task_finder(retro_task_t *task, void *user_data)
    return task->handler == task_cloud_sync_task_handler;
 }
 
-static void task_push_cloud_sync_with_mode(int conflict_resolution)
+static bool task_push_cloud_sync_with_mode(int conflict_resolution,
+      retro_task_callback_t cb, void *cb_data)
 {
    char task_title[128];
    task_finder_data_t       find_data;
@@ -2386,7 +2456,7 @@ static void task_push_cloud_sync_with_mode(int conflict_resolution)
    bool cloud_sync_enable              = config_get_ptr()->bools.cloud_sync_enable;
 
    if (!cloud_sync_enable)
-      return;
+      return false;
 
 #if defined(HAVE_THREADS) && !defined(TCS_LOCK_FREE)
    if (!tcs_manifest_lock)
@@ -2397,15 +2467,14 @@ static void task_push_cloud_sync_with_mode(int conflict_resolution)
    if (task_queue_find(&find_data))
    {
       RARCH_LOG(CSPFX "Already in progress.\n");
-      return;
+      return false;
    }
 
    sync_state = (task_cloud_sync_state_t *)calloc(1, sizeof(task_cloud_sync_state_t));
    if (!sync_state)
-      return;
+      return false;
 
-   /* Captured here, on the main thread, for the worker the threaded
-    * task queue runs the handler on. */
+   /* Keep this sync's settings across subsequent frames. */
    {
       settings_t *settings    = config_get_ptr();
       sync_state->destructive = settings->bools.cloud_sync_destructive;
@@ -2414,17 +2483,18 @@ static void task_push_cloud_sync_with_mode(int conflict_resolution)
             sizeof(sync_state->dir_core_assets));
       sync_state->dirlist     = task_cloud_sync_directory_map_new(settings);
    }
+   cloud_sync_capture();
    if (!sync_state->dirlist)
    {
       free(sync_state);
-      return;
+      return false;
    }
 
    if (!(task = task_init()))
    {
       string_list_free(sync_state->dirlist);
       free(sync_state);
-      return;
+      return false;
    }
 
    /* calloc zero-fill is not a portable initializer for an atomic
@@ -2436,17 +2506,20 @@ static void task_push_cloud_sync_with_mode(int conflict_resolution)
    task_cloud_sync_phase_set(sync_state, CLOUD_SYNC_PHASE_BEGIN);
    sync_state->start_time          = cpu_features_get_time_usec();
    sync_state->conflict_resolution = conflict_resolution;
+   sync_state->cb                  = cb;
+   sync_state->cb_data             = cb_data;
 
    strlcpy_lit(task_title, "Cloud Sync in progress", sizeof(task_title));
 
    task_cloud_sync_task_setup(task, sync_state, task_title);
 
    task_queue_push(task);
+   return true;
 }
 
-void task_push_cloud_sync(void)
+bool task_push_cloud_sync(retro_task_callback_t cb, void *cb_data)
 {
-   task_push_cloud_sync_with_mode(0);
+   return task_push_cloud_sync_with_mode(0, cb, cb_data);
 }
 
 void task_push_cloud_sync_update_driver(void)
@@ -2469,11 +2542,11 @@ void task_push_cloud_sync_update_driver(void)
 void task_push_cloud_sync_resolve_keep_local(void)
 {
    RARCH_LOG(CSPFX "Starting sync with conflict resolution: keep local.\n");
-   task_push_cloud_sync_with_mode(1);
+   task_push_cloud_sync_with_mode(1, NULL, NULL);
 }
 
 void task_push_cloud_sync_resolve_keep_server(void)
 {
    RARCH_LOG(CSPFX "Starting sync with conflict resolution: keep server.\n");
-   task_push_cloud_sync_with_mode(2);
+   task_push_cloud_sync_with_mode(2, NULL, NULL);
 }

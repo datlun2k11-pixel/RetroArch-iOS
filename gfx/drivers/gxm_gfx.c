@@ -52,10 +52,6 @@
 #include "../../configuration.h"
 #include "../../input/input_osk.h"
 
-/* Forward declaration
-   TODO/FIXME - check if this custom memcpy is genuinely more efficient */
-extern void *memcpy_neon(void *dst, const void *src, size_t n);
-
 /* Defines */
 
 #define RGBA8(r,g,b,a) ((((a)&0xFF)<<24) | (((b)&0xFF)<<16) | (((g)&0xFF)<<8) | (((r)&0xFF)<<0))
@@ -166,6 +162,8 @@ struct vita_overlay_data
 typedef struct vita_video
 {
    gxm_texture_t *texture;
+   /* Sampled by a quad drawn with no texture: solid colour */
+   gxm_texture_t *white_texture;
    SceGxmTextureFormat format;
    /* The size of the frame the core last handed over, packed. */
    unsigned dims;
@@ -188,6 +186,8 @@ typedef struct vita_video
 #ifdef HAVE_OVERLAY
    bool overlay_enable;
    bool overlay_full_screen;
+   /* overlay[].tex are the overlay pack's (load_textures) */
+   bool overlay_borrowed;
 #endif
    bool fullscreen;
    bool vsync;
@@ -336,6 +336,8 @@ static void *vertex_usse_alloc(unsigned int size, SceUID *uid,
       unsigned int *usse_offset);
 static void vertex_usse_free(SceUID uid);
 static void gxm_render_overlay(void *data);
+static uintptr_t gxm_load_texture(void *video_data, void *data,
+      bool threaded, enum texture_filter_type filter_type);
 static void gxm_set_projection(vita_video_t *vita,
       struct video_ortho *ortho, bool allow_rotate);
 
@@ -1230,7 +1232,8 @@ static gxm_texture_t *gxm_create_empty_texture_format(unsigned int w,
 
    memset(texture, 0, sizeof(gxm_texture_t));
 
-   tex_size =  w * h * tex_format_to_bytespp(format);
+   /* Rows are gxm_texture_get_stride() apart: the width to 8 */
+   tex_size = ((w + 7) & ~7) * h * tex_format_to_bytespp(format);
 
    /* Allocate a GPU buffer for the texture */
    texture_data = gpu_alloc(
@@ -1290,6 +1293,26 @@ static unsigned int gxm_texture_get_stride(const gxm_texture_t *texture)
 {
    return ((sceGxmTextureGetWidth(&texture->gxm_tex) + 7) & ~7)
       * tex_format_to_bytespp(sceGxmTextureGetFormat(&texture->gxm_tex));
+}
+
+/* @height rows of @row_len bytes from @src, @pitch bytes apart, into a
+ * texture's rows @stride bytes apart; one copy when the two line up.
+ * @row_len is no more than either. */
+static void gxm_copy_rows(void *dst, unsigned stride, const void *src,
+      unsigned pitch, unsigned row_len, unsigned height)
+{
+   uint8_t       *out = (uint8_t*)dst;
+   const uint8_t *in  = (const uint8_t*)src;
+
+   if (!height)
+      return;
+   if (stride == pitch)
+   {
+      memcpy(out, in, (size_t)pitch * (height - 1) + row_len);
+      return;
+   }
+   for (; height; height--, out += stride, in += pitch)
+      memcpy(out, in, row_len);
 }
 
 static void gxm_texture_set_filters(gxm_texture_t *texture,
@@ -1562,7 +1585,8 @@ static void gfx_display_gxm_draw(gfx_display_ctx_draw_t *draw,
    if (!vita || !draw)
       return;
 
-   texture            = (gxm_texture_t*)draw->texture;
+   texture            = draw->texture
+      ? (gxm_texture_t*)draw->texture : vita->white_texture;
    vertex             = draw->coords->vertex;
    tex_coord          = draw->coords->tex_coord;
    color              = draw->coords->color;
@@ -1688,8 +1712,7 @@ static void *gxm_font_init(void *data,
       goto error;
 
    /* The atlas may grow; the texture follows it */
-   atlas->max_width  = 2048;
-   atlas->max_height = 2048;
+   atlas->max_dims = VIDEO_SCALE_PACK(2048, 2048);
 
    if (!(font->texture = gxm_font_make_texture(atlas)))
       goto error;
@@ -1779,10 +1802,10 @@ static void gxm_font_render_message(
          unsigned int pitch     = font->atlas->width; \
          /* Copy only the dirty rectangle tracked by the font \
           * renderers, one row at a time */ \
-         unsigned int x0        = font->atlas->dirty_x0; \
-         unsigned int y0        = font->atlas->dirty_y0; \
-         unsigned int x1        = font->atlas->dirty_x1; \
-         unsigned int y1        = font->atlas->dirty_y1; \
+         unsigned int x0        = VIDEO_SCALE_W(font->atlas->dirty_xy0); \
+         unsigned int y0        = VIDEO_SCALE_H(font->atlas->dirty_xy0); \
+         unsigned int x1        = VIDEO_SCALE_W(font->atlas->dirty_xy1); \
+         unsigned int y1        = VIDEO_SCALE_H(font->atlas->dirty_xy1); \
          if (x1 <= x0 || y1 <= y0 || x1 > pitch || y1 > font->atlas->height) \
          { \
             x0 = 0; \
@@ -1798,8 +1821,8 @@ static void gxm_font_render_message(
       gxm_draw_texture_tint_part_scale(font->texture, \
             x + ((glyph)->draw_offset_x + (pen_x)) * scale, \
             y + ((glyph)->draw_offset_y + (pen_y)) * scale, \
-            (glyph)->atlas_offset_x, (glyph)->atlas_offset_y, \
-            (glyph)->width, (glyph)->height, \
+            VIDEO_SCALE_W((glyph)->atlas_pos), VIDEO_SCALE_H((glyph)->atlas_pos), \
+            VIDEO_SCALE_W((glyph)->dims), VIDEO_SCALE_H((glyph)->dims), \
             scale, \
             scale, \
             color); \
@@ -1921,8 +1944,7 @@ static bool gxm_font_get_line_metrics(void* data,
  * VIDEO DRIVER
  */
 
-static void *gxm_gfx_init(const video_info_t *video,
-      input_driver_t **input, void **input_data)
+static void *gxm_gfx_init(const video_info_t *video)
 {
    unsigned int color;
    unsigned temp_width                    = PSP_FB_WIDTH;
@@ -1933,8 +1955,6 @@ static void *gxm_gfx_init(const video_info_t *video,
    if (!vita)
       return NULL;
 
-   *input             = NULL;
-   *input_data        = NULL;
 
    gxm_init_internal((1 * 1024 * 1024), SCE_GXM_MULTISAMPLE_4X,
    (sceKernelGetModelForCDialog() == SCE_KERNEL_MODEL_VITATV)
@@ -1958,6 +1978,16 @@ static void *gxm_gfx_init(const video_info_t *video,
    vita->menu.texture = NULL;
    vita->menu.active  = 0;
    vita->menu.dims    = 0;
+   {
+      static const uint32_t white = 0xffffffffu;
+      struct texture_image image;
+      memset(&image, 0, sizeof(image));
+      image.pixels        = (uint32_t*)&white;
+      image.width         = 1;
+      image.height        = 1;
+      vita->white_texture = (gxm_texture_t*)gxm_load_texture(vita, &image,
+            false, TEXTURE_FILTER_NEAREST);
+   }
 
    vita->vsync        = video->vsync;
    vita->rgb32        = video->rgb32;
@@ -1972,7 +2002,7 @@ static void *gxm_gfx_init(const video_info_t *video,
 
    /* no input driver of this driver's own: the frontend starts the
     * platform's */
-   input_driver_left_to_frontend(INPUT_WINDOW_PLATFORM, input, input_data);
+   input_driver_video_window(INPUT_WINDOW_PLATFORM, NULL);
 
    vita->keep_aspect        = true;
    vita->should_resize      = true;
@@ -1988,14 +2018,18 @@ static void gxm_free_overlay(vita_video_t *vita)
 {
    unsigned i;
 
-   if (gxm_initialized)
-      sceGxmFinish(gxm_context);
+   if (!vita->overlay_borrowed)
+   {
+      if (gxm_initialized)
+         sceGxmFinish(gxm_context);
 
-   for (i = 0; i < vita->overlays; i++)
-      gxm_free_texture(vita->overlay[i].tex);
+      for (i = 0; i < vita->overlays; i++)
+         gxm_free_texture(vita->overlay[i].tex);
+   }
    free(vita->overlay);
-   vita->overlay = NULL;
-   vita->overlays = 0;
+   vita->overlay          = NULL;
+   vita->overlays         = 0;
+   vita->overlay_borrowed = false;
 }
 #endif
 
@@ -2057,13 +2091,42 @@ static void gxm_common_dialog_update(void)
    sceCommonDialogUpdate(&param);
 }
 
+/* The core's frame into the texture it is drawn from, made anew when
+ * its size changes. Only the frame's @dims of each row are copied: a
+ * row of the frame can be longer than the texture's. */
+static void gxm_upload_frame(vita_video_t *vita, const void *frame,
+      unsigned dims, unsigned pitch)
+{
+   if (vita->dims != dims && vita->texture)
+   {
+      if (gxm_initialized)
+         sceGxmFinish(gxm_context);
+      gxm_free_texture(vita->texture);
+      vita->texture = NULL;
+   }
+
+   if (!vita->texture)
+   {
+      vita->dims    = dims;
+      vita->texture = gxm_create_empty_texture_format(VIDEO_SCALE_W(dims),
+            VIDEO_SCALE_H(dims), vita->format);
+      if (!vita->texture)
+         return;
+      gxm_texture_set_filters(vita->texture, vita->tex_filter,
+            vita->tex_filter);
+   }
+
+   gxm_copy_rows(sceGxmTextureGetData(&vita->texture->gxm_tex),
+         gxm_texture_get_stride(vita->texture), frame, pitch,
+         VIDEO_SCALE_W(dims)
+         * ((vita->format == SCE_GXM_TEXTURE_FORMAT_X8U8U8U8_1RGB) ? 4 : 2),
+         VIDEO_SCALE_H(dims));
+}
+
 static bool gxm_frame(void *data, const void *frame,
       unsigned dims, uint64_t frame_count,
       unsigned pitch, const char *msg, video_frame_info_t *video_info)
 {
-   unsigned width = VIDEO_SCALE_W(dims);
-   unsigned height = VIDEO_SCALE_H(dims);
-   void *tex_p;
    gxm_display_data_t displayData;
    vita_video_t *vita                     = (vita_video_t *)data;
    unsigned temp_width                    = PSP_FB_WIDTH;
@@ -2077,60 +2140,9 @@ static bool gxm_frame(void *data, const void *frame,
    bool statistics_show                   = video_info->statistics_show;
    struct font_params *osd_params         = (struct font_params*)&video_info->osd_stat_params;
 
-   if (frame)
-   {
-      if (!(vita->texture && sceGxmTextureGetData(&vita->texture->gxm_tex)==frame))
-      {
-         unsigned i;
-         unsigned int stride;
-
-         if (vita->dims != dims && vita->texture)
-         {
-            if (gxm_initialized)
-               sceGxmFinish(gxm_context);
-            gxm_free_texture(vita->texture);
-            vita->texture = NULL;
-         }
-
-         if (!vita->texture)
-         {
-            vita->dims    = dims;
-            vita->texture = gxm_create_empty_texture_format(width, height,
-                  vita->format);
-            gxm_texture_set_filters(vita->texture, vita->tex_filter,
-                  vita->tex_filter);
-         }
-         tex_p  = sceGxmTextureGetData(&vita->texture->gxm_tex);
-         stride = gxm_texture_get_stride(vita->texture);
-
-         if (vita->format == SCE_GXM_TEXTURE_FORMAT_X8U8U8U8_1RGB)
-         {
-            const uint32_t *frame32;
-            uint32_t *tex32;
-            stride                     /= 4;
-            pitch                      /= 4;
-            tex32 = tex_p;
-            frame32 = frame;
-
-            for (i = 0; i < height; i++)
-               memcpy_neon(&tex32[i*stride], &frame32[i*pitch],
-                     pitch*sizeof(uint32_t));
-         }
-         else
-         {
-            const uint16_t *frame16;
-            uint16_t *tex16;
-            stride                 /= 2;
-            pitch                  /= 2;
-            tex16 = tex_p;
-            frame16 = frame;
-
-            for (i = 0; i < height; i++)
-               memcpy_neon(&tex16[i*stride], &frame16[i*pitch],
-                     width*sizeof(uint16_t));
-         }
-      }
-   }
+   if (frame && !(vita->texture
+            && sceGxmTextureGetData(&vita->texture->gxm_tex) == frame))
+      gxm_upload_frame(vita, frame, dims, pitch);
 
    if (vita->should_resize)
       gxm_update_viewport(vita);
@@ -2363,6 +2375,11 @@ static void gxm_free(void *data)
       vita->texture = NULL;
    }
 
+   if (vita->white_texture)
+   {
+      gxm_free_texture(vita->white_texture);
+      vita->white_texture = NULL;
+   }
 }
 
 static void gxm_set_projection(vita_video_t *vita,
@@ -2456,7 +2473,6 @@ static void gxm_set_texture_frame(void *data,
       const void *frame, bool rgb32,
       unsigned dims, float alpha)
 {
-   unsigned i;
    void *tex_p;
    unsigned int stride;
    vita_video_t *vita = (vita_video_t*)data;
@@ -2496,31 +2512,10 @@ static void gxm_set_texture_frame(void *data,
    tex_p  = sceGxmTextureGetData(&vita->menu.texture->gxm_tex);
    stride = gxm_texture_get_stride(vita->menu.texture);
 
-   /* Copy row-by-row via memcpy rather than pixel-by-pixel.  The
-    * texture stride (destination) can differ from the source pitch
-    * (width * bpp) for alignment reasons, so a single memcpy of the
-    * whole buffer isn't safe when stride != width*bpp, but a per-row
-    * memcpy handles both cases and is materially faster than the
-    * previous nested loop with per-pixel indexing. */
-   if (rgb32)
    {
-      uint32_t       *tex32   = (uint32_t*)tex_p;
-      const uint32_t *frame32 = (const uint32_t*)frame;
-      size_t          rowlen  = (size_t)VIDEO_SCALE_W(dims) * 4;
-
-      stride /= 4;
-      for (i = 0; i < VIDEO_SCALE_H(dims); i++)
-         memcpy(tex32 + i * stride, frame32 + i * VIDEO_SCALE_W(dims), rowlen);
-   }
-   else
-   {
-      uint16_t       *tex16   = (uint16_t*)tex_p;
-      const uint16_t *frame16 = (const uint16_t*)frame;
-      size_t          rowlen  = (size_t)VIDEO_SCALE_W(dims) * 2;
-
-      stride /= 2;
-      for (i = 0; i < VIDEO_SCALE_H(dims); i++)
-         memcpy(tex16 + i * stride, frame16 + i * VIDEO_SCALE_W(dims), rowlen);
+      unsigned row_len = VIDEO_SCALE_W(dims) * (rgb32 ? 4 : 2);
+      gxm_copy_rows(tex_p, stride, frame, row_len, row_len,
+            VIDEO_SCALE_H(dims));
    }
 }
 
@@ -2533,9 +2528,6 @@ static void gxm_set_texture_enable(void *data, bool state, bool full_screen)
 static uintptr_t gxm_load_texture(void *video_data, void *data,
       bool threaded, enum texture_filter_type filter_type)
 {
-   unsigned int stride, pitch, j;
-   uint32_t             *tex32    = NULL;
-   const uint32_t *frame32        = NULL;
    struct texture_image *image    = (struct texture_image*)data;
    gxm_texture_t *texture = gxm_create_empty_texture_format(
          image->width, image->height,
@@ -2550,20 +2542,32 @@ static uintptr_t gxm_load_texture(void *video_data, void *data,
             SCE_GXM_TEXTURE_FILTER_LINEAR,
             SCE_GXM_TEXTURE_FILTER_LINEAR);
 
-   stride                      = gxm_texture_get_stride(texture);
-   stride                     /= 4;
-
-   tex32                       = sceGxmTextureGetData(&texture->gxm_tex);
-   frame32                     = image->pixels;
-   pitch                       = image->width;
-
-   for (j = 0; j < image->height; j++)
-         memcpy_neon(
-               &tex32[j*stride],
-               &frame32[j*pitch],
-               pitch * sizeof(uint32_t));
+   gxm_copy_rows(sceGxmTextureGetData(&texture->gxm_tex),
+         gxm_texture_get_stride(texture), image->pixels, image->width * 4,
+         image->width * 4, image->height);
 
    return (uintptr_t)texture;
+}
+
+/* Written in place like the menu texture: no replacement to load,
+ * and no sceGxmFinish to unload the old one */
+static enum video_texture_update gxm_update_texture(void *video_data,
+      uintptr_t id, const struct texture_image *ti, bool threaded)
+{
+   gxm_texture_t *texture = (gxm_texture_t*)id;
+
+   if (     !texture || !ti || !ti->pixels || ti->pix10 || ti->fp16
+         || sceGxmTextureGetFormat(&texture->gxm_tex)
+            != SCE_GXM_TEXTURE_FORMAT_U8U8U8U8_ARGB
+         || sceGxmTextureGetWidth(&texture->gxm_tex)  != ti->width
+         || sceGxmTextureGetHeight(&texture->gxm_tex) != ti->height)
+      return VIDEO_TEXTURE_UPDATE_REFUSED;
+
+   gxm_copy_rows(sceGxmTextureGetData(&texture->gxm_tex),
+         gxm_texture_get_stride(texture), ti->pixels, ti->width * 4,
+         ti->width * 4, ti->height);
+
+   return VIDEO_TEXTURE_UPDATE_DONE;
 }
 
 static void gxm_unload_texture(void *data,
@@ -2776,7 +2780,20 @@ static const video_poke_interface_t vita_poke_interface = {
    NULL, /* set_hdr_scanlines */
    NULL, /* set_hdr_subpixel_layout */
    gxm_supports_texture_format,
-   gxm_load_texture_compressed
+   gxm_load_texture_compressed,
+   NULL, /* present_last */
+   NULL, /* get_last_present_time */
+   NULL, /* hw_ring_install */
+   NULL, /* hw_ring_fence_new */
+   NULL, /* hw_ring_fence_free */
+   NULL, /* hw_ring_fence_signal */
+   NULL, /* hw_ring_fence_wait */
+   NULL, /* hw_ring_capture */
+   NULL, /* hw_ring_present_slot */
+   NULL, /* hw_ring_context_new */
+   NULL, /* hw_ring_context_free */
+   NULL, /* hw_ring_framebuffer */
+   gxm_update_texture
 };
 
 static void gxm_get_poke_interface(void *data,
@@ -2881,6 +2898,46 @@ static void gxm_overlay_vertex_geom(void *data, unsigned image,
    }
 }
 
+/* A page of the pack's textures: gxm_load_texture's, uploaded once
+ * for every page; no texture of the page's own, so nothing to wait
+ * for on a switch */
+static bool gxm_overlay_load_textures(void *data,
+      const uintptr_t *textures, unsigned num_textures)
+{
+   unsigned i;
+   vita_video_t *vita = (vita_video_t*)data;
+
+   if (!vita)
+      return false;
+
+   gxm_free_overlay(vita);
+   if (!num_textures)
+      return true;
+   if (!(vita->overlay = (struct vita_overlay_data*)calloc(num_textures,
+         sizeof(*vita->overlay))))
+      return false;
+   vita->overlays         = num_textures;
+   vita->overlay_borrowed = true;
+
+   for (i = 0; i < num_textures; i++)
+   {
+      struct vita_overlay_data *o = &vita->overlay[i];
+      gxm_texture_t *tex          = (gxm_texture_t*)textures[i];
+
+      if (!tex)
+         continue;
+      o->tex       = tex;
+      o->dims      = VIDEO_SCALE_PACK(
+            sceGxmTextureGetWidth(&tex->gxm_tex),
+            sceGxmTextureGetHeight(&tex->gxm_tex));
+      gxm_overlay_tex_geom(vita, i, 0, 0, 1, 1); /* Default. Stretch to whole screen. */
+      gxm_overlay_vertex_geom(vita, i, 0, 0, 1, 1);
+      o->alpha_mod = 1.0f;
+   }
+
+   return true;
+}
+
 static void gxm_overlay_enable(void *data, bool state)
 {
    vita_video_t *vita   = (vita_video_t*)data;
@@ -2909,6 +2966,9 @@ static void gxm_render_overlay(void *data)
    vita_video_t *vita = (vita_video_t*)data;
 
    for (i = 0; i < vita->overlays; i++)
+   {
+      if (!vita->overlay[i].tex)
+         continue;
       gxm_draw_texture_tint_part_scale(vita->overlay[i].tex,
             vita->overlay[i].x,
             vita->overlay[i].y,
@@ -2919,12 +2979,13 @@ static void gxm_render_overlay(void *data)
             vita->overlay[i].w,
             vita->overlay[i].h,
             RGBA8(0xFF,0xFF,0xFF,(uint8_t)VIDEO_ALPHA_BYTE(vita->overlay[i].alpha_mod)));
+   }
 }
 
 static const video_overlay_interface_t gxm_overlay_interface = {
    gxm_overlay_enable,
    gxm_overlay_load,
-   NULL, /* load_textures */
+   gxm_overlay_load_textures,
    gxm_overlay_tex_geom,
    gxm_overlay_vertex_geom,
    gxm_overlay_full_screen,

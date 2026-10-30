@@ -197,7 +197,8 @@ static int16_t psp_joypad_axis(unsigned port, uint32_t joyaxis)
 
 static int16_t psp_joypad_state(
       rarch_joypad_info_t *joypad_info,
-      const struct retro_keybind *binds,
+      const uint16_t *joykeys,
+      const uint32_t *joyaxes,
       unsigned port)
 {
    unsigned i;
@@ -209,11 +210,8 @@ static int16_t psp_joypad_state(
 
    for (i = 0; i < RARCH_FIRST_CUSTOM_BIND; i++)
    {
-      /* Auto-binds are per joypad, not per user. */
-      const uint64_t joykey  = (binds[i].joykey != NO_BTN)
-         ? binds[i].joykey  : joypad_info->auto_binds[i].joykey;
-      const uint32_t joyaxis = (binds[i].joyaxis != AXIS_NONE)
-         ? binds[i].joyaxis : joypad_info->auto_binds[i].joyaxis;
+      const uint64_t joykey  = joykeys[i];
+      const uint32_t joyaxis = joyaxes[i];
       if (
                (uint16_t)joykey != NO_BTN 
             && (pad_state[port_idx] & (UINT64_C(1) << (uint16_t)joykey))
@@ -304,10 +302,8 @@ static void psp_joypad_poll(void)
          analog_state[i][1][0] = analog_state[i][1][1] = 
          analog_state[i][2][0] = analog_state[i][2][1] = 0;
 
-#if defined(SN_TARGET_PSP2) || defined(VITA)
       if (ret < 0)
          continue;
-#endif
 #if defined(VITA)
       /* The system keyboard (psp_input.c) is modal and reads the pad
        * itself; the buttons that drive it must not also drive the

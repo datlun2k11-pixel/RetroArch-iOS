@@ -34,6 +34,8 @@ extern "C" {
 #include <compat/strl.h>
 #include <string/stdstring.h>
 #include <retro_atomic.h>
+#include "winraw_mouse_pending.h"
+#include "winraw_mouse_buttons.h"
 
 #ifndef _XBOX
 #include "../../gfx/common/win32_common.h"
@@ -50,83 +52,28 @@ extern "C" {
 
 /* Threading model
  * ---------------
- * (This is how the driver was, and is with RETROARCH_RAWINPUT_POLL=0
- * in the environment. By default the window is the polling thread's
- * and the reports are read in bulk by the poll: see "Read by the
- * poll" further down.)
+ * The keyboard and mouse window is made by the first winraw_poll(), on
+ * the thread that polls, and every poll starts with one bulk read
+ * (GetRawInputBuffer()) of what is waiting for it. That thread's pump
+ * leaves raw input in the queue for the read (winraw_poll_owns_thread());
+ * a report some other pump comes across - a modal loop Windows runs for
+ * a menu or a dragged window - is taken by winraw_callback(), which then
+ * reads the rest in bulk. A report's handler cannot read its own report
+ * in bulk: it has already left the queue with its message.
  *
- * On every Windows video driver that can actually use this input
- * driver, it is built by the video context driver's input_driver
- * callback - gfx_ctx_wgl_input_driver() and the w_vk / d3d_common /
- * gdi equivalents - rather than by the runloop. Under video_threaded
- * the video driver's init() runs on the video thread
- * (video_thread_wrapper.c, CMD_INIT), so winraw_init() and therefore
- * winraw_create_window() run there too.
+ * A bulk read takes every report waiting on the thread, whichever
+ * window it was for. winraw_joypad's, when its window is on this thread
+ * too, are handed to it (winraw_joypad_take_hid()), and the two drivers
+ * make one read between them (winraw_queue_read()).
  *
- * There is a second path. A video driver may leave *input NULL, and
- * video_driver_init_input() then picks the configured driver itself -
- * on the main thread, since video_driver_init_internal() calls it
- * after the video thread has been spun up. A winraw window created
- * that way would not share a thread with the pump and would never see
- * WM_INPUT. The only Windows driver that takes that path is sdl2,
- * which sets *input = NULL at sdl2_gfx.c:470, and that combination is
- * already unusable and warned about for an unrelated reason - see the
- * note at the end of this comment. Worth knowing if another driver
- * ever stops providing one.
+ * Key events are held until the end of the poll and delivered there.
+ * Which modifiers are held is read from the key table; only the lock
+ * keys come from win32_get_keyboard_mods(), which the main window's
+ * thread publishes and which can be a frame behind.
  *
- * That matters because RegisterRawInputDevices() targets wr->window,
- * a HWND_MESSAGE window, and WM_INPUT is delivered to the queue of the
- * thread that created it. The pump,
- * ui_application_win32_process_events(), uses
- * PeekMessage(&msg, 0, 0, 0, PM_REMOVE), which retrieves messages for
- * every window belonging to the calling thread - and it runs on the
- * main thread when video is not threaded (runloop.c) or on the video
- * thread when it is (win32_check_window()). Either way the pump and
- * wr->window are on the same thread, so WM_INPUT is dispatched in both
- * configurations.
- *
- * The split that does exist: winraw_callback() runs on whichever
- * thread owns the window, while winraw_poll() is called from
- * input_driver_poll() in the runloop, always on the main thread. Every
- * field the two share crosses a thread boundary. dlt_x/dlt_y,
- * whl_u/whl_d, pos_pending, abs_pending and abs_pos are
- * retro_atomic_int_t for that reason.
- *
- * x and y are plain LONG because they have exactly one writer:
- * winraw_poll(). The wndproc never reads or writes them. It publishes
- * what it knows - an accumulated delta, a request to sample the system
- * cursor, or an absolute position - and poll derives the position from
- * whichever applies, once per frame. abs_ref_x/abs_ref_y are the
- * wndproc's own copy of the last absolute report, used to turn
- * successive absolute positions into deltas without reading the
- * position it does not own.
- *
- * It used to be two writers both doing read-modify-write, which was a
- * lost-update race that atomics would not have fixed - only made to
- * look synchronised.
- *
- * Note also that whoever drains raw input owns it process-wide: the
- * SDL2 video driver calls RegisterRawInputDevices() and
- * GetRawInputBuffer() internally, which takes the WM_INPUT stream away
- * from this driver entirely. See the warning in gfx/drivers/sdl2_gfx.c.
- *
- * That cuts both ways, and it is the reason GetRawInputBuffer() is not
- * used here. It drains the queue for the whole thread, not for one
- * window, so a drain in winraw_callback() also takes the joystick and
- * gamepad records that winraw_joypad registered against its own
- * HWND_MESSAGE window - created on this same thread by
- * input_driver_init_joypads(), immediately after winraw_init(). This
- * was tried in d087a820cd and reverted in 7858994d45: forwarding the
- * RIM_TYPEHID records back to the joypad driver restored pad input, but
- * keyboard and mouse buttons stayed broken for a reason that was never
- * established, while mouse coordinates kept working. Anyone trying
- * again needs to be the single drain point for the entire process,
- * which means winraw_joypad giving up its own window and its own
- * GetRawInputData() call, and should know the prize is small: measured
- * at 8.32 reports per frame with a 1000 Hz mouse at 120 fps, the drain
- * removes about seven of the roughly seventeen syscalls per frame,
- * since WM_INPUT is still posted per report and PeekMessage() with
- * PM_REMOVE has no user-mode fast path.
+ * Whoever drains raw input owns it process-wide: the SDL2 video driver
+ * takes the stream away from this driver entirely. See the warning in
+ * gfx/drivers/sdl2_gfx.c.
  */
 
 #include "../../configuration.h"
@@ -150,17 +97,17 @@ typedef struct
     * the atomics below and poll derives the position from them once
     * per frame. Two writers doing read-modify-write here was a
     * lost-update race that no amount of atomicity would have fixed. */
-   LONG x, y;
-   /* Absolute-position reference, touched only by the wndproc. Used to
-    * turn successive MOUSE_MOVE_ABSOLUTE reports into deltas. */
-   LONG abs_ref_x, abs_ref_y;
+   uint32_t pos;   /* x, y in the window: VIDEO_POS_PACK */
    /* Produced by the wndproc, drained once per frame by winraw_poll().
     * The snapshot in winraw_input_t::mice is single-threaded; only the
-    * g_mice originals are ever accessed concurrently. */
-   retro_atomic_int_t dlt_x, dlt_y;
-   retro_atomic_int_t whl_u, whl_d;
-   /* Set by the wndproc when this mouse needs its position taken from
-    * the system cursor, drained once per frame by winraw_poll(). */
+    * g_mice originals are ever accessed concurrently.
+    * dlt: the motion since the last poll, x and y as one
+    * VIDEO_POS_PACK word, so a report's two halves are added and taken
+    * together. whl: WRAW_WHL_* bits. */
+   retro_atomic_int_t dlt;
+   retro_atomic_int_t whl;
+   /* Cursor query request; carries no payload. Drained once per frame
+    * by winraw_poll(). */
    retro_atomic_int_t pos_pending;
    /* Set by the wndproc for a MOUSE_MOVE_ABSOLUTE report, with the
     * scaled position alongside as one VIDEO_POS_PACK word, so poll
@@ -168,16 +115,21 @@ typedef struct
     * over the accumulated delta, and yields to pos_pending. */
    retro_atomic_int_t abs_pending;
    retro_atomic_int_t abs_pos;
-   int device;
+   retro_atomic_int_t device;
+   retro_atomic_int_t buttons;
+   /* The poll's frame snapshot; never written by the callback. */
    uint8_t flags;
 } winraw_mouse_t;
+
+/* winraw_mouse_t::whl */
+#define WRAW_WHL_UP   (1 << 0)
+#define WRAW_WHL_DOWN (1 << 1)
 
 struct winraw_pointer_status
 {
    struct winraw_pointer_status *next;
    int pointer_id;
-   int pointer_x;
-   int pointer_y;
+   uint32_t pointer_pos;   /* VIDEO_POS_PACK */
 };
 
 /* Key events held until the end of a poll. A frame's worth is a
@@ -256,6 +208,9 @@ typedef struct
    uint8_t kb_keys[SC_LAST];
    uint8_t flags;
    bool last_focus;
+   /* the window's focus, read once a poll: what the poll and the reads
+    * of its frame go by, so that one frame does not act on two */
+   bool focus;
    bool kb_clear_pending;
    /* "Background Keyboard Input": key reports are taken while the
     * window is not the active one too (as a sink only); kb_taking is
@@ -263,13 +218,6 @@ typedef struct
    bool kb_background;
    bool kb_taking;
 
-   /* Read in bulk by the poll: see "Read by the poll" below. All of
-    * this is unused, and zero, unless that is switched on. */
-   bool poll_drain;
-   /* Registered as a sink: input arrives whether or not the
-    * application is in the foreground, and the main window's focus
-    * decides what is taken. */
-   bool sink;
    bool window_failed;
    DWORD window_tid;   /* the thread that made the window */
    /* the "disable Windows keys" setting the keyboard is registered
@@ -316,16 +264,19 @@ typedef struct
    unsigned long drain_empty;    /* reads that found nothing waiting */
    unsigned long by_message;     /* reports that came as a message */
    unsigned long kev_dropped;
-   /* Taken by the window's thread: how old, at each poll, what that
-    * thread had taken was (see winraw_pump_done()). */
-   uint64_t      stale_sum;      /* microseconds, summed */
-   uint32_t      stale_max;
-   unsigned long stale_polls;
+   /* The menu is up or an overlay is configured: every mouse is placed
+    * by the cursor. Poll publishes it to the window's thread. */
+   retro_atomic_int_t cursor_for_all;
 } winraw_input_t;
 
 /* TODO/FIXME - static globals */
 static winraw_mouse_t *g_mice        = NULL;
-static bool winraw_focus             = false;
+/* Whether the main window has the keyboard focus. Written by the window
+ * procedure - on the video thread when video is threaded - and read by
+ * the poll: an atomic, which a plain bool written on one thread and read
+ * on another is not. */
+static retro_atomic_int_t winraw_focus_flag;
+#define winraw_focus (retro_atomic_load_acquire_int(&winraw_focus_flag) != 0)
 
 /* Sync internal mouse coordinates with the OS cursor position.
  * Used after events such as window mode, size, and focus changes */
@@ -344,10 +295,10 @@ static bool winraw_sync_mouse_to_cursor(winraw_input_t *wr)
 
    ScreenToClient(wnd, &p);
 
-   for (i = 0; i < wr->mouse_cnt; ++i)
    {
-      g_mice[i].x = (LONG)p.x;
-      g_mice[i].y = (LONG)p.y;
+      uint32_t pos = VIDEO_POS_PACK(p.x, p.y);
+      for (i = 0; i < wr->mouse_cnt; ++i)
+         g_mice[i].pos = pos;
    }
 
    return true;
@@ -909,10 +860,14 @@ static bool winraw_init_devices(winraw_mouse_t **mice, unsigned *mouse_cnt)
       if (!GetCursorPos(&crs_pos))
          goto error;
 
-      for (i = 0; i < mouse_cnt_r; ++i)
       {
-         mice_r[i].x = crs_pos.x;
-         mice_r[i].y = crs_pos.y;
+         uint32_t pos = VIDEO_POS_PACK(crs_pos.x, crs_pos.y);
+         for (i = 0; i < mouse_cnt_r; ++i)
+         {
+            mice_r[i].pos = pos;
+            retro_atomic_int_init(&mice_r[i].device, 0);
+            retro_atomic_int_init(&mice_r[i].buttons, 0);
+         }
       }
    }
 
@@ -1279,13 +1234,9 @@ done:
          if (!wr->kb_keys[mcode])
             continue;
          wr->kb_keys[mcode] = 0;
-         if (wr->poll_drain && wr->kev_n < WINRAW_KEV_SIZE)
+         if (wr->kev_n < WINRAW_KEV_SIZE)
             wr->kev[wr->kev_n++] =
                WINRAW_KEV_PACK(mcode, 0, winraw_held_mods(wr));
-         else if (!wr->poll_drain)
-            input_keyboard_event(0,
-                  input_keymaps_translate_keysym_to_rk(mcode),
-                  0, win32_get_keyboard_mods(), RETRO_DEVICE_KEYBOARD);
       }
    }
 
@@ -1349,62 +1300,6 @@ static void winraw_keyboards_refresh(winraw_input_t *wr)
    RARCH_LOG("[WinRaw] Keyboard list made again: %u.\n", wr->kg_cnt);
 }
 
-static int16_t winraw_lightgun_aiming_state(winraw_input_t *wr,
-      winraw_mouse_t *mouse,
-      unsigned port, unsigned id)
-{
-   struct video_viewport vp = {0};
-   int16_t res_x         = 0;
-   int16_t res_y         = 0;
-   int16_t res_screen_x  = 0;
-   int16_t res_screen_y  = 0;
-
-   if ((video_driver_translate_coord_viewport_wrap(
-               &vp, mouse->x, mouse->y,
-               &res_x, &res_y, &res_screen_x, &res_screen_y)))
-   {
-      switch (id)
-      {
-         case RETRO_DEVICE_ID_LIGHTGUN_SCREEN_X:
-            return res_x;
-         case RETRO_DEVICE_ID_LIGHTGUN_SCREEN_Y:
-            return res_y;
-         case RETRO_DEVICE_ID_LIGHTGUN_IS_OFFSCREEN:
-            return input_driver_pointer_is_offscreen(res_x, res_y);
-         default:
-            break;
-      }
-   }
-
-   return 0;
-}
-
-static bool winraw_mouse_button_pressed(
-      winraw_input_t *wr,
-      winraw_mouse_t *mouse,
-      unsigned port, unsigned key)
-{
-   switch (key)
-   {
-      case RETRO_DEVICE_ID_MOUSE_LEFT:
-         return ((mouse->flags & WRAW_MOUSE_FLG_BTN_L) > 0);
-      case RETRO_DEVICE_ID_MOUSE_RIGHT:
-         return ((mouse->flags & WRAW_MOUSE_FLG_BTN_R) > 0);
-      case RETRO_DEVICE_ID_MOUSE_MIDDLE:
-         return ((mouse->flags & WRAW_MOUSE_FLG_BTN_M) > 0);
-      case RETRO_DEVICE_ID_MOUSE_BUTTON_4:
-         return ((mouse->flags & WRAW_MOUSE_FLG_BTN_B4) > 0);
-      case RETRO_DEVICE_ID_MOUSE_BUTTON_5:
-         return ((mouse->flags & WRAW_MOUSE_FLG_BTN_B5) > 0);
-      case RETRO_DEVICE_ID_MOUSE_WHEELUP:
-         return mouse->whl_u;
-      case RETRO_DEVICE_ID_MOUSE_WHEELDOWN:
-         return mouse->whl_d;
-   }
-
-   return false;
-}
-
 static void winraw_init_mouse_xy_mapping(winraw_input_t *wr)
 {
    struct video_viewport viewport;
@@ -1422,11 +1317,9 @@ static void winraw_init_mouse_xy_mapping(winraw_input_t *wr)
    /* Sync to OS cursor position; fall back to center if it fails */
    if (!winraw_sync_mouse_to_cursor(wr))
    {
+      uint32_t pos = VIDEO_POS_PACK(mouse_x, mouse_y);
       for (i = 0; i < wr->mouse_cnt; i++)
-      {
-         g_mice[i].x      = mouse_x;
-         g_mice[i].y      = mouse_y;
-      }
+         g_mice[i].pos = pos;
    }
 
    wr->view_abs_ratio_x   = (double)VIDEO_SCALE_W(viewport.full_dims)  / 65535.0;
@@ -1435,28 +1328,44 @@ static void winraw_init_mouse_xy_mapping(winraw_input_t *wr)
    wr->flags             |= WRAW_INP_FLG_MOUSE_XY_MAPPING_READY;
 }
 
+/* A report's motion added to the total, both halves in one step. An
+ * axis is held to what a core can be given, -32768..32767 a frame. */
+static INLINE void winraw_dlt_add(retro_atomic_int_t *dlt, int dx, int dy)
+{
+   int old, now;
+   do
+   {
+      old = retro_atomic_load_relaxed_int(dlt);
+      now = (int)VIDEO_POS_PACK(VIDEO_POS_X(old) + dx, VIDEO_POS_Y(old) + dy);
+   } while (!retro_atomic_cas_int(dlt, old, now));
+}
+
 static void winraw_update_mouse_state(winraw_input_t *wr,
       winraw_mouse_t *mouse, RAWMOUSE *state)
 {
    bool swap_mouse_buttons = (g_win32_flags & WIN32_CMN_FLAG_SWAP_MOUSE_BTNS) ? true : false;
+   int device = retro_atomic_load_relaxed_int(&mouse->device);
+   unsigned left = swap_mouse_buttons ? WRAW_MOUSE_FLG_BTN_R : WRAW_MOUSE_FLG_BTN_L;
+   unsigned right = swap_mouse_buttons ? WRAW_MOUSE_FLG_BTN_L : WRAW_MOUSE_FLG_BTN_R;
+   unsigned down = 0, up = 0;
 
    if (state->usFlags & MOUSE_MOVE_ABSOLUTE)
    {
       if ((wr->flags & WRAW_INP_FLG_MOUSE_XY_MAPPING_READY) > 0)
       {
-         state->lLastX = (LONG)(wr->view_abs_ratio_x * state->lLastX);
-         state->lLastY = (LONG)(wr->view_abs_ratio_y * state->lLastY);
-         /* abs_ref_* is this thread's own copy of the last absolute
-          * position, so the delta can be derived without reading the
-          * position that winraw_poll() owns. */
-         retro_atomic_fetch_add_int(&mouse->dlt_x,
-               state->lLastX - mouse->abs_ref_x);
-         retro_atomic_fetch_add_int(&mouse->dlt_y,
-               state->lLastY - mouse->abs_ref_y);
-         mouse->abs_ref_x = state->lLastX;
-         mouse->abs_ref_y = state->lLastY;
-         retro_atomic_store_release_int(&mouse->abs_pos,
-               (int)VIDEO_POS_PACK(state->lLastX, state->lLastY));
+         /* abs_pos is written by this thread alone, so the report
+          * before this one is there to take the motion from: the delta
+          * is derived without reading the position winraw_poll() owns. */
+         unsigned last = (unsigned)retro_atomic_load_relaxed_int(
+               &mouse->abs_pos);
+         /* this report's place in the window, scaled and packed once */
+         unsigned now  = VIDEO_POS_PACK(
+               (LONG)(wr->view_abs_ratio_x * state->lLastX),
+               (LONG)(wr->view_abs_ratio_y * state->lLastY));
+         winraw_dlt_add(&mouse->dlt,
+               VIDEO_POS_X(now) - VIDEO_POS_X(last),
+               VIDEO_POS_Y(now) - VIDEO_POS_Y(last));
+         retro_atomic_store_release_int(&mouse->abs_pos, (int)now);
          retro_atomic_store_release_int(&mouse->abs_pending, 1);
       }
       else
@@ -1466,23 +1375,17 @@ static void winraw_update_mouse_state(winraw_input_t *wr,
    {
       /* Menu and pointer require GetCursorPos() for
        * positioning, but using that always will
-       * break multiple mice positions */
-      bool getcursorpos = (mouse->device == RETRO_DEVICE_POINTER) ? true : false;
-#ifdef HAVE_MENU
-      if (menu_driver_alive())
-         getcursorpos = true;
-#endif
-      /* Input overlay with mouse cursor must also use GetCursorPos() */
-      if (!getcursorpos)
-      {
-         if (input_config_overlay_configured())
-            getcursorpos = true;
-      }
+       * break multiple mice positions.
+       * Input overlay with mouse cursor must also use GetCursorPos().
+       * Whether the menu is up or an overlay is configured is asked
+       * once a poll (winraw_poll()), not once a report: a mouse sends
+       * a thousand of these a second, or eight thousand. */
+      bool getcursorpos = (device == RETRO_DEVICE_POINTER)
+         || retro_atomic_load_relaxed_int(&wr->cursor_for_all);
 
       if (getcursorpos)
       {
-         retro_atomic_fetch_add_int(&mouse->dlt_x, state->lLastX);
-         retro_atomic_fetch_add_int(&mouse->dlt_y, state->lLastY);
+         winraw_dlt_add(&mouse->dlt, state->lLastX, state->lLastY);
 
          /* Defer the cursor query to winraw_poll(). GetCursorPos() is an
           * unconditional kernel transition on every Windows version, and
@@ -1490,164 +1393,63 @@ static void winraw_update_mouse_state(winraw_input_t *wr,
           * frame with a 1000 Hz mouse at 60 fps. Only the value in place
           * at the frame snapshot is ever read, so resolving it once per
           * frame gives the same result from a fresher sample. */
-         retro_atomic_store_release_int(&mouse->pos_pending, 1);
+         retro_atomic_store_relaxed_int(&mouse->pos_pending, 1);
       }
       else
       {
          /* This branch moves by delta, so any deferred cursor query or
           * absolute report from earlier in this frame is superseded. */
-         retro_atomic_store_release_int(&mouse->pos_pending, 0);
+         retro_atomic_store_relaxed_int(&mouse->pos_pending, 0);
          retro_atomic_store_release_int(&mouse->abs_pending, 0);
 
          /* Handle different sensitivity for lightguns */
-         if (mouse->device == RETRO_DEVICE_LIGHTGUN)
+         if (device == RETRO_DEVICE_LIGHTGUN)
          {
-            retro_atomic_store_release_int(&mouse->dlt_x, state->lLastX);
-            retro_atomic_store_release_int(&mouse->dlt_y, state->lLastY);
+            retro_atomic_store_release_int(&mouse->dlt,
+                  (int)VIDEO_POS_PACK(state->lLastX, state->lLastY));
          }
          else
          {
-            retro_atomic_fetch_add_int(&mouse->dlt_x, state->lLastX);
-            retro_atomic_fetch_add_int(&mouse->dlt_y, state->lLastY);
+            winraw_dlt_add(&mouse->dlt, state->lLastX, state->lLastY);
          }
       }
    }
 
-   if (swap_mouse_buttons)
-   {
-      if (state->usButtonFlags & RI_MOUSE_LEFT_BUTTON_DOWN)
-         mouse->flags |=  (WRAW_MOUSE_FLG_BTN_R);
-      else if (state->usButtonFlags & RI_MOUSE_LEFT_BUTTON_UP)
-         mouse->flags &= ~(WRAW_MOUSE_FLG_BTN_R);
+   if (state->usButtonFlags & RI_MOUSE_LEFT_BUTTON_DOWN)
+      down |= left;
+   else if (state->usButtonFlags & RI_MOUSE_LEFT_BUTTON_UP)
+      up |= left;
 
-      if (state->usButtonFlags & RI_MOUSE_RIGHT_BUTTON_DOWN)
-         mouse->flags |=  (WRAW_MOUSE_FLG_BTN_L);
-      else if (state->usButtonFlags & RI_MOUSE_RIGHT_BUTTON_UP)
-         mouse->flags &= ~(WRAW_MOUSE_FLG_BTN_L);
-   }
-   else
-   {
-      if (state->usButtonFlags & RI_MOUSE_LEFT_BUTTON_DOWN)
-         mouse->flags |=  (WRAW_MOUSE_FLG_BTN_L);
-      else if (state->usButtonFlags & RI_MOUSE_LEFT_BUTTON_UP)
-         mouse->flags &= ~(WRAW_MOUSE_FLG_BTN_L);
-
-      if (state->usButtonFlags & RI_MOUSE_RIGHT_BUTTON_DOWN)
-         mouse->flags |=  (WRAW_MOUSE_FLG_BTN_R);
-      else if (state->usButtonFlags & RI_MOUSE_RIGHT_BUTTON_UP)
-         mouse->flags &= ~(WRAW_MOUSE_FLG_BTN_R);
-   }
+   if (state->usButtonFlags & RI_MOUSE_RIGHT_BUTTON_DOWN)
+      down |= right;
+   else if (state->usButtonFlags & RI_MOUSE_RIGHT_BUTTON_UP)
+      up |= right;
 
    if (state->usButtonFlags & RI_MOUSE_MIDDLE_BUTTON_DOWN)
-      mouse->flags |=  (WRAW_MOUSE_FLG_BTN_M);
+      down |= WRAW_MOUSE_FLG_BTN_M;
    else if (state->usButtonFlags & RI_MOUSE_MIDDLE_BUTTON_UP)
-      mouse->flags &= ~(WRAW_MOUSE_FLG_BTN_M);
+      up |= WRAW_MOUSE_FLG_BTN_M;
 
    if (state->usButtonFlags & RI_MOUSE_BUTTON_4_DOWN)
-      mouse->flags |=  (WRAW_MOUSE_FLG_BTN_B4);
+      down |= WRAW_MOUSE_FLG_BTN_B4;
    else if (state->usButtonFlags & RI_MOUSE_BUTTON_4_UP)
-      mouse->flags &= ~(WRAW_MOUSE_FLG_BTN_B4);
+      up |= WRAW_MOUSE_FLG_BTN_B4;
 
    if (state->usButtonFlags & RI_MOUSE_BUTTON_5_DOWN)
-      mouse->flags |=  (WRAW_MOUSE_FLG_BTN_B5);
+      down |= WRAW_MOUSE_FLG_BTN_B5;
    else if (state->usButtonFlags & RI_MOUSE_BUTTON_5_UP)
-      mouse->flags &= ~(WRAW_MOUSE_FLG_BTN_B5);
+      up |= WRAW_MOUSE_FLG_BTN_B5;
+
+   winraw_mouse_buttons_update(&mouse->buttons, down, up);
 
    if (state->usButtonFlags & RI_MOUSE_WHEEL)
    {
       if ((SHORT)state->usButtonData > 0)
-         retro_atomic_store_release_int(&mouse->whl_u, 1);
+         retro_atomic_fetch_or_int(&mouse->whl, WRAW_WHL_UP);
       else if ((SHORT)state->usButtonData < 0)
-         retro_atomic_store_release_int(&mouse->whl_d, 1);
+         retro_atomic_fetch_or_int(&mouse->whl, WRAW_WHL_DOWN);
    }
 }
-
-/* Read by the poll
- * ----------------
- * The keyboard and mouse window is made by the first winraw_poll(),
- * on the thread that polls, and the reports waiting for it are read
- * in bulk - one GetRawInputBuffer() for all of them - at the start of
- * every poll. RETROARCH_RAWINPUT_POLL=0 in the environment turns this
- * off and leaves the driver as the threading note at the top has it,
- * should something need telling apart from it.
- *
- * As it was (the threading note at the top), the window is
- * made on whichever thread runs the video driver's init, and each
- * report is a WM_INPUT message taken when that thread pumps: a
- * PeekMessage() and a GetRawInputData() per report, once per video
- * frame, and not at all while that thread waits in a present. Two
- * things follow.
- *
- * Latency. The poll, on the main thread, reads what the last pump
- * left. A key or a mouse report that arrived since is in the queue,
- * not in the state, and the core gets it a frame later. Read by the
- * poll itself, the state is whatever the devices had sent at the
- * moment of the poll - with late polling, the moment the core asks.
- *
- * Cost. Two system calls a report: at 60 fps a 1000 Hz mouse is some
- * 33 a frame and an 8000 Hz one some 270. A bulk read is one call for
- * all of them, and there is no message to dispatch. No thread is
- * added for this and nothing waits or wakes: the reads happen where
- * the frontend already is.
- *
- * What it costs when nothing is happening is the poll's one read a
- * frame, which then finds nothing: knowing what the devices have sent
- * at the moment of the poll means asking at the moment of the poll.
- * That is the only read made unasked.
- *
- * The thread's pump leaves raw input in the queue for that read
- * (winraw_poll_owns_thread()): it asks for the messages below WM_INPUT
- * and the ones above it, which is how Microsoft's own sample of a
- * buffered read keeps its pump off the reports. Before it did, a
- * session with the mouse in use had the pump take 1398 of 4578
- * reports out one message at a time, each with a read of its own and
- * a bulk read behind it, and the calls saved over the old path came
- * to a few per cent. Some other pump can still come across a report
- * as a message - a modal loop Windows runs for a menu or a window
- * being dragged - and then the callback takes that one and reads the
- * rest in bulk (below).
- *
- * And the window is no longer the video driver's thread's, which has
- * to be true before the input driver can stop being restarted with
- * the video driver. (It still is restarted with it: a later step.)
- *
- * What else differs when this is on:
- *
- * - Key events. A report's key is written to the key table when the
- *   report is read. The call to input_keyboard_event() - into the
- *   menu's state and the core's keyboard callback - is held until the
- *   end of the poll, and so is made on the main thread; as it is
- *   otherwise, under threaded video it is made from the video thread.
- *
- * - Modifiers. win32_get_keyboard_mods() is what the main window's
- *   thread last published from its own key messages, which can be a
- *   frame behind a report just read. Which modifier keys are held is
- *   read from the key table instead; only the lock keys' toggles are
- *   taken from the published value.
- *
- * - A bulk read takes every raw input report waiting on the thread,
- *   whichever window it was for. If winraw_joypad's window is on this
- *   thread too (video not threaded), its reports come out here and
- *   are passed to it (winraw_joypad_take_hid()). An attempt at bulk
- *   reads before this one, d087a820cd, read from inside the WM_INPUT
- *   handler and lost keys and buttons; the report a WM_INPUT message
- *   carries has already left the queue by the time its handler runs,
- *   so a bulk read there never sees it, and a key press is usually
- *   the only report waiting. Here a report that arrives as a message
- *   - the pump got to it before a poll did - is read from its message
- *   first, as it always was, and only then is the rest read in bulk.
- *
- * Raw input goes to a window only while its application is in the
- * foreground, and under threaded video this window's thread is not
- * the one with the focus. Windows judges the foreground by process,
- * not by thread: tried on Windows with threaded video, the reports
- * arrive. RETROARCH_RAWINPUT_POLL=2 is kept for a system where they
- * do not: it registers as a sink, so that everything arrives, and
- * the main window's focus (winraw_focus) decides whether it is taken.
- *
- * Measured there, a minute of play with a 1000 Hz mouse in use: 9714
- * reports in 7679 reads, one read an iteration, none taken by the
- * pump. The old path's two calls a report would have been 19428. */
 
 extern void winraw_joypad_take_hid(HANDLE device, const BYTE *data,
       DWORD report_size, DWORD count);
@@ -1720,7 +1522,7 @@ static void winraw_kev_deliver(winraw_input_t *wr)
       return;
 #ifdef HAVE_MENU
    /* keys typed elsewhere are not typed into the menu */
-   if (     !winraw_focus
+   if (     !wr->focus
          && menu_driver_alive())
    {
       wr->kev_n = 0;
@@ -1742,7 +1544,7 @@ static bool winraw_take(winraw_input_t *wr, DWORD type, HANDLE device,
       void *payload)
 {
    unsigned i;
-   unsigned mcode, flags, down, mod;
+   unsigned mcode, flags, down;
 
    switch (type)
    {
@@ -1752,7 +1554,6 @@ static bool winraw_take(winraw_input_t *wr, DWORD type, HANDLE device,
             mcode = kb->MakeCode;
             flags = kb->Flags;
             down  = (flags & RI_KEY_BREAK) ? 0 : 1;
-            mod   = 0;
 
             /* Extended scancodes */
             if (flags & RI_KEY_E0)
@@ -1782,8 +1583,6 @@ static bool winraw_take(winraw_input_t *wr, DWORD type, HANDLE device,
                case 0xE0B6:
                   return false;
             }
-
-            mod = win32_get_keyboard_mods();
 
             /* From a keyboard the list does not have: one plugged in
              * since the list was made. (No handle at all is a key
@@ -1833,8 +1632,7 @@ static bool winraw_take(winraw_input_t *wr, DWORD type, HANDLE device,
                      }
                   }
                }
-               else if (  wr->poll_drain
-                       && device != wr->kb_not_listed
+               else if (  device != wr->kb_not_listed
                        && wr->kb_cnt < WINRAW_KB_RAW_MAX)
                {
                   wr->kb_unknown      = device;
@@ -1843,19 +1641,12 @@ static bool winraw_take(winraw_input_t *wr, DWORD type, HANDLE device,
             }
 
             wr->kb_keys[mcode] = down;
-            if (wr->poll_drain)
-            {
-               /* held until the end of the poll */
-               if (wr->kev_n < WINRAW_KEV_SIZE)
-                  wr->kev[wr->kev_n++] =
-                     WINRAW_KEV_PACK(mcode, down, winraw_held_mods(wr));
-               else
-                  wr->kev_dropped++;
-            }
+            /* held until the end of the poll */
+            if (wr->kev_n < WINRAW_KEV_SIZE)
+               wr->kev[wr->kev_n++] =
+                  WINRAW_KEV_PACK(mcode, down, winraw_held_mods(wr));
             else
-               input_keyboard_event(down,
-                     input_keymaps_translate_keysym_to_rk(mcode),
-                     0, mod, RETRO_DEVICE_KEYBOARD);
+               wr->kev_dropped++;
          }
          break;
       case RIM_TYPEMOUSE:
@@ -1872,7 +1663,6 @@ static bool winraw_take(winraw_input_t *wr, DWORD type, HANDLE device,
           * the list was made. (No handle at all is input something
           * injected, not a device.) */
          if (     i == wr->mouse_cnt
-               && wr->poll_drain
                && device
                && device != wr->mouse_not_listed)
          {
@@ -1932,12 +1722,8 @@ static void winraw_drain(winraw_input_t *wr)
          else if (wr)
          {
             wr->drained++;
-            /* as a sink, background input arrives as well */
-            if (     !wr->sink || winraw_focus
-                  || (   wr->kb_background
-                      && ri->header.dwType == RIM_TYPEKEYBOARD))
-               winraw_take(wr, ri->header.dwType, ri->header.hDevice,
-                     payload);
+            winraw_take(wr, ri->header.dwType, ri->header.hDevice,
+                  payload);
          }
 
          p += (ri->header.dwSize + align - 1) & ~(align - 1);
@@ -1977,50 +1763,6 @@ void winraw_queue_claim_thread(bool claim)
       retro_atomic_fetch_add_int(&winraw_drain_claims, -1);
 }
 
-/* Whether raw input is read by the poll at all: on, unless
- * RETROARCH_RAWINPUT_POLL=0. */
-bool winraw_raw_input_polled(void)
-{
-   const char *env = getenv("RETROARCH_RAWINPUT_POLL");
-   return !(env && env[0] == '0');
-}
-
-/* Taken by the window's thread - the driver as it was, and as it is
- * with RETROARCH_RAWINPUT_POLL=0 - a report gets into the state the
- * poll reads when that thread pumps its messages, which the video
- * thread does once a frame. So what the poll reads is as old as that
- * thread's last pump: whatever a device has sent since waits for the
- * poll after the next one. Read by the poll that wait is not there,
- * which is the point of reading by the poll; this measures it where it
- * still exists, so that there is a number for it and not an argument.
- *
- * The thread that made the window stamps the clock each time its pump
- * has run dry; the poll, in winraw_poll(), takes the stamp's age. The
- * figures are logged when the driver is freed. Nothing here runs when
- * the poll reads. */
-static DWORD              winraw_legacy_tid;
-static retro_atomic_int_t winraw_legacy_pumped;
-static LARGE_INTEGER      winraw_legacy_freq;
-
-/* microseconds, the low 32 bits: for differences */
-static uint32_t winraw_legacy_now(void)
-{
-   LARGE_INTEGER now;
-   QueryPerformanceCounter(&now);
-   return (uint32_t)(
-           (now.QuadPart / winraw_legacy_freq.QuadPart) * 1000000
-         + (now.QuadPart % winraw_legacy_freq.QuadPart) * 1000000
-               / winraw_legacy_freq.QuadPart);
-}
-
-void winraw_pump_done(void)
-{
-   if (     winraw_legacy_tid
-         && GetCurrentThreadId() == winraw_legacy_tid)
-      retro_atomic_store_release_int(&winraw_legacy_pumped,
-            (int)(winraw_legacy_now() | 1));
-}
-
 /* For a thread's pump (ui_application_win32_process_events()): true
  * on the thread whose raw input the poll reads in bulk. The pump then
  * leaves raw input where it is - in the queue, for the poll - instead
@@ -2029,17 +1771,6 @@ bool winraw_poll_owns_thread(void)
 {
    return retro_atomic_load_relaxed_int(&winraw_drain_claims) > 0
       && GetCurrentThreadId() == winraw_drain_tid;
-}
-
-/* Input that came while the application was in the background is not
- * taken - unless the driver registered as a sink, where everything
- * that is not foreground input comes marked that way and the main
- * window's focus decides. */
-static bool winraw_in_background(const winraw_input_t *wr, WPARAM wpar)
-{
-   if (GET_RAWINPUT_CODE_WPARAM(wpar) == RIM_INPUT)
-      return false;
-   return !(wr->sink && winraw_focus);
 }
 
 static LRESULT CALLBACK winraw_callback(
@@ -2059,7 +1790,7 @@ static LRESULT CALLBACK winraw_callback(
       return DefWindowProcA(wnd, msg, wpar, lpar);
 
    if (!(
-          winraw_in_background(wr, wpar)
+          GET_RAWINPUT_CODE_WPARAM(wpar) != RIM_INPUT
        || GetRawInputData((HRAWINPUT)lpar, RID_INPUT,
          data, &size, sizeof(RAWINPUTHEADER)) == (UINT)-1))
    {
@@ -2067,14 +1798,9 @@ static LRESULT CALLBACK winraw_callback(
       wr->by_message++;
       taken = winraw_take(wr, ri->header.dwType, ri->header.hDevice,
             &ri->data);
-      /* The pump came across a report before a poll read it. This one
-       * has left the queue with its message and had to be read on its
-       * own; whatever is waiting behind it is read in bulk now, rather
-       * than dispatched by the pump one message at a time. Nothing is
-       * read here when no report is waiting, so a pump that finds none
-       * costs nothing extra. */
-      if (wr->poll_drain)
-         winraw_drain(wr);
+      /* whatever is waiting behind it is read in bulk now, rather than
+       * dispatched one message at a time */
+      winraw_drain(wr);
       if (!taken)
          return 0;
    }
@@ -2089,13 +1815,12 @@ static LRESULT CALLBACK winraw_callback(
 static bool winraw_poll_window_up(winraw_input_t *wr)
 {
    RAWINPUTDEVICE rid[2];
-   DWORD base = wr->sink ? RIDEV_INPUTSINK : 0;
 
    if (!(wr->window = winraw_create_window(winraw_callback)))
       return false;
    SetWindowLongPtr(wr->window, GWLP_USERDATA, (LONG_PTR)wr);
 
-   rid[0].dwFlags     = base;
+   rid[0].dwFlags     = 0;
    rid[0].hwndTarget  = wr->window;
    rid[0].usUsagePage = 0x01; /* Generic desktop */
    rid[0].usUsage     = 0x06; /* Keyboard */
@@ -2108,7 +1833,7 @@ static bool winraw_poll_window_up(winraw_input_t *wr)
    if (wr->kb_background)
       rid[0].dwFlags |= RIDEV_INPUTSINK;
 
-   rid[1].dwFlags     = base;
+   rid[1].dwFlags     = 0;
    rid[1].hwndTarget  = wr->window;
    rid[1].usUsagePage = 0x01; /* generic desktop */
    rid[1].usUsage     = 0x02; /* mouse */
@@ -2120,8 +1845,7 @@ static bool winraw_poll_window_up(winraw_input_t *wr)
       winraw_drain_wr = wr;
       winraw_queue_claim_thread(true);
       RARCH_LOG("[WinRaw] Keyboard and mouse are read in bulk by the poll"
-            " (thread %lu)%s.\n", (unsigned long)wr->window_tid,
-            wr->sink ? ", registered as a sink" : "");
+            " (thread %lu).\n", (unsigned long)wr->window_tid);
       return true;
    }
 
@@ -2129,15 +1853,6 @@ static bool winraw_poll_window_up(winraw_input_t *wr)
    DestroyWindow(wr->window);
    wr->window = NULL;
    return false;
-}
-
-/* On, unless RETROARCH_RAWINPUT_POLL=0. 2 registers as a sink as
- * well. */
-static bool winraw_poll_wanted(bool *sink)
-{
-   const char *env = getenv("RETROARCH_RAWINPUT_POLL");
-   *sink           = (env && env[0] == '2');
-   return winraw_raw_input_polled();
 }
 
 /* Two things the driver used to pick up only by being started again,
@@ -2211,7 +1926,7 @@ static void winraw_nowinkey_apply(winraw_input_t *wr, bool enable,
       bool background)
 {
    RAWINPUTDEVICE rid;
-   rid.dwFlags     = ((wr->sink || background) ? RIDEV_INPUTSINK : 0)
+   rid.dwFlags     = (background ? RIDEV_INPUTSINK : 0)
                    | (enable   ? RIDEV_NOHOTKEYS : 0);
    rid.hwndTarget  = wr->window;
    rid.usUsagePage = 0x01; /* Generic desktop */
@@ -2225,124 +1940,87 @@ static void winraw_nowinkey_apply(winraw_input_t *wr, bool enable,
 
 static void *winraw_init(const char *joypad_driver)
 {
-   RAWINPUTDEVICE rid;
-   bool input_nowinkey_enable = input_config_get_nowinkey_enable();
    winraw_input_t *wr   = (winraw_input_t *)
       calloc(1, sizeof(winraw_input_t));
 
    if (!wr)
       return NULL;
+   wr->focus = winraw_focus;
 
    input_keymaps_init_keyboard_lut(rarch_key_map_winraw);
 
-   /* Read in bulk by the poll, if asked for: the window is then made
-    * by the first poll, on the thread that polls, not here. */
-   if (winraw_poll_wanted(&wr->sink))
-   {
-      wr->poll_drain = true;
-      if (!winraw_init_devices(&g_mice, &wr->mouse_cnt))
-         goto error;
-      winraw_keyboards_list(wr);
-      if (wr->mouse_cnt)
-      {
-         if (!(wr->mice = (winraw_mouse_t*)
-            malloc(wr->mouse_cnt * sizeof(winraw_mouse_t))))
-            goto error;
-         memcpy(wr->mice, g_mice, wr->mouse_cnt * sizeof(winraw_mouse_t));
-      }
-      return wr;
-   }
-
-   if (!(wr->window = winraw_create_window(winraw_callback)))
-      goto error;
+   /* The window is made by the first poll, on the thread that polls. */
    if (!winraw_init_devices(&g_mice, &wr->mouse_cnt))
       goto error;
    winraw_keyboards_list(wr);
-
    if (wr->mouse_cnt)
    {
       if (!(wr->mice = (winraw_mouse_t*)
          malloc(wr->mouse_cnt * sizeof(winraw_mouse_t))))
          goto error;
-
       memcpy(wr->mice, g_mice, wr->mouse_cnt * sizeof(winraw_mouse_t));
    }
-
-   rid.dwFlags     = (wr->window) ? 0 : RIDEV_REMOVE;
-   rid.hwndTarget  = wr->window;
-   rid.usUsagePage = 0x01; /* Generic desktop */
-   rid.usUsage     = 0x06; /* Keyboard */
-   if (input_nowinkey_enable)
-      rid.dwFlags |= RIDEV_NOHOTKEYS; /* Disable win keys while focused */
-
-   if (!RegisterRawInputDevices(&rid, 1, sizeof(RAWINPUTDEVICE)))
-      goto error;
-
-   rid.dwFlags     = wr->window ? 0 : RIDEV_REMOVE;
-   rid.hwndTarget  = wr->window;
-   rid.usUsagePage = 0x01; /* generic desktop */
-   rid.usUsage     = 0x02; /* mouse */
-
-   if (!RegisterRawInputDevices(&rid, 1, sizeof(RAWINPUTDEVICE)))
-      goto error;
-
-   SetWindowLongPtr(wr->window, GWLP_USERDATA, (LONG_PTR)wr);
-   retro_atomic_store_release_int(&winraw_legacy_pumped, 0);
-   if (QueryPerformanceFrequency(&winraw_legacy_freq)
-         && winraw_legacy_freq.QuadPart > 0)
-      winraw_legacy_tid = GetCurrentThreadId();
-
-#ifndef _XBOX
-   /* wr->window was created on this thread, so WM_INPUT is posted to
-    * this thread's queue and only a pump running here will dispatch it.
-    * The pump belongs to whichever thread owns the main window - the
-    * video thread under video_threaded. See the threading note at the
-    * top of this file: every Windows video driver that supports this
-    * input driver builds it from its own context callback, so the two
-    * match, but the video_driver_init_input() fallback runs on the main
-    * thread after the video thread already exists. Say so rather than
-    * leaving the user with silently dead input. */
-   {
-      DWORD self_tid = GetCurrentThreadId();
-      DWORD wnd_tid  = main_window.hwnd
-         ? GetWindowThreadProcessId(main_window.hwnd, NULL) : 0;
-
-      if (wnd_tid && wnd_tid != self_tid)
-         RARCH_ERR("[WinRaw] Raw input window is on thread %lu but the "
-               "message pump runs on thread %lu - WM_INPUT will not be "
-               "dispatched and keyboard/mouse input will not work.\n",
-               (unsigned long)self_tid, (unsigned long)wnd_tid);
-   }
-#endif
-
    return wr;
 
 error:
-   if (wr && wr->window)
-   {
-      rid.dwFlags     = RIDEV_REMOVE;
-      rid.hwndTarget  = NULL;
-      rid.usUsagePage = 0x01; /* generic desktop */
-      rid.usUsage     = 0x02; /* mouse */
-
-      RegisterRawInputDevices(&rid, 1, sizeof(RAWINPUTDEVICE));
-
-      rid.dwFlags     = RIDEV_REMOVE;
-      rid.hwndTarget  = NULL;
-      rid.usUsagePage = 0x01; /* Generic desktop */
-      rid.usUsage     = 0x06; /* Keyboard */
-      if (input_nowinkey_enable)
-         rid.dwFlags |= RIDEV_NOHOTKEYS; /* Disable win keys while focused */
-
-      RegisterRawInputDevices(&rid, 1, sizeof(RAWINPUTDEVICE));
-      DestroyWindow(wr->window);
-      UnregisterClassA("winraw-input", NULL);
-   }
    free(g_mice);
-   if (wr)
-      free(wr->mice);
+   g_mice = NULL;
+   free(wr->mice);
    free(wr);
    return NULL;
+}
+
+/* Each mouse's frame and the touches, handed to the frontend, which
+ * answers for the mouse, the pointer and the lightgun's aim: a port
+ * reads the mouse at its Mouse Index, a touch in a place is read
+ * before the mouse, and a mouse stands for one touch, its left button.
+ * How a mouse's reports are taken depends on what it is read as, which
+ * the frontend now knows and this asks. */
+static void winraw_publish_pointers(winraw_input_t *wr)
+{
+   input_pointer_frame_t frame[MAX_USERS];
+   uint32_t touch_pos[16];
+   unsigned i;
+   unsigned touches                     = 0;
+   unsigned count                       = wr->mouse_cnt;
+   struct winraw_pointer_status *touch  = wr->pointer_head.next;
+
+   if (count > MAX_USERS)
+      count = MAX_USERS;
+   for (i = 0; i < count; i++)
+   {
+      const winraw_mouse_t *m = &wr->mice[i];
+      unsigned buttons        = 0;
+      unsigned read_as        = input_driver_pointer_read_as(i);
+
+      if (read_as)
+         retro_atomic_store_relaxed_int(&g_mice[i].device, (int)read_as);
+      if (m->flags & WRAW_MOUSE_FLG_BTN_L)
+         buttons |= INPUT_POINTER_LEFT;
+      if (m->flags & WRAW_MOUSE_FLG_BTN_R)
+         buttons |= INPUT_POINTER_RIGHT;
+      if (m->flags & WRAW_MOUSE_FLG_BTN_M)
+         buttons |= INPUT_POINTER_MIDDLE;
+      if (m->flags & WRAW_MOUSE_FLG_BTN_B4)
+         buttons |= INPUT_POINTER_BUTTON_4;
+      if (m->flags & WRAW_MOUSE_FLG_BTN_B5)
+         buttons |= INPUT_POINTER_BUTTON_5;
+      if (m->whl & WRAW_WHL_UP)
+         buttons |= INPUT_POINTER_WHEEL_UP;
+      if (m->whl & WRAW_WHL_DOWN)
+         buttons |= INPUT_POINTER_WHEEL_DOWN;
+      frame[i].pos     = m->pos;
+      frame[i].rel     = (uint32_t)m->dlt;
+      frame[i].buttons = (uint16_t)buttons;
+   }
+   for (; touch && touches < 16; touch = touch->next)
+      touch_pos[touches++] = touch->pointer_pos;
+
+   input_driver_publish_pointers(frame, count,
+         INPUT_POINTERS_BY_MOUSE_INDEX | INPUT_POINTERS_GUN_BUTTONS_BOUND);
+   /* each one listed is there, and down */
+   input_driver_publish_touches(touch_pos, touches,
+         (1u << touches) - 1, (1u << touches) - 1);
 }
 
 static void winraw_poll(void *data)
@@ -2351,41 +2029,42 @@ static void winraw_poll(void *data)
    POINT crs_pos          = {0, 0};
    bool crs_pos_valid     = false;
    winraw_input_t *wr     = (winraw_input_t*)data;
+   bool cursor_for_all;
+
+   wr->focus              = winraw_focus;
+   /* The flag is the window's focus messages, and a video driver
+    * restart can leave it saying unfocused while the window is in
+    * front: the keyboard was then dead until the next Alt-Tab. When it
+    * says unfocused, Windows is asked; only for this poll, so that a
+    * loss the window procedure is about to store is not overwritten. */
+   if (!wr->focus)
+   {
+      HWND wnd            = (HWND)video_driver_window_get();
+      if (wnd && GetForegroundWindow() == wnd)
+         wr->focus        = true;
+   }
+
+   /* asked here for every report read below, and until the next poll */
+   cursor_for_all = input_config_overlay_configured();
+#ifdef HAVE_MENU
+   if (menu_driver_alive())
+      cursor_for_all = true;
+#endif
+   retro_atomic_store_relaxed_int(&wr->cursor_for_all, cursor_for_all);
 
    /* Everything the devices have sent up to now, before any of it is
     * looked at below. */
-   if (wr->poll_drain)
+   if (     !wr->window && !wr->window_failed
+         && !winraw_poll_window_up(wr))
    {
-      if (     !wr->window && !wr->window_failed
-            && !winraw_poll_window_up(wr))
-      {
-         wr->window_failed = true;
-         RARCH_ERR("[WinRaw] Could not make the keyboard and mouse window.\n");
-      }
-      /* winraw_joypad's poll, just before this one, has already made
-       * the read for both when it is the joypad driver */
-      if (wr->window && !winraw_queue_was_read)
-         winraw_drain(wr);
-      winraw_queue_was_read = false;
+      wr->window_failed = true;
+      RARCH_ERR("[WinRaw] Could not make the keyboard and mouse window.\n");
    }
-   else
-   {
-      /* how old what the window's thread has taken is, now that it is
-       * read (winraw_pump_done()) */
-      int at = retro_atomic_load_acquire_int(&winraw_legacy_pumped);
-      if (at)
-      {
-         uint32_t age = winraw_legacy_now() - (uint32_t)at;
-         /* a pause, a dragged window: not a frame's wait */
-         if (age < 250000)
-         {
-            wr->stale_sum += age;
-            if (age > wr->stale_max)
-               wr->stale_max = age;
-            wr->stale_polls++;
-         }
-      }
-   }
+   /* winraw_joypad's poll, just before this one, has already made the
+    * read for both when it is the joypad driver */
+   if (wr->window && !winraw_queue_was_read)
+      winraw_drain(wr);
+   winraw_queue_was_read = false;
 
    /* Fix coordinates after a resolution change. Runs here rather than
     * in the wndproc so that active_rect, view_abs_ratio_* and the
@@ -2410,7 +2089,7 @@ static void winraw_poll(void *data)
       winraw_init_mouse_xy_mapping(wr);
 
    /* Sync coordinates when window regains focus */
-   if (winraw_focus && !wr->last_focus)
+   if (wr->focus && !wr->last_focus)
       winraw_sync_mouse_to_cursor(wr);
 
    /* Release any keys still held at the moment focus is lost.
@@ -2426,7 +2105,7 @@ static void winraw_poll(void *data)
     * missed on exactly the Alt-Tab case that needs it and the
     * keys stay latched until focus returns. */
    {
-      bool taking       = winraw_focus || wr->kb_background;
+      bool taking       = wr->focus || wr->kb_background;
       if (!taking && wr->kb_taking)
          wr->kb_clear_pending = true;
       wr->kb_taking     = taking;
@@ -2448,11 +2127,11 @@ static void winraw_poll(void *data)
       wr->kb_clear_pending = false;
    }
 
-   wr->last_focus = winraw_focus;
+   wr->last_focus = wr->focus;
 
    for (i = 0; i < wr->mouse_cnt; ++i)
    {
-      /* Derive the position. This is the only writer of g_mice[i].x/y.
+      /* Derive the position. This is the only writer of g_mice[i].pos.
        *
        * The three sources are mutually exclusive and the wndproc marks
        * which one applies: a deferred cursor query wins, then an
@@ -2461,15 +2140,17 @@ static void winraw_poll(void *data)
        * reports asked for it or however many mice are attached. */
       LONG dx;
       LONG dy;
+      int dlt;
+      enum winraw_mouse_position_source source;
 
-      /* Clear buttons when not focused */
-      if (!winraw_focus)
-         g_mice[i].flags = 0;
+      /* the frame's motion, both halves in one take */
+      dlt = retro_atomic_exchange_int(&g_mice[i].dlt, 0);
+      dx  = VIDEO_POS_X(dlt);
+      dy  = VIDEO_POS_Y(dlt);
 
-      dx = (LONG)retro_atomic_exchange_int(&g_mice[i].dlt_x, 0);
-      dy = (LONG)retro_atomic_exchange_int(&g_mice[i].dlt_y, 0);
-
-      if (retro_atomic_exchange_int(&g_mice[i].pos_pending, 0))
+      source = winraw_mouse_take_position(&g_mice[i].pos_pending,
+            &g_mice[i].abs_pending);
+      if (source == WINRAW_MOUSE_CURSOR)
       {
          if (!crs_pos_valid)
          {
@@ -2482,22 +2163,18 @@ static void winraw_poll(void *data)
                crs_pos_valid = true;
          }
          if (crs_pos_valid)
-         {
-            g_mice[i].x = crs_pos.x;
-            g_mice[i].y = crs_pos.y;
-         }
+            g_mice[i].pos = VIDEO_POS_PACK(crs_pos.x, crs_pos.y);
       }
-      else if (retro_atomic_exchange_int(&g_mice[i].abs_pending, 0))
+      else if (source == WINRAW_MOUSE_ABSOLUTE)
       {
-         unsigned pos = (unsigned)retro_atomic_load_acquire_int(
+         /* the report's word is the position's */
+         g_mice[i].pos = (uint32_t)retro_atomic_load_acquire_int(
                &g_mice[i].abs_pos);
-         g_mice[i].x  = (LONG)VIDEO_POS_X(pos);
-         g_mice[i].y  = (LONG)VIDEO_POS_Y(pos);
       }
       else if (dx || dy)
       {
-         LONG nx = g_mice[i].x + dx;
-         LONG ny = g_mice[i].y + dy;
+         LONG nx = VIDEO_POS_X(g_mice[i].pos) + dx;
+         LONG ny = VIDEO_POS_Y(g_mice[i].pos) + dy;
          /* Prevent travel outside active window */
          if (nx < wr->active_rect.left)
             nx = wr->active_rect.left;
@@ -2509,18 +2186,17 @@ static void winraw_poll(void *data)
          else if (ny > wr->active_rect.bottom)
             ny = wr->active_rect.bottom;
 
-         g_mice[i].x = nx;
-         g_mice[i].y = ny;
+         g_mice[i].pos = VIDEO_POS_PACK(nx, ny);
       }
 
-      wr->mice[i].x       = g_mice[i].x;
-      wr->mice[i].y       = g_mice[i].y;
-      wr->mice[i].dlt_x   = dx;
-      wr->mice[i].dlt_y   = dy;
-      wr->mice[i].whl_u   = retro_atomic_exchange_int(&g_mice[i].whl_u, 0);
-      wr->mice[i].whl_d   = retro_atomic_exchange_int(&g_mice[i].whl_d, 0);
-      wr->mice[i].flags   = g_mice[i].flags;
+      wr->mice[i].pos     = g_mice[i].pos;
+      wr->mice[i].dlt     = dlt;
+      wr->mice[i].whl     = retro_atomic_exchange_int(&g_mice[i].whl, 0);
+      wr->mice[i].flags   = (uint8_t)winraw_mouse_buttons_snapshot(
+            &g_mice[i].buttons, wr->focus);
    }
+
+   winraw_publish_pointers(wr);
 
    /* devices came or went: the keyboards are listed again */
    if (     retro_atomic_load_relaxed_int(&winraw_devices_changed)
@@ -2533,30 +2209,58 @@ static void winraw_poll(void *data)
       RARCH_LOG("[WinRaw] Keyboard list made again: %u.\n", wr->kg_cnt);
    }
 
-   if (wr->poll_drain)
+   if (wr->mouse_unknown_seen)
+      winraw_mice_refresh(wr);
+   if (wr->kb_unknown_seen)
+      winraw_keyboards_refresh(wr);
+   if (wr->window)
    {
-      if (wr->mouse_unknown_seen)
-         winraw_mice_refresh(wr);
-      if (wr->kb_unknown_seen)
-         winraw_keyboards_refresh(wr);
-      if (wr->window)
-      {
-         bool nowinkey   = input_config_get_nowinkey_enable();
-         bool background = input_config_get_keyboard_background();
-         if (nowinkey != wr->nowinkey || background != wr->kb_background)
-            winraw_nowinkey_apply(wr, nowinkey, background);
-      }
-      winraw_kev_deliver(wr);
+      bool nowinkey   = input_config_get_nowinkey_enable();
+      bool background = input_config_get_keyboard_background();
+      if (nowinkey != wr->nowinkey || background != wr->kb_background)
+         winraw_nowinkey_apply(wr, nowinkey, background);
+   }
+   winraw_kev_deliver(wr);
+}
+
+/* Which of @keys are down for @port: bit n of @down for keys[n]. A
+ * port's controls answer to the one keyboard the port was given, if it
+ * was given one; a hotkey answers to every keyboard. In the background
+ * keys play the game only: they work no hotkey, and nothing while the
+ * menu is up. */
+static void winraw_keys_down(void *data, unsigned port,
+      const uint16_t *keys, const uint8_t *bind, unsigned count,
+      uint32_t *down)
+{
+   unsigned i;
+   winraw_input_t *wr = (winraw_input_t*)data;
+   const uint8_t *own = winraw_port_keys(wr, port);
+   bool keys_ok       = wr->focus;
+   bool meta_ok       = wr->focus;
+
+#ifdef HAVE_MENU
+   if (!keys_ok && wr->kb_background)
+      keys_ok = !menu_driver_alive();
+#else
+   if (wr->kb_background)
+      keys_ok = true;
+#endif
+
+   for (i = 0; i < count; i++)
+   {
+      bool pressed = (bind[i] >= RARCH_FIRST_META_KEY)
+         ? (meta_ok && WINRAW_KEYBOARD_PRESSED(wr, keys[i]))
+         : (keys_ok && WINRAW_PORT_KEY_PRESSED(wr, own, keys[i]));
+      if (pressed)
+         down[i >> 5] |= (1u << (i & 31));
    }
 }
 
 static int16_t winraw_input_state(
       void *data,
       const input_device_driver_t *joypad,
-      const input_device_driver_t *sec_joypad,
       rarch_joypad_info_t *joypad_info,
       const retro_keybind_set *binds,
-      bool keyboard_mapping_blocked,
       unsigned port,
       unsigned device,
       unsigned idx,
@@ -2566,14 +2270,12 @@ static int16_t winraw_input_state(
 
    if (port < MAX_USERS)
    {
-      int16_t ret           = 0;
       winraw_input_t *wr    = (winraw_input_t*)data;
       /* the one keyboard this port was given, if it was given one */
       const uint8_t *own    = winraw_port_keys(wr, port);
       /* In the background, keys play the game only: they work no
        * hotkey, and nothing while the menu is up. */
-      bool keys_ok          = winraw_focus;
-      bool meta_ok          = winraw_focus;
+      bool keys_ok          = wr->focus;
       bool process_mouse    =
          (device == RETRO_DEVICE_JOYPAD)
          || (device == RETRO_DEVICE_MOUSE)
@@ -2592,7 +2294,7 @@ static int16_t winraw_input_state(
             {
                mouse = &wr->mice[i];
                if (mouse && device > RETRO_DEVICE_JOYPAD)
-                  g_mice[i].device = device;
+                  retro_atomic_store_relaxed_int(&g_mice[i].device, (int)device);
                break;
             }
          }
@@ -2608,258 +2310,16 @@ static int16_t winraw_input_state(
 
       switch (device)
       {
-         case RETRO_DEVICE_JOYPAD:
-            if (id == RETRO_DEVICE_ID_JOYPAD_MASK)
-            {
-               unsigned i;
-
-               if (mouse)
-               {
-                  for (i = 0; i < RARCH_FIRST_CUSTOM_BIND; i++)
-                  {
-                     if (RETRO_KEYBIND_VALID(&binds[port][i]))
-                     {
-                        if (winraw_mouse_button_pressed(wr, mouse, port, binds[port][i].mbutton))
-                           ret |= (1 << i);
-                     }
-                  }
-               }
-
-               if (!keyboard_mapping_blocked && keys_ok)
-               {
-                  for (i = 0; i < RARCH_FIRST_CUSTOM_BIND; i++)
-                  {
-                     if (RETRO_KEYBIND_VALID(&binds[port][i]))
-                     {
-                        if (     (RETRO_KEYBIND_KEY(&binds[port][i]) && RETRO_KEYBIND_KEY(&binds[port][i]) < RETROK_LAST)
-                              && WINRAW_PORT_KEY_PRESSED(wr, own, RETRO_KEYBIND_KEY(&binds[port][i])))
-                           ret |= (1 << i);
-                     }
-                  }
-               }
-
-               return ret;
-            }
-
-            if (id < RARCH_BIND_LIST_END)
-            {
-               if (RETRO_KEYBIND_VALID(&binds[port][id]))
-               {
-                  if (     (RETRO_KEYBIND_KEY(&binds[port][id]) && RETRO_KEYBIND_KEY(&binds[port][id]) < RETROK_LAST)
-                        /* a hotkey answers to every keyboard */
-                        && ((id >= RARCH_FIRST_META_KEY)
-                           ? WINRAW_KEYBOARD_PRESSED(wr, RETRO_KEYBIND_KEY(&binds[port][id]))
-                           : WINRAW_PORT_KEY_PRESSED(wr, own, RETRO_KEYBIND_KEY(&binds[port][id])))
-                        && (id == RARCH_GAME_FOCUS_TOGGLE || !keyboard_mapping_blocked)
-                        && ((id >= RARCH_FIRST_META_KEY) ? meta_ok : keys_ok)
-                     )
-                     return 1;
-                  else if (mouse && winraw_mouse_button_pressed(wr, mouse, port, binds[port][id].mbutton))
-                     return 1;
-               }
-            }
-            break;
-         case RETRO_DEVICE_ANALOG:
-            {
-               int id_minus_key      = 0;
-               int id_plus_key       = 0;
-               unsigned id_minus     = 0;
-               unsigned id_plus      = 0;
-               bool id_plus_valid    = false;
-               bool id_minus_valid   = false;
-
-               input_conv_analog_id_to_bind_id(idx, id, id_minus, id_plus);
-
-               id_minus_valid        = RETRO_KEYBIND_VALID(&binds[port][id_minus]);
-               id_plus_valid         = RETRO_KEYBIND_VALID(&binds[port][id_plus]);
-               id_minus_key          = RETRO_KEYBIND_KEY(&binds[port][id_minus]);
-               id_plus_key           = RETRO_KEYBIND_KEY(&binds[port][id_plus]);
-
-               if (keys_ok && id_plus_valid && id_plus_key && id_plus_key < RETROK_LAST)
-               {
-                  if (WINRAW_PORT_KEY_PRESSED(wr, own, id_plus_key))
-                     ret = 0x7fff;
-               }
-               if (keys_ok && id_minus_valid && id_minus_key && id_minus_key < RETROK_LAST)
-               {
-                  if (WINRAW_PORT_KEY_PRESSED(wr, own, id_minus_key))
-                     ret += -0x7fff;
-               }
-            }
-            return ret;
+         /* The RetroPad's buttons and the hotkeys, where they are bound
+          * to keys or mouse buttons, are the frontend's to answer: it
+          * asks winraw_keys_down() for the keys once a poll. */
+         /* ... and a stick's axes, where they are bound to keys. */
          case RETRO_DEVICE_KEYBOARD:
             return keys_ok && (id && id < RETROK_LAST) && WINRAW_PORT_KEY_PRESSED(wr, own, id);
-         case RETRO_DEVICE_MOUSE:
-         case RARCH_DEVICE_MOUSE_SCREEN:
-            if (mouse)
-            {
-               bool abs = (device == RARCH_DEVICE_MOUSE_SCREEN);
-               switch (id)
-               {
-                  case RETRO_DEVICE_ID_MOUSE_X:
-                     return abs ? mouse->x : mouse->dlt_x;
-                  case RETRO_DEVICE_ID_MOUSE_Y:
-                     return abs ? mouse->y : mouse->dlt_y;
-                  case RETRO_DEVICE_ID_MOUSE_LEFT:
-                     if ((mouse->flags & WRAW_MOUSE_FLG_BTN_L) > 0)
-                        return 1;
-                     break;
-                  case RETRO_DEVICE_ID_MOUSE_RIGHT:
-                     if ((mouse->flags & WRAW_MOUSE_FLG_BTN_R) > 0)
-                        return 1;
-                     break;
-                  case RETRO_DEVICE_ID_MOUSE_WHEELUP:
-                     if (mouse->whl_u)
-                        return 1;
-                     break;
-                  case RETRO_DEVICE_ID_MOUSE_WHEELDOWN:
-                     if (mouse->whl_d)
-                        return 1;
-                     break;
-                  case RETRO_DEVICE_ID_MOUSE_MIDDLE:
-                     if ((mouse->flags & WRAW_MOUSE_FLG_BTN_M) > 0)
-                        return 1;
-                     break;
-                  case RETRO_DEVICE_ID_MOUSE_BUTTON_4:
-                     if ((mouse->flags & WRAW_MOUSE_FLG_BTN_B4) > 0)
-                        return 1;
-                     break;
-                  case RETRO_DEVICE_ID_MOUSE_BUTTON_5:
-                     if ((mouse->flags & WRAW_MOUSE_FLG_BTN_B5) > 0)
-                        return 1;
-                     break;
-               }
-            }
-            break;
-         case RETRO_DEVICE_POINTER:
-         case RARCH_DEVICE_POINTER_SCREEN:
-            {
-               struct video_viewport vp    = {0};
-               bool pointer_down           = false;
-               int x                       = 0;
-               int y                       = 0;
-               int16_t res_x               = 0;
-               int16_t res_y               = 0;
-               int16_t res_screen_x        = 0;
-               int16_t res_screen_y        = 0;
-               unsigned num                = 0;
-               struct winraw_pointer_status *
-                  check_pos                = wr->pointer_head.next;
-
-               while (check_pos && num < idx)
-               {
-                  num++;
-                  check_pos    = check_pos->next;
-               }
-               if (!check_pos && idx > 0) /* idx = 0 has mouse fallback. */
-                  return 0;
-
-               if (mouse)
-               {
-                  x            = mouse->x;
-                  y            = mouse->y;
-                  pointer_down = (mouse->flags & (WRAW_MOUSE_FLG_BTN_L)) > 0;
-               }
-
-               if (check_pos)
-               {
-                  x            = check_pos->pointer_x;
-                  y            = check_pos->pointer_y;
-                  pointer_down = true;
-               }
-
-               if (!(video_driver_translate_coord_viewport_confined_wrap(&vp, x, y,
-                           &res_x, &res_y, &res_screen_x, &res_screen_y)))
-                  return 0;
-
-               if (device == RARCH_DEVICE_POINTER_SCREEN)
-               {
-                  res_x        = res_screen_x;
-                  res_y        = res_screen_y;
-               }
-
-               switch (id)
-               {
-                  case RETRO_DEVICE_ID_POINTER_X:
-                     return res_x;
-                  case RETRO_DEVICE_ID_POINTER_Y:
-                     return res_y;
-                  case RETRO_DEVICE_ID_POINTER_PRESSED:
-                     return pointer_down;
-                  case RETRO_DEVICE_ID_POINTER_IS_OFFSCREEN:
-                     return input_driver_pointer_is_offscreen(res_x, res_y);
-                  default:
-                     break;
-               }
-            }
-            break;
-         case RETRO_DEVICE_LIGHTGUN:
-            switch (id)
-            {
-               case RETRO_DEVICE_ID_LIGHTGUN_SCREEN_X:
-               case RETRO_DEVICE_ID_LIGHTGUN_SCREEN_Y:
-               case RETRO_DEVICE_ID_LIGHTGUN_IS_OFFSCREEN:
-                  if (mouse)
-                     return winraw_lightgun_aiming_state(wr, mouse, port, id);
-                  break;
-               case RETRO_DEVICE_ID_LIGHTGUN_TRIGGER:
-               case RETRO_DEVICE_ID_LIGHTGUN_RELOAD:
-               case RETRO_DEVICE_ID_LIGHTGUN_AUX_A:
-               case RETRO_DEVICE_ID_LIGHTGUN_AUX_B:
-               case RETRO_DEVICE_ID_LIGHTGUN_AUX_C:
-               case RETRO_DEVICE_ID_LIGHTGUN_START:
-               case RETRO_DEVICE_ID_LIGHTGUN_SELECT:
-               case RETRO_DEVICE_ID_LIGHTGUN_DPAD_UP:
-               case RETRO_DEVICE_ID_LIGHTGUN_DPAD_DOWN:
-               case RETRO_DEVICE_ID_LIGHTGUN_DPAD_LEFT:
-               case RETRO_DEVICE_ID_LIGHTGUN_DPAD_RIGHT:
-               case RETRO_DEVICE_ID_LIGHTGUN_PAUSE: /* deprecated */
-                  {
-                     unsigned new_id                = input_driver_lightgun_id_convert(id);
-                     const uint64_t bind_joykey     = input_config_binds[port][new_id].joykey;
-                     const uint64_t bind_joyaxis    = input_config_binds[port][new_id].joyaxis;
-                     const uint64_t autobind_joykey = input_autoconf_binds[port][new_id].joykey;
-                     const uint64_t autobind_joyaxis= input_autoconf_binds[port][new_id].joyaxis;
-                     uint16_t joyport               = joypad_info->joy_idx;
-                     float axis_threshold           = joypad_info->axis_threshold;
-                     const uint64_t joykey          = (bind_joykey != NO_BTN)
-                        ? bind_joykey  : autobind_joykey;
-                     const uint32_t joyaxis         = (bind_joyaxis != AXIS_NONE)
-                        ? bind_joyaxis : autobind_joyaxis;
-
-                     if (RETRO_KEYBIND_VALID(&binds[port][new_id]))
-                     {
-                        if ((uint16_t)joykey != NO_BTN && joypad->button(
-                                 joyport, (uint16_t)joykey))
-                           return 1;
-                        if (joyaxis != AXIS_NONE &&
-                              ((float)abs(joypad->axis(joyport, joyaxis))
-                               / 0x8000) > axis_threshold)
-                           return 1;
-                        else if ((RETRO_KEYBIND_KEY(&binds[port][new_id]) && RETRO_KEYBIND_KEY(&binds[port][new_id]) < RETROK_LAST)
-                              && !keyboard_mapping_blocked
-                              && WINRAW_PORT_KEY_PRESSED(wr, own, RETRO_KEYBIND_KEY(&binds[port][new_id]))
-                           )
-                           return 1;
-                        else if (mouse)
-                        {
-                           if (winraw_mouse_button_pressed(wr, mouse, port, binds[port][new_id].mbutton))
-                              return 1;
-                        }
-                     }
-                  }
-                  break;
-                  /*deprecated*/
-               case RETRO_DEVICE_ID_LIGHTGUN_X:
-                  if (mouse)
-                     return mouse->dlt_x;
-                  break;
-               case RETRO_DEVICE_ID_LIGHTGUN_Y:
-                  if (mouse)
-                     return mouse->dlt_y;
-                  break;
-            }
-            break;
+         /* The mouse, the pointer and the lightgun's aim are the
+          * frontend's to answer: winraw_poll() publishes each mouse
+          * and the touches. */
+         /* ... and the lightgun's buttons, from what they are bound to. */
       }
    }
 
@@ -2873,10 +2333,10 @@ bool winraw_handle_message(UINT msg,
    switch (msg)
    {
       case WM_SETFOCUS:
-         winraw_focus = true;
+         retro_atomic_store_release_int(&winraw_focus_flag, 1);
          break;
       case WM_KILLFOCUS:
-         winraw_focus = false;
+         retro_atomic_store_release_int(&winraw_focus_flag, 0);
          break;
 
       case WM_DEVICECHANGE:
@@ -2917,82 +2377,42 @@ bool winraw_handle_message(UINT msg,
 
 static void winraw_free(void *data)
 {
-   RAWINPUTDEVICE rid;
-   winraw_input_t *wr         = (winraw_input_t*)data;
-   bool input_nowinkey_enable = input_config_get_nowinkey_enable();
+   winraw_input_t *wr = (winraw_input_t*)data;
 
-   if (wr->poll_drain)
-   {
-      if (wr->window)
-      {
-         rid.dwFlags     = RIDEV_REMOVE;
-         rid.hwndTarget  = NULL;
-         rid.usUsagePage = 0x01; /* generic desktop */
-         rid.usUsage     = 0x02; /* mouse */
-         RegisterRawInputDevices(&rid, 1, sizeof(RAWINPUTDEVICE));
-         rid.usUsage     = 0x06; /* Keyboard */
-         RegisterRawInputDevices(&rid, 1, sizeof(RAWINPUTDEVICE));
-
-         SetWindowLongPtr(wr->window, GWLP_USERDATA, 0);
-         /* A window is destroyed by the thread that made it. That is
-          * the polling thread, which is also the one that frees the
-          * driver; if it ever is not, the window is asked to close
-          * and goes when its own thread next pumps. */
-         if (GetCurrentThreadId() == wr->window_tid)
-         {
-            DestroyWindow(wr->window);
-            UnregisterClassA("winraw-input", NULL);
-         }
-         else
-            PostMessageA(wr->window, WM_CLOSE, 0, 0);
-         winraw_queue_claim_thread(false);
-      }
-      if (winraw_drain_wr == wr)
-         winraw_drain_wr = NULL;
-      RARCH_DBG("[WinRaw] Read by the poll: %lu keyboard and mouse reports"
-            " and %lu of controllers in %lu bulk reads, %lu as messages;"
-            " %lu reads found nothing waiting (%lu key events dropped).\n",
-            wr->drained, wr->drained_hid, wr->drain_reads, wr->by_message,
-            wr->drain_empty, wr->kev_dropped);
-      free(g_mice);
-      free(wr->mice);
-      free(data);
-      return;
-   }
-
-   rid.dwFlags          = RIDEV_REMOVE;
-   rid.hwndTarget       = NULL;
-   rid.usUsagePage      = 0x01; /* generic desktop */
-   rid.usUsage          = 0x02; /* mouse */
-
-   RegisterRawInputDevices(&rid, 1, sizeof(RAWINPUTDEVICE));
-
-   rid.dwFlags          = RIDEV_REMOVE;
-   rid.hwndTarget       = NULL;
-   rid.usUsagePage      = 0x01; /* Generic desktop */
-   rid.usUsage          = 0x06; /* Keyboard */
-   if (input_nowinkey_enable)
-      rid.dwFlags      |= RIDEV_NOHOTKEYS; /* Disable win keys while focused */
-
-   RegisterRawInputDevices(&rid, 1, sizeof(RAWINPUTDEVICE));
-
-   SetWindowLongPtr(wr->window, GWLP_USERDATA, 0);
    if (wr->window)
    {
-      DestroyWindow(wr->window);
-      UnregisterClassA("winraw-input", NULL);
+      RAWINPUTDEVICE rid;
+      rid.dwFlags     = RIDEV_REMOVE;
+      rid.hwndTarget  = NULL;
+      rid.usUsagePage = 0x01; /* generic desktop */
+      rid.usUsage     = 0x02; /* mouse */
+      RegisterRawInputDevices(&rid, 1, sizeof(RAWINPUTDEVICE));
+      rid.usUsage     = 0x06; /* Keyboard */
+      RegisterRawInputDevices(&rid, 1, sizeof(RAWINPUTDEVICE));
+
+      SetWindowLongPtr(wr->window, GWLP_USERDATA, 0);
+      /* A window is destroyed by the thread that made it. That is the
+       * polling thread, which is also the one that frees the driver; if
+       * it ever is not, the window is asked to close and goes when its
+       * own thread next pumps. */
+      if (GetCurrentThreadId() == wr->window_tid)
+      {
+         DestroyWindow(wr->window);
+         UnregisterClassA("winraw-input", NULL);
+      }
+      else
+         PostMessageA(wr->window, WM_CLOSE, 0, 0);
+      winraw_queue_claim_thread(false);
    }
-   winraw_legacy_tid = 0;
-   if (wr->stale_polls)
-      RARCH_DBG("[WinRaw] Taken by the window's thread: at the poll,"
-            " what that thread had taken was %.2f ms old on average and"
-            " %.2f ms at the most, over %lu polls. Read by the poll,"
-            " which is the default, that wait is not there.\n",
-            (double)wr->stale_sum / (double)wr->stale_polls / 1000.0,
-            (double)wr->stale_max / 1000.0, wr->stale_polls);
+   if (winraw_drain_wr == wr)
+      winraw_drain_wr = NULL;
+   RARCH_DBG("[WinRaw] Read by the poll: %lu keyboard and mouse reports"
+         " and %lu of controllers in %lu bulk reads, %lu as messages;"
+         " %lu reads found nothing waiting (%lu key events dropped).\n",
+         wr->drained, wr->drained_hid, wr->drain_reads, wr->by_message,
+         wr->drain_empty, wr->kev_dropped);
    free(g_mice);
    free(wr->mice);
-
    free(data);
 }
 
@@ -3015,9 +2435,9 @@ static void winraw_grab_mouse(void *d, bool state)
    if (curr_state == state)
       return;
 
-   /* read by the poll, and its first poll has not made the window
-    * yet: there is nothing to register again */
-   if (wr->poll_drain && !wr->window)
+   /* the first poll has not made the window yet: there is nothing to
+    * register again */
+   if (!wr->window)
    {
       if (state)
          wr->flags |=  WRAW_INP_FLG_MOUSE_GRAB;
@@ -3029,8 +2449,7 @@ static void winraw_grab_mouse(void *d, bool state)
       return;
    }
 
-   rid.dwFlags        = (wr->window)
-      ? (wr->sink ? RIDEV_INPUTSINK : 0) : RIDEV_REMOVE;
+   rid.dwFlags        = 0;
    rid.hwndTarget     = wr->window;
    rid.usUsagePage    = 0x01; /* generic desktop */
    rid.usUsage        = 0x02; /* mouse */
@@ -3047,23 +2466,13 @@ static void winraw_grab_mouse(void *d, bool state)
    }
 }
 
-/* Left running across a video driver restart
- * (input_driver_t::survives_video) when it is read by the poll. Its
- * window is then the polling thread's, not the video driver's
- * thread's; it looks the main window up afresh at every poll; and the
- * two things it used to pick up only by being restarted - a mouse
- * plugged in, the Windows-key setting - it does itself
- * (winraw_mice_refresh(), winraw_nowinkey_apply()). The joypad driver
- * is kept with it, so it has to be one that can stay too: winraw_joypad
- * read by the poll. With any other joypad driver, or with
- * RETROARCH_RAWINPUT_POLL=0, the driver is restarted with the video
- * driver as it always was. */
-extern bool winraw_joypad_survives_video(void);
-
+/* Left running across a video driver restart: its window is the
+ * polling thread's, it looks the main window up afresh at every poll,
+ * and it picks up a mouse plugged in and the Windows-key setting itself
+ * (winraw_mice_refresh(), winraw_nowinkey_apply()). */
 static bool winraw_survives_video(void *data)
 {
-   winraw_input_t *wr = (winraw_input_t*)data;
-   return wr && wr->poll_drain && winraw_joypad_survives_video();
+   return data != NULL;
 }
 
 input_driver_t input_winraw = {
@@ -3078,5 +2487,6 @@ input_driver_t input_winraw = {
    winraw_grab_mouse,
    NULL,
    NULL,
-   winraw_survives_video
+   winraw_survives_video,
+   winraw_keys_down
 };

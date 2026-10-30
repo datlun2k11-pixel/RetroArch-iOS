@@ -68,7 +68,12 @@ void RARCH_ERR(const char *fmt, ...)  { (void)fmt; }
 bool verbosity_is_enabled(void)       { return false; }
 settings_t *config_get_ptr(void)      { return NULL; }
 char *dir_get_ptr(enum rarch_dir_type type) { (void)type; return NULL; }
-bool content_savefile_is_live(const char *path) { (void)path; return false; }
+/* The file a running core owns, if any. */
+static char live_path[256];
+bool content_savefile_is_live(const char *path)
+{
+   return *live_path && path && !strcmp(path, live_path);
+}
 void task_window_progress_cb(retro_task_t *task) { (void)task; }
 size_t fill_pathname_application_special(char *s, size_t len,
       enum application_special_type type)
@@ -76,10 +81,18 @@ size_t fill_pathname_application_special(char *s, size_t len,
 void cloud_sync_find_driver(const char *drv, const char *prefix,
       bool verbosity_enabled)
 { (void)drv; (void)prefix; (void)verbosity_enabled; }
+void cloud_sync_capture(void) { }
 bool cloud_sync_begin(cloud_sync_complete_handler_t cb, void *user_data)
 { (void)cb; (void)user_data; return false; }
+/* Nonzero: the driver ends the sync, and reports it at once. */
+static int end_ok;
 bool cloud_sync_end(cloud_sync_complete_handler_t cb, void *user_data)
-{ (void)cb; (void)user_data; return false; }
+{
+   if (!end_ok)
+      return false;
+   cb(user_data, NULL, true, NULL);
+   return true;
+}
 /* A fetch writes @fetch_size bytes to the local file and reports it from
  * another thread, as a WebDAV or S3 transfer reports from the main
  * thread while the task runs on the queue's worker. Unset, a fetch is
@@ -97,11 +110,22 @@ typedef struct
 
 static void write_file(const char *path, size_t size, unsigned seed);
 
+/* Nonzero: a fetch writes half its bytes and then reports failure, as
+ * a transfer cut off part-way. */
+static int fetch_fail;
+
 static void fetch_thread(void *data)
 {
    fetch_job_t job = *(fetch_job_t*)data;
    RFILE      *f;
    free(data);
+   if (fetch_fail)
+   {
+      write_file(job.file, fetch_size / 2, 9);
+      job.cb(job.ud, job.key, false, NULL);
+      retro_atomic_inc_int(&fetches_reported);
+      return;
+   }
    write_file(job.file, fetch_size, 9);
    f = filestream_open(job.file, RETRO_VFS_FILE_ACCESS_READ,
          RETRO_VFS_FILE_ACCESS_HINT_NONE);
@@ -137,7 +161,7 @@ bool cloud_sync_update(const char *path, RFILE *file,
 bool cloud_sync_free(const char *path, cloud_sync_complete_handler_t cb,
       void *user_data)
 { (void)path; (void)cb; (void)user_data; transfers++; return false; }
-void cloud_sync_poll(void) { }
+void cloud_sync_poll(cloud_sync_poll_budget_t within, void *budget) { (void)within; (void)budget; }
 
 /* --- the I/O window: @grant units per run on top of the floor ------- */
 
@@ -325,11 +349,14 @@ static void fetch_lane(void)
    task_cloud_sync_task_setup(task, st, "Cloud Sync in progress");
    grant = 3; runs = 0; max_granted = 0; transfers = 0;
    /* start the fetch and wait for its report */
-   for (i = 0; i < 5000 && !retro_atomic_load_acquire_int(&fetches_reported); i++)
-   {
+   for (i = 0; i < 5000 && !task_cloud_sync_waiting_get(st)
+         && !retro_atomic_load_acquire_int(&fetches_reported); i++)
       task_cloud_sync_task_handler(task);
+   /* Leave completed downloads queued until the fixture is ready. */
+   for (i = 0; i < 5000 && !retro_atomic_load_acquire_int(&fetches_reported); i++)
       retro_sleep(1);
-   }
+   check("fetch: callback returned before processing",
+         retro_atomic_load_acquire_int(&fetches_reported) != 0);
    /* the callback has returned: the file is not hashed yet, and one run
     * of the handler hashes only what its grant allows */
    task_cloud_sync_task_handler(task);
@@ -354,10 +381,100 @@ static void fetch_lane(void)
    check("download: its hash in both updated manifests", ok_server && ok_local);
    check("download: matches the server, no manifest upload needed",
          !st->need_manifest_uploaded);
+   {
+      char  tmp[160];
+      char *got = hash_of(path);
+      snprintf(tmp, sizeof(tmp), "%s.rafetching", path);
+      check("download: lands under its own name, nothing left beside it",
+            got && !strcmp(got, want) && access(tmp, F_OK) != 0);
+      free(got);
+   }
 
    fetch_size = 0;
    free(want);
    unlink(path);
+   task_cloud_sync_cleanup(task);
+   free(task->title);
+   free(task);
+}
+
+/* A local save the server has a newer copy of; the fetch is under way
+ * when @what happens. The local file must come through as it was. */
+static void fetch_keep_lane(int live, const char *what_keep, const char *what_rest)
+{
+   task_cloud_sync_state_t *st   = (task_cloud_sync_state_t*)calloc(1, sizeof(*st));
+   retro_task_t            *task = task_init();
+   struct string_list      *dl   = string_list_new();
+   union string_list_elem_attr attr;
+   char     path[128], tmp[160];
+   char    *old, *srv, *got;
+   unsigned i;
+   int      carried = 0;
+
+   attr.i = 0;
+   string_list_append(dl, "saves", attr);
+   dl->elems[0].userdata = strdup(dir);
+   st->dirlist                 = dl;
+   st->server_manifest         = (file_list_t*)calloc(1, sizeof(file_list_t));
+   st->local_manifest          = (file_list_t*)calloc(1, sizeof(file_list_t));
+   st->current_manifest        = (file_list_t*)calloc(1, sizeof(file_list_t));
+   st->updated_server_manifest = (file_list_t*)calloc(1, sizeof(file_list_t));
+   st->updated_local_manifest  = (file_list_t*)calloc(1, sizeof(file_list_t));
+   st->destructive             = true;
+   strlcpy(st->dir_core_assets, dir, sizeof(st->dir_core_assets));
+   retro_atomic_int_init(&st->waiting, 0);
+   retro_atomic_int_init(&st->phase, (int)CLOUD_SYNC_PHASE_DIFF);
+   retro_atomic_int_init(&fetches_reported, 0);
+
+   /* the server's copy, hashed, then the local one in its place */
+   snprintf(path, sizeof(path), "%s/keep.srm", dir);
+   snprintf(tmp,  sizeof(tmp),  "%s.rafetching", path);
+   fetch_size = 64 * 1024;
+   write_file(path, fetch_size, 9);
+   srv = hash_of(path);
+   write_file(path, 4096, 4);
+   old = hash_of(path);
+   list_add(st->server_manifest, "saves/keep.srm", NULL, strdup(srv));
+   fetch_fail = !live;
+
+   task_cloud_sync_task_setup(task, st, "Cloud Sync in progress");
+   grant = 100;
+   for (i = 0; i < 5000 && !task_cloud_sync_waiting_get(st)
+         && !retro_atomic_load_acquire_int(&fetches_reported); i++)
+      task_cloud_sync_task_handler(task);
+   /* Leave completed downloads queued until the fixture is ready. */
+   for (i = 0; i < 5000 && !retro_atomic_load_acquire_int(&fetches_reported); i++)
+      retro_sleep(1);
+   check("fetch: callback returned before processing",
+         retro_atomic_load_acquire_int(&fetches_reported) != 0);
+   /* the download is in, not yet in place: a core takes the file now */
+   if (live)
+   {
+      strlcpy(live_path, path, sizeof(live_path));
+      pathname_conform_slashes_to_os(live_path);
+   }
+   for (i = 0; i < 200000 && (task_cloud_sync_phase_get(st) == CLOUD_SYNC_PHASE_DIFF
+            || task_cloud_sync_waiting_get(st) > 0); i++)
+      task_cloud_sync_task_handler(task);
+
+   got = hash_of(path);
+   check(what_keep, got && !strcmp(got, old) && access(tmp, F_OK) != 0);
+   task_cloud_sync_fold_manifest_adds(st);
+   for (i = 0; i < st->updated_server_manifest->size; i++)
+      if (!strcmp(st->updated_server_manifest->list[i].alt, "saves/keep.srm"))
+         carried = st->updated_server_manifest->list[i].userdata
+            && !strcmp((const char*)st->updated_server_manifest->list[i].userdata, srv);
+   check(what_rest, st->downloads == 0 && carried
+         && (live ? !st->failures : st->failures));
+
+   *live_path = '\0';
+   fetch_fail = 0;
+   fetch_size = 0;
+   free(got);
+   free(old);
+   free(srv);
+   unlink(path);
+   unlink(tmp);
    task_cloud_sync_cleanup(task);
    free(task->title);
    free(task);
@@ -453,6 +570,7 @@ static void walk_lane(void)
    snprintf(path, sizeof(path), "%s/.hidden/h.srm", a);      write_file(path, 4, 1);
    snprintf(path, sizeof(path), "%s/.dot.srm", a);           write_file(path, 4, 1);
    snprintf(path, sizeof(path), "%s/core2/p.srm.rafetching", a); write_file(path, 4, 1);
+   snprintf(path, sizeof(path), "%s/core2/p.srm.tmp", a);        write_file(path, 4, 1);
    snprintf(path, sizeof(path), "%s/.DS_Store", b);          write_file(path, 4, 1);
 
    nkeys = reference_keys(a, "saves", keys, 0);
@@ -476,7 +594,8 @@ static void walk_lane(void)
          same = 0;
    check("walk: the same files dir_list_new() lists, hidden ones too", same);
    for (i = 0; same && i < nkeys; i++)
-      if (strstr(keys[i], ".rafetching") || strstr(keys[i], ".DS_Store"))
+      if (     strstr(keys[i], ".rafetching") || strstr(keys[i], ".DS_Store")
+            || strstr(keys[i], ".tmp"))
          same = 0;
    check("walk: ignored names left out", same);
    task_cloud_sync_cleanup(task);
@@ -514,9 +633,24 @@ static void walk_lane(void)
    if (system(cmd) != 0) { }
 }
 
+/* What a sync's pusher is told when it is done. */
+static unsigned done_calls;
+static int      done_failed;
+static int      done_had_state;
+
+static void on_sync_done(retro_task_t *task, void *task_data,
+      void *user_data, const char *err)
+{
+   (void)task_data;
+   done_calls++;
+   done_failed    = err != NULL;
+   done_had_state = task->state != NULL && user_data == (void*)&done_calls;
+}
+
 /* A whole sync's tail through the real task queue: the diff, the local
- * manifest and the end, then retirement. Run under LeakSanitizer in CI. */
-static void queue_lane(void)
+ * manifest and the end, then retirement. Run under LeakSanitizer in CI.
+ * @ends: whether the driver ends the sync. */
+static void queue_run(int ends)
 {
    task_cloud_sync_state_t *st   = (task_cloud_sync_state_t*)calloc(1, sizeof(*st));
    retro_task_t            *task = task_init();
@@ -537,6 +671,8 @@ static void queue_lane(void)
    strlcpy(st->dir_core_assets, dir, sizeof(st->dir_core_assets));
    retro_atomic_int_init(&st->waiting, 0);
    retro_atomic_int_init(&st->phase, (int)CLOUD_SYNC_PHASE_DIFF);
+   st->cb      = on_sync_done;
+   st->cb_data = &done_calls;
    snprintf(path, sizeof(path), "%s/q.srm", dir);
    write_file(path, 300 * 1024, 3);
    list_add(st->server_manifest,  "saves/q.srm", NULL, hash_of(path));
@@ -545,14 +681,16 @@ static void queue_lane(void)
 
    /* set up as task_push_cloud_sync() sets up every sync */
    task_cloud_sync_task_setup(task, st, "Cloud Sync in progress");
-   grant = 2;
+   grant      = 2;
+   end_ok     = ends;
+   done_calls = 0;
 
    task_queue_init(false, NULL);
    task_queue_push(task);
    for (i = 0; i < 10000; i++)
       task_queue_check();
    task_queue_deinit();
-   check("queue: the sync ran to its end and retired", 1);
+   end_ok = 0;
 
    unlink(path);
    snprintf(path, sizeof(path), "%s/manifest.local", dir);
@@ -561,13 +699,48 @@ static void queue_lane(void)
    unlink(path);
 }
 
+static void queue_lane(void)
+{
+   queue_run(1);
+   check("queue: the sync ran to its end and retired", 1);
+   check("queue: a clean sync tells its pusher once, with no error, before its state goes",
+         done_calls == 1 && !done_failed && done_had_state);
+
+   queue_run(0);
+   check("queue: a sync the driver could not end tells its pusher it failed",
+         done_calls == 1 && done_failed);
+}
+
+/* A sync whose driver cannot begin: its pusher hears it failed. */
+static void begin_lane(void)
+{
+   task_cloud_sync_state_t *st   = (task_cloud_sync_state_t*)calloc(1, sizeof(*st));
+   retro_task_t            *task = task_init();
+   unsigned i;
+
+   retro_atomic_int_init(&st->waiting, 0);
+   retro_atomic_int_init(&st->phase, (int)CLOUD_SYNC_PHASE_BEGIN);
+   st->cb      = on_sync_done;
+   st->cb_data = &done_calls;
+   task_cloud_sync_task_setup(task, st, "Cloud Sync in progress");
+   done_calls = 0;
+
+   task_queue_init(false, NULL);
+   task_queue_push(task);
+   for (i = 0; i < 100; i++)
+      task_queue_check();
+   task_queue_deinit();
+   check("begin: a sync that could not begin tells its pusher it failed",
+         done_calls == 1 && done_failed);
+}
+
 int main(void)
 {
    unsigned r;
    int      ok;
 
    tcs_test_lock();
-   strcpy(dir, "/tmp/cs_pacing_XXXXXX");
+   strcpy(dir, "cs_pacing_XXXXXX");
    if (!mkdtemp(dir))
       return 2;
 
@@ -592,8 +765,15 @@ int main(void)
    check("spent window: one unit per run", max_granted == 1);
 
    fetch_lane();
+   fetch_keep_lane(1,
+         "fetch: a save a core took during the download is left as it was",
+         "fetch: ... and the server's copy waits for the next sync");
+   fetch_keep_lane(0,
+         "fetch: a download cut off part-way leaves the save as it was",
+         "fetch: ... and is fetched again next sync");
    walk_lane();
    queue_lane();
+   begin_lane();
 
    rmdir(dir);
    printf("cloudsync_pacing_test: %s\n", fails ? "FAIL" : "PASS");

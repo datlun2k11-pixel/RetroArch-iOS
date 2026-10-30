@@ -109,6 +109,7 @@ enum menu_settings_type
    MENU_SETTING_DROPDOWN_ITEM,
    MENU_SETTING_DROPDOWN_ITEM_RESOLUTION,
    MENU_SETTING_DROPDOWN_ITEM_CRT_SUPER_RESOLUTION,
+   MENU_SETTING_DROPDOWN_ITEM_HEADSET_REFRESH_RATE,
    MENU_SETTING_DROPDOWN_ITEM_VIDEO_SHADER_PARAM,
    MENU_SETTING_DROPDOWN_ITEM_VIDEO_SHADER_PRESET_PARAM,
    MENU_SETTING_DROPDOWN_ITEM_VIDEO_SHADER_NUM_PASS,
@@ -502,16 +503,11 @@ struct menu_state
     * polls so that a stall after the last poll is not counted as
     * time the button was held. */
    retro_time_t input_time_us;
-   retro_time_t input_poll_time_us;
-   retro_time_t powerstate_last_time_us;
-   retro_time_t datetime_last_time_us;
    retro_time_t input_last_time_us;
    menu_input_t input_state;               /* retro_time_t alignment */
 
-   retro_time_t prev_start_time;
-   retro_time_t noop_press_time;
-   retro_time_t noop_start_time;
-   retro_time_t action_start_time;
+   /* How long a held direction has been repeating, in real time: held
+    * Left/Right on a number speeds up by it. Set by menu_event(). */
    retro_time_t action_press_time;
 
    struct menu_bind_state input_binds;     /* uint64_t alignment */
@@ -538,19 +534,17 @@ struct menu_state
       size_t   index_list[SCROLL_INDEX_SIZE];
       unsigned index_size;
       unsigned acceleration;
+      /* entries this frame's Up or Down moves: set by a held
+       * direction's repeat (as many as its speed made due since the last
+       * frame); 0 for a press, which moves as the acceleration says */
+      unsigned steps;
       enum menu_scroll_mode mode;
    } scroll;
 
    /* unsigned alignment */
    unsigned input_dialog_kb_idx;
-   /* Nonzero: the input held now is held back - from the menu, the
-    * hotkeys and the core - until it is all let go, which clears it.
-    * Set when the menu opens or closes, a bind or a text entry ends,
-    * and the mouse clicks, so that the press that did it does nothing
-    * more. It is a wait for release and not a count of frames. */
-   unsigned input_driver_flushing_input;
+   unsigned video_screen_selected;
    menu_dialog_t dialog_st;
-   enum menu_action prev_action;
    enum menu_input_dialog_kb_text_type input_dialog_kb_text_type;
 #ifdef HAVE_RUNAHEAD
    unsigned int runahead_mode;
@@ -816,6 +810,12 @@ void menu_driver_toggle(
       retro_keyboard_event_t *frontend_key_event,
       bool on);
 
+/* Queue a fullscreen file-browser launch; NULL cancels it. */
+bool menu_driver_media_open(const char *path);
+/* Startup presentation is released only by the activated fullscreen view. */
+int menu_driver_media_startup_token(void);
+void menu_driver_media_startup_ready(int token);
+
 /* Iterate the menu driver for one frame. */
 bool menu_driver_iterate(
       struct menu_state *menu_st,
@@ -837,6 +837,10 @@ bool menu_is_running_quick_menu(void);
 /* "Find a Button by Pressing It": waits for a button of @port's
  * controller and puts the selection on its entry. */
 void menu_input_remap_find_begin(unsigned port);
+/* A combination's buttons set by holding them, on a screen of its own
+ * that takes the menu's input meanwhile. False if there is no such
+ * combination. */
+bool menu_input_entry_capture_begin(unsigned number);
 
 bool menu_input_key_bind_set_mode(
       enum menu_input_binds_ctl_state state, void *data);
@@ -847,6 +851,11 @@ void menu_update_runahead_mode(void);
 
 size_t menu_playlist_random_selection(
       size_t selection, bool is_explore_list);
+
+/* The Playlists tab's Scan: a random playlist row other than
+ * @selection. Not menu_playlist_random_selection, which picks an item
+ * inside an open playlist or Explore list. */
+size_t menu_playlists_tab_random_selection(size_t selection);
 
 void menu_dialog_confirm_set(struct menu_state *menu_st,
       unsigned msg, unsigned cmd);

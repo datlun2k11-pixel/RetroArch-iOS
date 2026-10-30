@@ -136,56 +136,42 @@ static void ui_application_win32_dispatch(MSG *msg)
  * names it below is compiled only where the driver is. */
 #if defined(HAVE_WINRAWINPUT) && !defined(_XBOX) && _WIN32_WINNT >= 0x0501 && !defined(__WINRT__)
 extern bool winraw_poll_owns_thread(void);
-extern void winraw_pump_done(void);
 #define WIN32_RAW_INPUT_PUMP
-#define WIN32_RAW_INPUT_PUMP_DONE() winraw_pump_done()
-#else
-#define WIN32_RAW_INPUT_PUMP_DONE() ((void)0)
 #endif
 
-static void ui_application_win32_process_events(void)
+static bool ui_application_win32_next_message(void)
 {
    MSG msg;
-
 #ifdef WIN32_RAW_INPUT_PUMP
    if (winraw_poll_owns_thread())
    {
-      /* The raw input driver reads this thread's reports in bulk when
-       * it polls (winraw_input.c, "Read by the poll"). Taking them out
-       * here, one WM_INPUT at a time, is the work that read exists to
-       * save, so this asks for everything below WM_INPUT and
-       * everything above it and leaves the reports in the queue. The
-       * two ranges take turns, so that neither waits for the other to
-       * run dry. */
-      for (;;)
+      bool any = false;
+      if (PeekMessage(&msg, 0, 0, WM_INPUT - 1, PM_REMOVE))
       {
-         bool any = false;
-         if (PeekMessage(&msg, 0, 0, WM_INPUT - 1, PM_REMOVE))
-         {
-            ui_application_win32_dispatch(&msg);
-            any = true;
-         }
-         if (PeekMessage(&msg, 0, WM_INPUT + 1, 0xFFFFFFFF, PM_REMOVE))
-         {
-            ui_application_win32_dispatch(&msg);
-            any = true;
-         }
-         if (!any)
-            break;
-      }
-   }
-   else
-#endif
-   {
-      while (PeekMessage(&msg, 0, 0, 0, PM_REMOVE))
          ui_application_win32_dispatch(&msg);
-      /* The raw input driver, where this thread takes its reports:
-       * they are in its state as of now. */
-      WIN32_RAW_INPUT_PUMP_DONE();
+         any = true;
+      }
+      if (PeekMessage(&msg, 0, WM_INPUT + 1, 0xFFFFFFFF, PM_REMOVE))
+      {
+         ui_application_win32_dispatch(&msg);
+         any = true;
+      }
+      return any;
    }
+#endif
+   if (!PeekMessage(&msg, 0, 0, 0, PM_REMOVE))
+      return false;
+   ui_application_win32_dispatch(&msg);
+   return true;
+}
 
-   /* The video thread pumps through here too (win32_check_window);
-    * only the main thread may run the parked commands. */
+static void ui_application_win32_process_events(void)
+{
+#if !defined(_XBOX) && !defined(__WINRT__)
+   if (!win32_message_pump(ui_application_win32_next_message))
+#endif
+      while (ui_application_win32_next_message()) { }
+
    if (task_is_on_main_thread())
       win32_menu_run_deferred();
 }
@@ -746,10 +732,11 @@ bool win32_load_content_from_gui(const char *szFilename)
    return false;
 }
 
-#ifdef LEGACY_WIN32
-bool win32_drag_query_file(HWND hwnd, WPARAM wparam)
+/* Windows 9x hands over ANSI paths, and DragQueryFileA has been in
+ * shell32 since Windows 95. */
+static bool win32_drag_query_file_ansi(HWND hwnd, WPARAM wparam)
 {
-   UINT count = DragQueryFile((HDROP)wparam, 0xFFFFFFFF, NULL, 0);
+   UINT count = DragQueryFileA((HDROP)wparam, 0xFFFFFFFF, NULL, 0);
    if (count)
    {
       char szFilename[1024];
@@ -763,7 +750,7 @@ bool win32_drag_query_file(HWND hwnd, WPARAM wparam)
       for (i = 0; files && i < count; i++)
       {
          szFilename[0] = '\0';
-         DragQueryFile((HDROP)wparam, i, szFilename, sizeof(szFilename));
+         DragQueryFileA((HDROP)wparam, i, szFilename, sizeof(szFilename));
          if (     local_to_utf8_string(szFilename, utf8, sizeof(utf8))
                && !string_list_append(files, utf8, attr))
          {
@@ -775,16 +762,40 @@ bool win32_drag_query_file(HWND hwnd, WPARAM wparam)
          return true;
 #endif
       szFilename[0]    = '\0';
-      DragQueryFile((HDROP)wparam, 0, szFilename, sizeof(szFilename));
+      DragQueryFileA((HDROP)wparam, 0, szFilename, sizeof(szFilename));
       return win32_load_content_from_gui(szFilename);
    }
    return false;
 }
+
+#ifdef LEGACY_WIN32
+bool win32_drag_query_file(HWND hwnd, WPARAM wparam)
+{
+   return win32_drag_query_file_ansi(hwnd, wparam);
+}
 #else
 bool win32_drag_query_file(HWND hwnd, WPARAM wparam)
 {
-   UINT count = DragQueryFileW((HDROP)wparam, 0xFFFFFFFF, NULL, 0);
-   if (count)
+   typedef UINT (WINAPI *DragQueryFileW_t)(HDROP, UINT, LPWSTR, UINT);
+   static DragQueryFileW_t query_w = NULL;
+   static bool probed              = false;
+   UINT count                      = 0;
+
+   /* Resolved rather than imported, so the binary still loads on a
+    * shell32 without it; a drop it cannot read goes the ANSI way. */
+   if (!probed)
+   {
+      HMODULE shell32 = GetModuleHandleA("shell32.dll");
+      if (shell32)
+         query_w = (DragQueryFileW_t)GetProcAddress(shell32,
+               "DragQueryFileW");
+      probed = true;
+   }
+   if (query_w)
+      count = query_w((HDROP)wparam, 0xFFFFFFFF, NULL, 0);
+   if (!count)
+      return win32_drag_query_file_ansi(hwnd, wparam);
+
    {
       wchar_t wszFilename[4096];
       bool ret        = false;
@@ -798,7 +809,7 @@ bool win32_drag_query_file(HWND hwnd, WPARAM wparam)
       for (i = 0; files && i < count; i++)
       {
          wszFilename[0] = L'\0';
-         DragQueryFileW((HDROP)wparam, i, wszFilename,
+         query_w((HDROP)wparam, i, wszFilename,
                sizeof(wszFilename) / sizeof(wszFilename[0]));
          if ((szFilename = utf16_to_utf8_string_alloc(wszFilename)))
          {
@@ -816,7 +827,7 @@ bool win32_drag_query_file(HWND hwnd, WPARAM wparam)
 #endif
       wszFilename[0]   = L'\0';
 
-      DragQueryFileW((HDROP)wparam, 0, wszFilename,
+      query_w((HDROP)wparam, 0, wszFilename,
             sizeof(wszFilename) / sizeof(wszFilename[0]));
       szFilename = utf16_to_utf8_string_alloc(wszFilename);
       ret        = win32_load_content_from_gui(szFilename);
@@ -952,7 +963,11 @@ LRESULT win32_menu_loop(HWND owner, WPARAM wparam)
 {
    WPARAM mode            = wparam & 0xffff;
 
-   if (!task_is_on_main_thread())
+   if (!task_is_on_main_thread()
+#if !defined(_XBOX) && !defined(__WINRT__)
+         || win32_message_dispatching()
+#endif
+      )
    {
       if (mode && !win32_menu_defer(mode))
          RARCH_WARN("[Win32] Menu command %u dropped: too many pending.\n",
@@ -1298,7 +1313,7 @@ static const char *win32_meta_key_to_name(unsigned int meta_key,
       char *buf, size_t buf_size)
 {
    int i = 0;
-   const struct retro_keybind* key = &input_config_binds[0][meta_key];
+   const struct retro_keybind* key = input_config_bind(0, meta_key);
    int key_code                    = RETRO_KEYBIND_KEY(key);
 
    for (;;)
@@ -1732,7 +1747,13 @@ int win32_resources_pick_core_dialog(HWND parent, DLGPROC dlg_proc)
 }
 #endif /* !__WINRT__ */
 
-static void ui_companion_win32_deinit(void *data) { }
+static void ui_companion_win32_deinit(void *data)
+{
+   (void)data;
+#if !defined(_XBOX) && !defined(__WINRT__)
+   win32_message_pump_free();
+#endif
+}
 static void *ui_companion_win32_init(void) { return (void*)-1; }
 static void ui_companion_win32_toggle(void *data, bool force) { }
 static void ui_companion_win32_event_command(

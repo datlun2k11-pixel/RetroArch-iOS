@@ -47,6 +47,11 @@ static unsigned failures;
 static char port_text[16];
 static int  pad_a;      /* RetroPad A, held or not */
 static int  stick_x;    /* left stick X */
+static int  stick_ry;   /* right stick Y */
+/* the controller touchpad, read by the core when its option is on */
+static int  touch_down[2];
+static int  touch_x[2], touch_y[2];
+static const uint16_t *last_frame;
 
 static void RETRO_CALLCONV log_none(enum retro_log_level level, const char *fmt, ...)
 { (void)level; (void)fmt; }
@@ -73,6 +78,8 @@ static bool RETRO_CALLCONV environment(unsigned cmd, void *data)
                var->value = "1";
             else if (!strcmp(var->key, "net_retropad_screen"))
                var->value = "RetroPad";
+            else if (!strcmp(var->key, "net_retropad_touchpad"))
+               var->value = "enabled";
             return var->value != NULL;
          }
       case RETRO_ENVIRONMENT_SET_VARIABLES:
@@ -86,7 +93,7 @@ static bool RETRO_CALLCONV environment(unsigned cmd, void *data)
 }
 
 static void RETRO_CALLCONV video(const void *d, unsigned w, unsigned h, size_t p)
-{ (void)d; (void)w; (void)h; (void)p; }
+{ (void)w; (void)h; (void)p; last_frame = (const uint16_t*)d; }
 static void RETRO_CALLCONV audio(int16_t l, int16_t r) { (void)l; (void)r; }
 static size_t RETRO_CALLCONV audio_batch(const int16_t *d, size_t n) { (void)d; return n; }
 static void RETRO_CALLCONV input_poll(void) { }
@@ -96,12 +103,28 @@ static int16_t RETRO_CALLCONV input_state(unsigned port, unsigned device,
 {
    if (port != 0)
       return 0;
+   if (device == RETRO_DEVICE_TOUCHPAD && index < 2)
+   {
+      if (!touch_down[index])
+         return 0;
+      if (id == RETRO_DEVICE_ID_POINTER_PRESSED)
+         return 1;
+      if (id == RETRO_DEVICE_ID_POINTER_X)
+         return (int16_t)touch_x[index];
+      if (id == RETRO_DEVICE_ID_POINTER_Y)
+         return (int16_t)touch_y[index];
+      return 0;
+   }
    if (device == RETRO_DEVICE_JOYPAD && id == RETRO_DEVICE_ID_JOYPAD_A)
       return (int16_t)pad_a;
    if (     device == RETRO_DEVICE_ANALOG
          && index  == RETRO_DEVICE_INDEX_ANALOG_LEFT
          && id     == RETRO_DEVICE_ID_ANALOG_X)
       return (int16_t)stick_x;
+   if (     device == RETRO_DEVICE_ANALOG
+         && index  == RETRO_DEVICE_INDEX_ANALOG_RIGHT
+         && id     == RETRO_DEVICE_ID_ANALOG_Y)
+      return (int16_t)stick_ry;
    return 0;
 }
 
@@ -234,7 +257,63 @@ int main(void)
          "a stick's move arrived %u time(s), want 4, the last 30 frames on", n);
    printf("   ok   a stick's move is sent again the same way\n");
 
+   /* the right stick fully down is the top bit of the core's input
+    * state: built under UBSan, a shift into the sign bit stops here */
+   f0       = frame;
+   stick_ry = 32767;
+   run(10);
+   n = frames_of(RETRO_DEVICE_ANALOG, RETRO_DEVICE_ID_ANALOG_Y, 32767, f0, at, 16);
+   CHECK(n >= 1, "the right stick's move arrived %u time(s)", n);
+   stick_ry = 0;
+   run(40);
+   printf("   ok   the right stick fully down is the input state's top bit\n");
+
+   /* the touchpad: a dot where each finger is, green for the first and
+    * magenta for the second, the screen as the pad; gone when let go,
+    * and nothing sent for it */
+   {
+      unsigned sent = seen_n;
+      uint16_t before;
+      run(1);
+      before        = last_frame ? last_frame[120 * 320 + 80] : 0;
+      touch_down[0] = 1; touch_x[0] = -16384; touch_y[0] = 0;
+      touch_down[1] = 1; touch_x[1] = 32767;  touch_y[1] = -32768;
+      run(1);
+      CHECK(last_frame && last_frame[120 * 320 + 80] == 0x07e0,
+            "the first finger is not a green dot where it is");
+      CHECK(last_frame && last_frame[0 * 320 + 319] == 0xf81f,
+            "the second finger is not a magenta dot where it is");
+      touch_down[0] = touch_down[1] = 0;
+      run(1);
+      CHECK(last_frame && last_frame[120 * 320 + 80] == before,
+            "a finger let go left its dot");
+      CHECK(seen_n == sent, "the touchpad was sent to the receiver");
+      printf("   ok   the controller touchpad's fingers are shown where they are\n");
+   }
+
    retro_deinit();
+
+   /* a test file may name a button past the input state's 32 bits:
+    * it matches nothing, and the step is judged without a wider shift */
+   {
+      char ratst[64];
+      struct retro_game_info info;
+      FILE *tf;
+      snprintf(ratst, sizeof(ratst), "/tmp/net_retropad_%u.ratst", port);
+      if ((tf = fopen(ratst, "wb")))
+      {
+         fputs("[{\"expected_button\": 40, \"message\": \"past bit 31\"}]", tf);
+         fclose(tf);
+      }
+      memset(&info, 0, sizeof(info));
+      info.path = ratst;
+      retro_init();
+      CHECK(retro_load_game(&info), "the test file did not load");
+      run(330);
+      retro_deinit();
+      remove(ratst);
+      printf("   ok   a test file naming a button past bit 31 runs its step\n");
+   }
    socket_close(fd);
    if (failures)
    {
